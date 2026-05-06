@@ -3047,6 +3047,68 @@ void SelectOptimization(Function *F) {
   }
 }
 
+static Function *getOrCreateMinMaxIntrinsicFallback(Module &M,
+                                                    Function *Specification) {
+  auto *FunctionTy = Specification->getFunctionType();
+  Type *Ty = FunctionTy->getReturnType();
+
+  Intrinsic::ID KnownID = Intrinsic::not_intrinsic;
+  if (!isMemFreeLibMFunction(Specification->getName(), &KnownID) ||
+      (KnownID != Intrinsic::minnum && KnownID != Intrinsic::maxnum))
+    return nullptr;
+
+  if (FunctionTy->isVarArg() || FunctionTy->getNumParams() != 2)
+    return nullptr;
+  if (Ty != FunctionTy->getParamType(0) || Ty != FunctionTy->getParamType(1))
+    return nullptr;
+
+  std::string FallbackName =
+      ("__enzyme_device_fallback_" + Specification->getName()).str();
+  if (Function *Existing = M.getFunction(FallbackName))
+    return Existing;
+
+  Function *Fallback = Function::Create(FunctionTy, Function::InternalLinkage,
+                                        FallbackName, M);
+  Fallback->setCallingConv(CallingConv::C);
+  Fallback->addFnAttr(Attribute::AlwaysInline);
+  Fallback->addFnAttr(Attribute::NoUnwind);
+  Fallback->addFnAttr(Attribute::WillReturn);
+  Fallback->addFnAttr(Attribute::ReadNone);
+
+  auto *Entry = BasicBlock::Create(M.getContext(), "entry", Fallback);
+  IRBuilder<> Builder(Entry);
+  Value *X = Fallback->getArg(0);
+  Value *Y = Fallback->getArg(1);
+  X->setName("x");
+  Y->setName("y");
+  Builder.CreateRet(Builder.CreateCall(
+      getIntrinsicDeclaration(&M, KnownID, {Ty}), {X, Y}));
+  return Fallback;
+}
+
+static void replaceSpecificationUses(Function *Specification,
+                                     Function *Replacement) {
+  if (Specification == Replacement)
+    return;
+
+  for (auto I = Specification->use_begin(), UE = Specification->use_end();
+       I != UE;) {
+    auto &use = *I;
+    ++I;
+    auto cext = ConstantExpr::getBitCast(Replacement, Specification->getType());
+    if (cast<Instruction>(use.getUser())->getParent()->getParent() ==
+        Replacement)
+      continue;
+    use.set(cext);
+    if (auto CI = dyn_cast<CallInst>(use.getUser())) {
+      if (CI->getCalledOperand() == cext ||
+          CI->getCalledFunction() == Replacement) {
+        CI->setCallingConv(Replacement->getCallingConv());
+      }
+    }
+  }
+}
+
 void ReplaceFunctionImplementation(Module &M) {
   for (Function &Impl : M) {
     for (auto attr : {"implements", "implements2"}) {
@@ -3063,25 +3125,32 @@ void ReplaceFunctionImplementation(Module &M) {
                           << "', potentially inlined and/or eliminated.\n");
         continue;
       }
+      if (Impl.isDeclaration()) {
+        bool UseDeviceDeclaration =
+            (M.getTargetTriple().find("amdgcn") != std::string::npos &&
+             Impl.getName().starts_with("__ocml_"));
+        if (!UseDeviceDeclaration)
+          continue;
+      }
       LLVM_DEBUG(dbgs() << "Replace specification '" << Specification->getName()
                         << "' with implementation '" << Impl.getName()
                         << "'\n");
+      replaceSpecificationUses(Specification, &Impl);
+    }
+  }
 
-      for (auto I = Specification->use_begin(), UE = Specification->use_end();
-           I != UE;) {
-        auto &use = *I;
-        ++I;
-        auto cext = ConstantExpr::getBitCast(&Impl, Specification->getType());
-        if (cast<Instruction>(use.getUser())->getParent()->getParent() == &Impl)
-          continue;
-        use.set(cext);
-        if (auto CI = dyn_cast<CallInst>(use.getUser())) {
-          if (CI->getCalledOperand() == cext ||
-              CI->getCalledFunction() == &Impl) {
-            CI->setCallingConv(Impl.getCallingConv());
-          }
-        }
-      }
+  // CUDA headers can leave local fmin/fmax wrapper declarations such as
+  // _ZL4fminff without a usable device definition. Canonicalize those directly
+  // to the matching LLVM intrinsic fallback instead of leaving an unresolved
+  // extern for ptxas.
+  for (Function &Specification : llvm::make_early_inc_range(M)) {
+    if (!Specification.isDeclaration())
+      continue;
+    if (Function *Fallback =
+            getOrCreateMinMaxIntrinsicFallback(M, &Specification)) {
+      LLVM_DEBUG(dbgs() << "Replace specification '" << Specification.getName()
+                        << "' with fallback '" << Fallback->getName() << "'\n");
+      replaceSpecificationUses(&Specification, Fallback);
     }
   }
 }
@@ -3149,6 +3218,8 @@ void PreProcessCache::optimizeIntermediate(Function *F) {
     PA = FPM.run(*F, FAM);
     FAM.invalidate(*F, PA);
   }
+
+  ReplaceFunctionImplementation(*F->getParent());
 
   // TODO actually run post optimizations.
 }
@@ -6991,7 +7062,11 @@ return true;
     }
 */
   }
+#if defined(_MSC_VER)
+  __declspec(noinline) void dump() const { llvm::errs() << *this << "\n"; }
+#else
   __attribute__((noinline)) void dump() const { llvm::errs() << *this << "\n"; }
+#endif
   InnerTy notB(const ConstraintContext &ctx) const {
     switch (ty) {
     case Type::None:

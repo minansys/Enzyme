@@ -44,10 +44,15 @@
 #include <cmath>
 
 #if LLVM_VERSION_MAJOR >= 16
+#if defined(_MSC_VER)
+#include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
+#else
 #define private public
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
 #undef private
+#endif
 #else
 #include "SCEV/ScalarEvolution.h"
 #include "SCEV/ScalarEvolutionExpander.h"
@@ -3806,21 +3811,21 @@ Function *EnzymeLogic::CreatePrimalAndGradient(
 
       auto revfn = CreatePrimalAndGradient(
           context,
-          (ReverseCacheKey){.todiff = key.todiff,
-                            .retType = key.retType,
-                            .constant_args = key.constant_args,
-                            .overwritten_args = key.overwritten_args,
-                            .returnUsed = false,
-                            .shadowReturnUsed = false,
-                            .mode = DerivativeMode::ReverseModeGradient,
-                            .width = key.width,
-                            .freeMemory = key.freeMemory,
-                            .AtomicAdd = key.AtomicAdd,
-                            .additionalType = tape ? tape->getType() : nullptr,
-                            .forceAnonymousTape = key.forceAnonymousTape,
-                            .typeInfo = key.typeInfo,
-                            .runtimeActivity = key.runtimeActivity,
-                            .strongZero = key.strongZero},
+          ReverseCacheKey{.todiff = key.todiff,
+                          .retType = key.retType,
+                          .constant_args = key.constant_args,
+                          .overwritten_args = key.overwritten_args,
+                          .returnUsed = false,
+                          .shadowReturnUsed = false,
+                          .mode = DerivativeMode::ReverseModeGradient,
+                          .width = key.width,
+                          .freeMemory = key.freeMemory,
+                          .AtomicAdd = key.AtomicAdd,
+                          .additionalType = tape ? tape->getType() : nullptr,
+                          .forceAnonymousTape = key.forceAnonymousTape,
+                          .typeInfo = key.typeInfo,
+                          .runtimeActivity = key.runtimeActivity,
+                          .strongZero = key.strongZero},
           TA, &aug, omp);
 
       SmallVector<Value *, 4> revargs;
@@ -3905,21 +3910,21 @@ Function *EnzymeLogic::CreatePrimalAndGradient(
 
       auto revfn = CreatePrimalAndGradient(
           context,
-          (ReverseCacheKey){.todiff = key.todiff,
-                            .retType = nextRetType,
-                            .constant_args = next_constant_args,
-                            .overwritten_args = key.overwritten_args,
-                            .returnUsed = key.returnUsed,
-                            .shadowReturnUsed = false,
-                            .mode = DerivativeMode::ReverseModeGradient,
-                            .width = key.width,
-                            .freeMemory = key.freeMemory,
-                            .AtomicAdd = key.AtomicAdd,
-                            .additionalType = key.additionalType,
-                            .forceAnonymousTape = key.forceAnonymousTape,
-                            .typeInfo = key.typeInfo,
-                            .runtimeActivity = key.runtimeActivity,
-                            .strongZero = key.strongZero},
+          ReverseCacheKey{.todiff = key.todiff,
+                          .retType = nextRetType,
+                          .constant_args = next_constant_args,
+                          .overwritten_args = key.overwritten_args,
+                          .returnUsed = key.returnUsed,
+                          .shadowReturnUsed = false,
+                          .mode = DerivativeMode::ReverseModeGradient,
+                          .width = key.width,
+                          .freeMemory = key.freeMemory,
+                          .AtomicAdd = key.AtomicAdd,
+                          .additionalType = key.additionalType,
+                          .forceAnonymousTape = key.forceAnonymousTape,
+                          .typeInfo = key.typeInfo,
+                          .runtimeActivity = key.runtimeActivity,
+                          .strongZero = key.strongZero},
           TA, augmenteddata, omp);
 
       {

@@ -908,6 +908,78 @@ Value *GradientUtils::unwrapM(Value *const val, IRBuilder<> &BuilderM,
       }
     }
 
+#if defined(_MSC_VER)
+#define getOpFullest(Builder, vtmp, frominst, lookupInst, check)               \
+  ([&]() -> Value * {                                                          \
+    Value *v = vtmp;                                                           \
+    Type *vty = v->getType();                                                  \
+    BasicBlock *origParent = frominst;                                         \
+    Value *___res;                                                             \
+    if (unwrapMode == UnwrapMode::LegalFullUnwrap ||                           \
+        unwrapMode == UnwrapMode::LegalFullUnwrapNoTapeReplace ||              \
+        unwrapMode == UnwrapMode::AttemptFullUnwrap ||                         \
+        unwrapMode == UnwrapMode::AttemptFullUnwrapWithLookup) {               \
+      if (v == val)                                                            \
+        ___res = nullptr;                                                      \
+      else                                                                     \
+        ___res = unwrapM(v, Builder, available, unwrapMode, origParent,        \
+                         permitCache);                                         \
+      if (!___res && unwrapMode == UnwrapMode::AttemptFullUnwrapWithLookup) {  \
+        bool noLookup = false;                                                 \
+        auto found = available.find(v);                                        \
+        if (found != available.end() && !found->second)                        \
+          noLookup = true;                                                     \
+        if (auto opinst = dyn_cast<Instruction>(v))                            \
+          if (isOriginalBlock(*Builder.GetInsertBlock())) {                    \
+            if (!DT.dominates(opinst, &*Builder.GetInsertPoint()))             \
+              noLookup = true;                                                 \
+          }                                                                    \
+        origParent = lookupInst;                                               \
+        if (!noLookup)                                                         \
+          ___res = lookupM(v, Builder, available, v != val, origParent);       \
+      }                                                                        \
+      if (___res)                                                              \
+        assert(___res->getType() == vty && "uw");                              \
+    } else {                                                                   \
+      origParent = lookupInst;                                                 \
+      assert(unwrapMode == UnwrapMode::AttemptSingleUnwrap);                   \
+      auto found = available.find(v);                                          \
+      if (found != available.end() && !found->second)                          \
+        ___res = nullptr;                                                      \
+      else {                                                                   \
+        ___res = lookupM(v, Builder, available, v != val, origParent);         \
+        if (___res && ___res->getType() != vty) {                              \
+          llvm::errs() << *newFunc << "\n";                                    \
+          llvm::errs() << " v = " << *v << " res = " << *___res << "\n";       \
+        }                                                                      \
+        if (___res)                                                            \
+          assert(___res->getType() == vty && "lu");                            \
+      }                                                                        \
+    }                                                                          \
+    return ___res;                                                             \
+  }())
+#define getOpFull(Builder, vtmp, frominst)                                     \
+  ([&]() -> Value * {                                                          \
+    BasicBlock *parent = scope;                                                \
+    if (parent == nullptr)                                                     \
+      if (auto originst = dyn_cast<Instruction>(val))                          \
+        parent = originst->getParent();                                        \
+    return getOpFullest(Builder, vtmp, frominst, parent, true);                \
+  }())
+#define getOpUnchecked(vtmp)                                                   \
+  ([&]() -> Value * {                                                          \
+    BasicBlock *parent = scope;                                                \
+    return getOpFullest(BuilderM, vtmp, parent, parent, false);                \
+  }())
+#define getOp(vtmp)                                                            \
+  ([&]() -> Value * {                                                          \
+    BasicBlock *parent = scope;                                                \
+    if (parent == nullptr)                                                     \
+      if (auto originst = dyn_cast<Instruction>(val))                          \
+        parent = originst->getParent();                                        \
+    return getOpFullest(BuilderM, vtmp, parent, parent, true);                 \
+  }())
+#else
 #define getOpFullest(Builder, vtmp, frominst, lookupInst, check)               \
   ({                                                                           \
     Value *v = vtmp;                                                           \
@@ -978,6 +1050,7 @@ Value *GradientUtils::unwrapM(Value *const val, IRBuilder<> &BuilderM,
         parent = originst->getParent();                                        \
     getOpFullest(BuilderM, vtmp, parent, parent, true);                        \
   })
+#endif
 
   if (isa<Argument>(val) || isa<Constant>(val)) {
     return val;
@@ -4855,23 +4928,23 @@ Constant *GradientUtils::GetOrCreateShadowFunction(
         AtomicAdd);
     Constant *newf = Logic.CreatePrimalAndGradient(
         context,
-        (ReverseCacheKey){.todiff = fn,
-                          .retType = retType,
-                          .constant_args = types,
-                          .subsequent_calls_may_write =
-                              subsequent_calls_may_write,
-                          .overwritten_args = overwritten_args,
-                          .returnUsed = false,
-                          .shadowReturnUsed = false,
-                          .mode = DerivativeMode::ReverseModeGradient,
-                          .width = width,
-                          .freeMemory = true,
-                          .AtomicAdd = AtomicAdd,
-                          .additionalType = getInt8PtrTy(fn->getContext()),
-                          .forceAnonymousTape = true,
-                          .typeInfo = type_args,
-                          .runtimeActivity = runtimeActivity,
-                          .strongZero = strongZero},
+        ReverseCacheKey{.todiff = fn,
+                        .retType = retType,
+                        .constant_args = types,
+                        .subsequent_calls_may_write =
+                            subsequent_calls_may_write,
+                        .overwritten_args = overwritten_args,
+                        .returnUsed = false,
+                        .shadowReturnUsed = false,
+                        .mode = DerivativeMode::ReverseModeGradient,
+                        .width = width,
+                        .freeMemory = true,
+                        .AtomicAdd = AtomicAdd,
+                        .additionalType = getInt8PtrTy(fn->getContext()),
+                        .forceAnonymousTape = true,
+                        .typeInfo = type_args,
+                        .runtimeActivity = runtimeActivity,
+                        .strongZero = strongZero},
         TA,
         /*map*/ &augdata);
     assert(newf);

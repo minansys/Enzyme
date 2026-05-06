@@ -1190,7 +1190,7 @@ template <typename T> static inline llvm::Function *getFunctionFromCall(T *op) {
   const llvm::Value *callVal;
   callVal = op->getCalledOperand();
   while (!called) {
-    if (auto castinst = dyn_cast<ConstantExpr>(callVal))
+    if (auto castinst = dyn_cast<llvm::ConstantExpr>(callVal))
       if (castinst->isCast()) {
         callVal = castinst->getOperand(0);
         continue;

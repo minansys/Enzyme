@@ -29,12 +29,23 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
+#include "llvm/ADT/StringSwitch.h"
+#include "llvm/Bitcode/BitcodeReader.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Intrinsics.h"
+#include "llvm/TargetParser/Triple.h"
 
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Linker/Linker.h"
+#include "llvm/Support/Error.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include "llvm/Support/TimeProfiler.h"
@@ -42,10 +53,13 @@
 #include "llvm/Pass.h"
 
 #include "llvm/Transforms/Utils.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
 
+#include <cstdlib>
 #include <map>
 
 #include "PreserveNVVM.h"
+#include "TypeAnalysis/TypeAnalysis.h"
 #include "Utils.h"
 
 using namespace llvm;
@@ -75,6 +89,402 @@ bool preserveLinkage(bool Begin, Function &F, bool Inlining = true) {
     return true;
   }
   return false;
+}
+
+static constexpr const char preserve_device_math_anchor_name[] =
+    "__enzyme_preserve_device_math";
+
+static bool isUnarySameTypeDeviceMathName(StringRef Name) {
+  return Name == "sin" || Name == "cos" || Name == "tan" ||
+         Name == "asin" || Name == "acos" || Name == "atan" ||
+         Name == "sinh" || Name == "cosh" || Name == "tanh" ||
+         Name == "asinh" || Name == "acosh" || Name == "atanh" ||
+         Name == "exp" || Name == "exp2" || Name == "exp10" ||
+         Name == "expm1" || Name == "log" || Name == "log2" ||
+         Name == "log10" || Name == "log1p" || Name == "logb" ||
+         Name == "sqrt" || Name == "cbrt" || Name == "rcbrt" ||
+         Name == "erf" || Name == "erfc" || Name == "erfcx" ||
+         Name == "erfinv" || Name == "erfcinv" || Name == "normcdf" ||
+         Name == "normcdfinv" || Name == "lgamma" || Name == "tgamma" ||
+         Name == "round" || Name == "fabs" || Name == "floor" ||
+         Name == "ceil" || Name == "trunc" || Name == "rint" ||
+         Name == "nearbyint" || Name == "rsqrt" || Name == "native_exp" ||
+         Name == "native_log" || Name == "native_log10" ||
+         Name == "native_sin" || Name == "native_cos" ||
+         Name == "native_sqrt";
+}
+
+static bool isBinarySameTypeDeviceMathName(StringRef Name) {
+  return Name == "pow" || Name == "atan2" || Name == "hypot" ||
+         Name == "fdim" || Name == "fmod" || Name == "remainder" ||
+         Name == "copysign" || Name == "fmax" || Name == "fmin";
+}
+
+static FunctionType *getDeviceMathDeclarationType(Module &M, StringRef MathName,
+                                                  StringRef LLVMName) {
+  Type *Ty = nullptr;
+  if (LLVMName.ends_with("f32")) {
+    Ty = Type::getFloatTy(M.getContext());
+  } else if (LLVMName.ends_with("f64")) {
+    Ty = Type::getDoubleTy(M.getContext());
+  } else {
+    return nullptr;
+  }
+
+  Intrinsic::ID KnownID = Intrinsic::not_intrinsic;
+  if (isMemFreeLibMFunction(MathName, &KnownID) &&
+      KnownID != Intrinsic::not_intrinsic) {
+    if (KnownID == Intrinsic::pow || KnownID == Intrinsic::minnum ||
+        KnownID == Intrinsic::maxnum)
+      return FunctionType::get(Ty, {Ty, Ty}, false);
+    return FunctionType::get(Ty, {Ty}, false);
+  }
+
+  StringRef BaseName = MathName;
+  if (BaseName.ends_with("f"))
+    BaseName = BaseName.drop_back();
+
+  if (isUnarySameTypeDeviceMathName(BaseName))
+    return FunctionType::get(Ty, {Ty}, false);
+  if (isBinarySameTypeDeviceMathName(BaseName))
+    return FunctionType::get(Ty, {Ty, Ty}, false);
+  return nullptr;
+}
+
+static std::optional<std::pair<std::string, std::string>>
+getDeviceMathSeedForFunction(
+    Function &F,
+    const StringMap<std::pair<std::string, std::string>> &Implements) {
+  if (auto Found = Implements.find(F.getName()); Found != Implements.end()) {
+    return std::make_pair(Found->getValue().first,
+                          StringRef(Found->getValue().second).take_back(3).str());
+  }
+
+  StringRef MathName = getFuncName(&F);
+  if (MathName.empty())
+    return std::nullopt;
+
+  if (MathName.starts_with("llvm.")) {
+    StringRef Rest = MathName.drop_front(5);
+    size_t DotPos = Rest.rfind('.');
+    if (DotPos == StringRef::npos)
+      return std::nullopt;
+
+    StringRef BaseMathName = Rest.substr(0, DotPos);
+    StringRef PrecisionSuffix = Rest.substr(DotPos + 1);
+    if (PrecisionSuffix != "f32" && PrecisionSuffix != "f64")
+      return std::nullopt;
+
+    std::string NormalizedMathName = BaseMathName.str();
+    if (PrecisionSuffix == "f32")
+      NormalizedMathName += "f";
+    return std::make_pair(std::move(NormalizedMathName),
+                          PrecisionSuffix.str());
+  }
+
+  if (!isMemFreeLibMFunction(MathName))
+    return std::nullopt;
+
+  if (F.getReturnType()->isFloatTy())
+    return std::make_pair(MathName.str(), "f32");
+  if (F.getReturnType()->isDoubleTy())
+    return std::make_pair(MathName.str(), "f64");
+
+  return std::nullopt;
+}
+
+static std::optional<std::string> findDeviceMathNameBySignature(
+    const StringMap<std::pair<std::string, std::string>> &Implements,
+    StringRef MathName, StringRef PrecisionSuffix) {
+  for (const auto &Entry : Implements) {
+    if (Entry.getValue().first == MathName &&
+        StringRef(Entry.getValue().second).ends_with(PrecisionSuffix))
+      return Entry.getKey().str();
+  }
+  return std::nullopt;
+}
+
+static void enqueueNeededDeviceMathName(StringRef DeviceName,
+                                        StringSet<> &NeededNames,
+                                        SmallVectorImpl<std::string> &Worklist) {
+  if (NeededNames.insert(DeviceName).second)
+    Worklist.push_back(DeviceName.str());
+}
+
+static ArrayRef<const char *>
+getDeviceMathDependencyBaseNames(StringRef BaseMathName) {
+  static constexpr const char *SinDeps[] = {"cos"};
+  static constexpr const char *CosDeps[] = {"sin"};
+  static constexpr const char *SinhDeps[] = {"cosh"};
+  static constexpr const char *CoshDeps[] = {"sinh"};
+  static constexpr const char *TanhDeps[] = {"cosh"};
+  static constexpr const char *J0Deps[] = {"j1"};
+  static constexpr const char *J1Deps[] = {"j0", "jn"};
+  static constexpr const char *Y0Deps[] = {"y1"};
+  static constexpr const char *Y1Deps[] = {"y0", "yn"};
+  static constexpr const char *PowDeps[] = {"log"};
+  static constexpr const char *RemainderDeps[] = {"round"};
+  static constexpr const char *FmodDeps[] = {"floor", "fabs", "copysign"};
+  static constexpr const char *ExpDeps[] = {"exp"};
+  static constexpr const char *SincDeps[] = {"cos"};
+
+  return StringSwitch<ArrayRef<const char *>>(BaseMathName)
+      .Case("sin", ArrayRef<const char *>(SinDeps))
+      .Case("cos", ArrayRef<const char *>(CosDeps))
+      .Case("sinh", ArrayRef<const char *>(SinhDeps))
+      .Case("cosh", ArrayRef<const char *>(CoshDeps))
+      .Case("tanh", ArrayRef<const char *>(TanhDeps))
+      .Case("j0", ArrayRef<const char *>(J0Deps))
+      .Case("j1", ArrayRef<const char *>(J1Deps))
+      .Case("y0", ArrayRef<const char *>(Y0Deps))
+      .Case("y1", ArrayRef<const char *>(Y1Deps))
+      .Case("pow", ArrayRef<const char *>(PowDeps))
+      .Case("remainder", ArrayRef<const char *>(RemainderDeps))
+      .Case("fmod", ArrayRef<const char *>(FmodDeps))
+      .Cases("expm1", "erf", ArrayRef<const char *>(ExpDeps))
+      .Cases("erfc", "erfcx", ArrayRef<const char *>(ExpDeps))
+      .Cases("erfcinv", "erfi", ArrayRef<const char *>(ExpDeps))
+      .Cases("sinc", "sincn", ArrayRef<const char *>(SincDeps))
+      .Default({});
+}
+
+static void enqueueDependentDeviceMathNames(
+    StringRef MathName, StringRef PrecisionSuffix,
+    const StringMap<std::pair<std::string, std::string>> &Implements,
+    StringSet<> &NeededNames, SmallVectorImpl<std::string> &Worklist) {
+  bool IsFloat = MathName.ends_with("f") || PrecisionSuffix == "f32";
+  StringRef BaseMathName = MathName;
+  if (IsFloat && BaseMathName.ends_with("f"))
+    BaseMathName = BaseMathName.drop_back();
+
+  auto addDependency = [&](StringRef DepBaseMathName) {
+    SmallString<16> DepMathName(DepBaseMathName);
+    if (IsFloat)
+      DepMathName += "f";
+
+      if (auto DepDeviceName = findDeviceMathNameBySignature(
+          Implements, DepMathName, PrecisionSuffix))
+      enqueueNeededDeviceMathName(*DepDeviceName, NeededNames, Worklist);
+  };
+
+  for (const char *DepBaseMathName : getDeviceMathDependencyBaseNames(BaseMathName))
+    addDependency(DepBaseMathName);
+}
+
+static StringSet<> collectNeededDeviceMathNames(
+    Module &M,
+    const StringMap<std::pair<std::string, std::string>> &Implements) {
+  StringSet<> NeededNames;
+  SmallVector<std::string, 16> Worklist;
+
+  for (Function &F : M) {
+    auto Seed = getDeviceMathSeedForFunction(F, Implements);
+    if (!Seed)
+      continue;
+
+    if (auto DeviceName = findDeviceMathNameBySignature(
+            Implements, Seed->first, Seed->second))
+      enqueueNeededDeviceMathName(*DeviceName, NeededNames, Worklist);
+
+    enqueueDependentDeviceMathNames(Seed->first, Seed->second, Implements,
+                                    NeededNames, Worklist);
+  }
+
+  while (!Worklist.empty()) {
+    std::string DeviceName = Worklist.pop_back_val();
+    auto Found = Implements.find(DeviceName);
+    if (Found == Implements.end())
+      continue;
+
+    StringRef MathName = Found->getValue().first;
+    StringRef LLVMName = Found->getValue().second;
+    if (!(LLVMName.ends_with("f32") || LLVMName.ends_with("f64")))
+      continue;
+
+    enqueueDependentDeviceMathNames(MathName, LLVMName.take_back(3), Implements,
+                                    NeededNames, Worklist);
+  }
+
+  return NeededNames;
+}
+
+static bool materializeDeviceMathDeclarations(
+    Module &M,
+    const StringMap<std::pair<std::string, std::string>> &Implements,
+    const StringSet<> &NeededDeviceMathNames) {
+  Triple TT(M.getTargetTriple());
+  if (!(isTargetNVPTX(M) || TT.isAMDGPU()))
+    return false;
+
+  bool changed = false;
+  for (const auto &NeededName : NeededDeviceMathNames) {
+    StringRef DeviceName = NeededName.getKey();
+    auto Entry = Implements.find(DeviceName);
+    if (Entry == Implements.end())
+      continue;
+    if (M.getFunction(DeviceName))
+      continue;
+
+    FunctionType *FT = getDeviceMathDeclarationType(
+      M, Entry->getValue().first, Entry->getValue().second);
+    if (!FT)
+      continue;
+
+    Function *F = Function::Create(FT, Function::ExternalLinkage, DeviceName, M);
+    F->setCallingConv(isTargetNVPTX(M) ? CallingConv::Fast : CallingConv::C);
+    F->addFnAttr(Attribute::NoUnwind);
+    F->addFnAttr(Attribute::WillReturn);
+    changed = true;
+  }
+  return changed;
+}
+
+static bool materializeMangledMinMaxWrapperDefinitions(Module &M) {
+  Triple TT(M.getTargetTriple());
+  if (!(isTargetNVPTX(M) || TT.isAMDGPU()))
+    return false;
+
+  bool changed = false;
+  for (Function &F : llvm::make_early_inc_range(M)) {
+    if (!F.isDeclaration())
+      continue;
+    if (!F.getName().starts_with("_Z"))
+      continue;
+
+    Intrinsic::ID KnownID = Intrinsic::not_intrinsic;
+    if (!isMemFreeLibMFunction(F.getName(), &KnownID) ||
+        (KnownID != Intrinsic::minnum && KnownID != Intrinsic::maxnum))
+      continue;
+
+    FunctionType *FT = F.getFunctionType();
+    Type *Ty = FT->getReturnType();
+    if (FT->isVarArg() || FT->getNumParams() != 2)
+      continue;
+    if (Ty != FT->getParamType(0) || Ty != FT->getParamType(1))
+      continue;
+
+    auto *Entry = BasicBlock::Create(M.getContext(), "entry", &F);
+    IRBuilder<> Builder(Entry);
+    Value *X = F.getArg(0);
+    Value *Y = F.getArg(1);
+    X->setName("x");
+    Y->setName("y");
+    Function *IntrinsicDecl = Intrinsic::getDeclaration(&M, KnownID, {Ty});
+    auto *Call = Builder.CreateCall(IntrinsicDecl, {X, Y});
+    Call->setCallingConv(IntrinsicDecl->getCallingConv());
+    Builder.CreateRet(Call);
+    changed = true;
+  }
+
+  return changed;
+}
+
+static std::optional<std::string> findLibdevicePath() {
+  SmallVector<std::string, 4> Candidates;
+  for (const char *EnvName : {"CUDA_PATH", "CUDA_HOME"}) {
+    if (const char *Base = std::getenv(EnvName)) {
+      SmallString<256> Path(Base);
+      sys::path::append(Path, "nvvm", "libdevice", "libdevice.10.bc");
+      Candidates.push_back(std::string(Path));
+    }
+  }
+
+#if defined(_WIN32)
+  Candidates.push_back(
+      "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.8\\nvvm\\libdevice\\libdevice.10.bc");
+#else
+  Candidates.push_back("/usr/local/cuda/nvvm/libdevice/libdevice.10.bc");
+#endif
+
+  for (const std::string &Path : Candidates) {
+    if (sys::fs::exists(Path))
+      return Path;
+  }
+  return std::nullopt;
+}
+
+static bool linkMissingNVPTXDeviceMathImplementations(
+    Module &M, const StringSet<> &NeededDeviceMathNames) {
+  if (!isTargetNVPTX(M))
+    return false;
+
+  SmallVector<std::string, 8> MissingNames;
+  for (const auto &NeededName : NeededDeviceMathNames) {
+    StringRef DeviceName = NeededName.getKey();
+    if (!DeviceName.starts_with("__nv_"))
+      continue;
+
+    Function *F = M.getFunction(DeviceName);
+    if (!F || !F->isDeclaration())
+      continue;
+
+    MissingNames.push_back(DeviceName.str());
+  }
+
+  if (MissingNames.empty())
+    return false;
+
+  auto LibdevicePath = findLibdevicePath();
+  if (!LibdevicePath)
+    return false;
+
+  auto BufferOrErr = MemoryBuffer::getFile(*LibdevicePath);
+  if (!BufferOrErr)
+    return false;
+
+  auto ModuleOrErr = parseBitcodeFile((*BufferOrErr)->getMemBufferRef(),
+                                      M.getContext());
+  if (!ModuleOrErr) {
+    consumeError(ModuleOrErr.takeError());
+    return false;
+  }
+
+  if (Linker::linkModules(M, std::move(*ModuleOrErr),
+                          Linker::Flags::LinkOnlyNeeded))
+    return false;
+
+  for (const std::string &Name : MissingNames) {
+    if (Function *F = M.getFunction(Name))
+      if (!F->isDeclaration())
+        return true;
+  }
+  return false;
+}
+
+static bool preserveDeviceMathImplementations(
+    Module &M,
+    const StringMap<std::pair<std::string, std::string>> &Implements) {
+  Triple TT(M.getTargetTriple());
+  if (!(isTargetNVPTX(M) || TT.isAMDGPU()))
+    return false;
+  if (M.getGlobalVariable(preserve_device_math_anchor_name))
+    return false;
+
+  SmallVector<GlobalValue *, 8> toPreserve;
+  for (Function &F : M) {
+    if (Implements.find(F.getName()) == Implements.end())
+      continue;
+    toPreserve.push_back(&F);
+  }
+
+  if (toPreserve.empty())
+    return false;
+
+  Type *Int8PtrTy = getInt8PtrTy(M.getContext());
+  SmallVector<Constant *, 8> entries;
+  entries.reserve(toPreserve.size());
+  for (auto *GV : toPreserve)
+    entries.push_back(ConstantExpr::getPointerCast(GV, Int8PtrTy));
+
+  auto *AnchorTy = ArrayType::get(Int8PtrTy, entries.size());
+  auto *Anchor = new GlobalVariable(
+      M, AnchorTy, true, GlobalValue::InternalLinkage,
+      ConstantArray::get(AnchorTy, entries), preserve_device_math_anchor_name);
+  Anchor->setSection("llvm.metadata");
+
+  SmallVector<GlobalValue *, 1> used{Anchor};
+  appendToCompilerUsed(M, used);
+  return true;
 }
 
 template <const char *handlername, DerivativeMode Mode, int numargs>
@@ -455,7 +865,10 @@ bool preserveNVVM(bool Begin, Module &M) {
   }
   SmallVector<GlobalVariable *, 1> toErase;
   for (GlobalVariable &g : M.globals()) {
-    if (g.getName().contains(gradient_handler_name)) {
+    if (g.getName().contains(preserve_device_math_anchor_name)) {
+      toErase.push_back(&g);
+      changed = true;
+    } else if (g.getName().contains(gradient_handler_name)) {
       handleCustomDerivative<gradient_handler_name,
                              DerivativeMode::ReverseModeGradient, 3>(M, g,
                                                                      toErase);
@@ -776,82 +1189,103 @@ bool preserveNVVM(bool Begin, Module &M) {
   }
 
   StringMap<std::pair<std::string, std::string>> Implements;
+  bool IsNVPTX = isTargetNVPTX(M);
+  Triple TT(M.getTargetTriple());
+  bool IsAMDGPU = TT.isAMDGPU();
   for (std::string T : {"", "f"}) {
-    // CUDA
-    // sincos, sinpi, cospi, sincospi, cyl_bessel_i1
-    for (std::string name :
-         {"sin",        "cos",     "tan",       "log2",   "exp",    "exp2",
-          "exp10",      "cosh",    "sinh",      "tanh",   "atan2",  "atan",
-          "asin",       "acos",    "log",       "log10",  "log1p",  "acosh",
-          "asinh",      "atanh",   "expm1",     "hypot",  "rhypot", "norm3d",
-          "rnorm3d",    "norm4d",  "rnorm4d",   "norm",   "rnorm",  "cbrt",
-          "rcbrt",      "j0",      "j1",        "y0",     "y1",     "yn",
-          "jn",         "erf",     "erfinv",    "erfc",   "erfcx",  "erfcinv",
-          "normcdfinv", "normcdf", "lgamma",    "ldexp",  "scalbn", "frexp",
-          "modf",       "fmod",    "remainder", "remquo", "powi",   "tgamma",
-          "round",      "fdim",    "ilogb",     "logb",   "isinf",  "pow",
-          "sqrt",       "finite",  "fabs",      "fmax"}) {
-      std::string nvname = "__nv_" + name;
-      std::string llname = "llvm." + name + ".";
-      std::string mathname = name;
+    if (IsNVPTX) {
+      // CUDA
+      // sincos, sinpi, cospi, sincospi, cyl_bessel_i1
+      for (std::string name :
+           {"sin",        "cos",     "tan",       "log2",   "exp",    "exp2",
+            "exp10",      "cosh",    "sinh",      "tanh",   "atan2",  "atan",
+            "asin",       "acos",    "log",       "log10",  "log1p",  "acosh",
+            "asinh",      "atanh",   "expm1",     "hypot",  "rhypot", "norm3d",
+            "rnorm3d",    "norm4d",  "rnorm4d",   "norm",   "rnorm",  "cbrt",
+            "rcbrt",      "j0",      "j1",        "y0",     "y1",     "yn",
+            "jn",         "erf",     "erfinv",    "erfc",   "erfcx",  "erfcinv",
+            "normcdfinv", "normcdf", "lgamma",    "ldexp",  "scalbn", "frexp",
+            "modf",       "fmod",    "remainder", "remquo", "powi",   "tgamma",
+            "round",      "fdim",    "ilogb",     "logb",   "isinf",  "pow",
+            "sqrt",       "finite",  "fabs",      "fmax",   "fmin",   "floor",
+            "ceil",       "trunc",   "rint",      "nearbyint", "copysign"}) {
+        std::string nvname = "__nv_" + name;
+        std::string llname = "llvm." + name + ".";
+        std::string mathname = name;
 
-      if (T == "f") {
-        mathname += "f";
-        nvname += "f";
-        llname += "f32";
-      } else {
-        llname += "f64";
+        if (T == "f") {
+          mathname += "f";
+          nvname += "f";
+          llname += "f32";
+        } else {
+          llname += "f64";
+        }
+
+        Implements[nvname] = std::make_pair(mathname, llname);
       }
-
-      Implements[nvname] = std::make_pair(mathname, llname);
     }
-    // ROCM
-    // sincos, sinpi, cospi, sincospi, cyl_bessel_i1
-    for (std::string name : {"acos",         "acosh",        "asin",
-                             "asinh",        "atan2",        "atan",
-                             "atanh",        "cbrt",         "ceil",
-                             "copysign",     "cos",          "native_cos",
-                             "cosh",         "cospi",        "i0",
-                             "i1",           "erfc",         "erfcinv",
-                             "erfcx",        "erf",          "erfinv",
-                             "exp10",        "native_exp10", "exp2",
-                             "exp",          "native_exp",   "expm1",
-                             "fabs",         "fdim",         "floor",
-                             "fma",          "fmax",         "fmin",
-                             "fmod",         "frexp",        "hypot",
-                             "ilogb",        "isfinite",     "isinf",
-                             "isnan",        "j0",           "j1",
-                             "ldexp",        "lgamma",       "log10",
-                             "native_log10", "log1p",        "log2",
-                             "log2",         "logb",         "log",
-                             "native_log",   "modf",         "nearbyint",
-                             "nextafter",    "len3",         "len4",
-                             "ncdf",         "ncdfinv",      "pow",
-                             "pown",         "rcbrt",        "remainder",
-                             "remquo",       "rhypot",       "rint",
-                             "rlen3",        "rlen4",        "round",
-                             "rsqrt",        "scalb",        "scalbn",
-                             "signbit",      "sincos",       "sincospi",
-                             "sin",          "native_sin",   "sinh",
-                             "sinpi",        "sqrt",         "native_sqrt",
-                             "tan",          "tanh",         "tgamma",
-                             "trunc",        "y0",           "y1"}) {
-      std::string nvname = "__ocml_" + name + "_";
-      std::string llname = "llvm." + name + ".";
-      std::string mathname = name;
 
-      if (T == "f") {
-        mathname += "f";
-        nvname += "f32";
-        llname += "f32";
-      } else {
-        nvname += "f64";
-        llname += "f64";
+    if (IsAMDGPU) {
+      // ROCM
+      // sincos, sinpi, cospi, sincospi, cyl_bessel_i1
+      for (std::string name : {"acos",         "acosh",        "asin",
+                               "asinh",        "atan2",        "atan",
+                               "atanh",        "cbrt",         "ceil",
+                               "copysign",     "cos",          "native_cos",
+                               "cosh",         "cospi",        "i0",
+                               "i1",           "erfc",         "erfcinv",
+                               "erfcx",        "erf",          "erfinv",
+                               "exp10",        "native_exp10", "exp2",
+                               "exp",          "native_exp",   "expm1",
+                               "fabs",         "fdim",         "floor",
+                               "fma",          "fmax",         "fmin",
+                               "fmod",         "frexp",        "hypot",
+                               "ilogb",        "isfinite",     "isinf",
+                               "isnan",        "j0",           "j1",
+                               "ldexp",        "lgamma",       "log10",
+                               "native_log10", "log1p",        "log2",
+                               "log2",         "logb",         "log",
+                               "native_log",   "modf",         "nearbyint",
+                               "nextafter",    "len3",         "len4",
+                               "ncdf",         "ncdfinv",      "pow",
+                               "pown",         "rcbrt",        "remainder",
+                               "remquo",       "rhypot",       "rint",
+                               "rlen3",        "rlen4",        "round",
+                               "rsqrt",        "scalb",        "scalbn",
+                               "signbit",      "sincos",       "sincospi",
+                               "sin",          "native_sin",   "sinh",
+                               "sinpi",        "sqrt",         "native_sqrt",
+                               "tan",          "tanh",         "tgamma",
+                               "trunc",        "y0",           "y1"}) {
+        std::string nvname = "__ocml_" + name + "_";
+        std::string llname = "llvm." + name + ".";
+        std::string mathname = name;
+
+        if (T == "f") {
+          mathname += "f";
+          nvname += "f32";
+          llname += "f32";
+        } else {
+          nvname += "f64";
+          llname += "f64";
+        }
+
+        Implements[nvname] = std::make_pair(mathname, llname);
       }
-
-      Implements[nvname] = std::make_pair(mathname, llname);
     }
   }
+  StringSet<> NeededDeviceMathNames =
+      collectNeededDeviceMathNames(M, Implements);
+  if (Begin)
+    changed |= materializeDeviceMathDeclarations(M, Implements,
+                                                 NeededDeviceMathNames);
+  if (Begin)
+    changed |= materializeMangledMinMaxWrapperDefinitions(M);
+  if (Begin)
+    changed |= linkMissingNVPTXDeviceMathImplementations(M,
+                                                         NeededDeviceMathNames);
+  if (Begin)
+    changed |= preserveDeviceMathImplementations(M, Implements);
   for (auto &F : llvm::make_early_inc_range(M)) {
     if (Begin) {
       changed |= attributeKnownFunctions(F);

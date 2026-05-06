@@ -23,10 +23,15 @@
 //===----------------------------------------------------------------------===//
 #include "CApi.h"
 #if LLVM_VERSION_MAJOR >= 16
+#if defined(_MSC_VER)
+#include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
+#else
 #define private public
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
 #undef private
+#endif
 #else
 #include "SCEV/ScalarEvolution.h"
 #include "SCEV/ScalarEvolutionExpander.h"
@@ -688,7 +693,7 @@ LLVMValueRef EnzymeCreatePrimalAndGradient(
   return wrap(eunwrap(Logic).CreatePrimalAndGradient(
       RequestContext(cast_or_null<Instruction>(unwrap(request_req)),
                      unwrap(request_ip)),
-      (ReverseCacheKey){
+      ReverseCacheKey{
           .todiff = cast<Function>(unwrap(todiff)),
           .retType = (DIFFE_TYPE)retType,
           .constant_args = nconstant_args,
@@ -1112,7 +1117,7 @@ struct MyAttributorLegacyPass : public ModulePass {
     AU.addRequired<TargetLibraryInfoWrapperPass>();
   }
 };
-extern "C++" char MyAttributorLegacyPass::ID = 0;
+char MyAttributorLegacyPass::ID = 0;
 void EnzymeAddAttributorLegacyPass(LLVMPassManagerRef PM) {
   unwrap(PM)->add(new MyAttributorLegacyPass());
 }

@@ -35,10 +35,15 @@
 #include <llvm/Config/llvm-config.h>
 
 #if LLVM_VERSION_MAJOR >= 16
+#if defined(_MSC_VER)
+#include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
+#else
 #define private public
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
 #undef private
+#endif
 #else
 #include "SCEV/ScalarEvolution.h"
 #include "SCEV/ScalarEvolutionExpander.h"
@@ -570,13 +575,15 @@ public:
   llvm::Value *applyChainRule(llvm::Type *diffType, llvm::IRBuilder<> &Builder,
                               Func rule, Args... args) {
     if (width > 1) {
-      const int size = sizeof...(args);
-      llvm::Value *vals[size] = {args...};
+      constexpr size_t size = sizeof...(args);
+      if constexpr (size > 0) {
+        llvm::Value *vals[size] = {args...};
 
-      for (size_t i = 0; i < size; ++i)
-        if (vals[i])
-          assert(llvm::cast<llvm::ArrayType>(vals[i]->getType())
-                     ->getNumElements() == width);
+        for (size_t i = 0; i < size; ++i)
+          if (vals[i])
+            assert(llvm::cast<llvm::ArrayType>(vals[i]->getType())
+                       ->getNumElements() == width);
+      }
 
       llvm::Type *wrappedType = diffType->isVoidTy()
                                     ? nullptr
@@ -601,13 +608,15 @@ public:
   template <typename Func, typename... Args>
   void applyChainRule(llvm::IRBuilder<> &Builder, Func rule, Args... args) {
     if (width > 1) {
-      const int size = sizeof...(args);
-      llvm::Value *vals[size] = {args...};
+      constexpr size_t size = sizeof...(args);
+      if constexpr (size > 0) {
+        llvm::Value *vals[size] = {args...};
 
-      for (size_t i = 0; i < size; ++i)
-        if (vals[i])
-          assert(llvm::cast<llvm::ArrayType>(vals[i]->getType())
-                     ->getNumElements() == width);
+        for (size_t i = 0; i < size; ++i)
+          if (vals[i])
+            assert(llvm::cast<llvm::ArrayType>(vals[i]->getType())
+                       ->getNumElements() == width);
+      }
 
       for (unsigned int i = 0; i < getWidth(); ++i) {
         auto tup = std::tuple<Args...>{

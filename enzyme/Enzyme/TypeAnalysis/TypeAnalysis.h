@@ -34,6 +34,7 @@
 #include "llvm/ADT/StringMap.h"
 
 #include "llvm/Analysis/TargetLibraryInfo.h"
+#include "llvm/Demangle/Demangle.h"
 
 #if LLVM_VERSION_MAJOR >= 16
 #include "llvm/Analysis/ScalarEvolution.h"
@@ -61,6 +62,14 @@ extern const llvm::StringMap<llvm::Intrinsic::ID> LIBM_FUNCTIONS;
 static inline bool isMemFreeLibMFunction(llvm::StringRef str,
                                          llvm::Intrinsic::ID *ID = nullptr) {
   llvm::StringRef ogstr = str;
+  auto lookupLibM = [&](llvm::StringRef name) {
+    auto found = LIBM_FUNCTIONS.find(name.str());
+    if (found == LIBM_FUNCTIONS.end())
+      return false;
+    if (ID)
+      *ID = found->second;
+    return true;
+  };
   if (ID) {
     if (str == "llvm.enzyme.lifetime_start") {
       *ID = llvm::Intrinsic::lifetime_start;
@@ -80,26 +89,31 @@ static inline bool isMemFreeLibMFunction(llvm::StringRef str,
   } else if (startsWith(str, "__ocml_")) {
     str = str.substr(7, str.size() - 7);
   }
-  if (LIBM_FUNCTIONS.find(str.str()) != LIBM_FUNCTIONS.end()) {
-    if (ID)
-      *ID = LIBM_FUNCTIONS.find(str.str())->second;
+  if (lookupLibM(str)) {
     return true;
   }
   if (endsWith(str, "f") || endsWith(str, "l") ||
       (startsWith(ogstr, "__nv_") && endsWith(str, "d"))) {
-    if (LIBM_FUNCTIONS.find(str.substr(0, str.size() - 1).str()) !=
-        LIBM_FUNCTIONS.end()) {
-      if (ID)
-        *ID = LIBM_FUNCTIONS.find(str.substr(0, str.size() - 1).str())->second;
+    if (lookupLibM(str.substr(0, str.size() - 1))) {
       return true;
     }
   }
   if ((startsWith(ogstr, "__ocml_") &&
        (endsWith(str, "_f64") || endsWith(str, "_f32")))) {
-    if (LIBM_FUNCTIONS.find(str.substr(0, str.size() - 4).str()) !=
-        LIBM_FUNCTIONS.end()) {
-      if (ID)
-        *ID = LIBM_FUNCTIONS.find(str.substr(0, str.size() - 4).str())->second;
+    if (lookupLibM(str.substr(0, str.size() - 4))) {
+      return true;
+    }
+  }
+  std::string demangledName = llvm::demangle(ogstr.str());
+  if (!demangledName.empty() && demangledName != ogstr.str()) {
+    llvm::StringRef baseName(demangledName);
+    if (auto lparen = baseName.find('('); lparen != llvm::StringRef::npos)
+      baseName = baseName.substr(0, lparen);
+    if (lookupLibM(baseName)) {
+      return true;
+    }
+    if ((endsWith(baseName, "f") || endsWith(baseName, "l")) &&
+        lookupLibM(baseName.substr(0, baseName.size() - 1))) {
       return true;
     }
   }

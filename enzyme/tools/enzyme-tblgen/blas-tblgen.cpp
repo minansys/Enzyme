@@ -907,7 +907,7 @@ void rev_call_arg(bool forward, const DagInit *ruleDag,
     }
     if (Def->isSubClassOf("MagicInst")) {
       if (Def->getName() == "Rows" || Def->isSubClassOf("Rows")) {
-        os << "({";
+        os << "([&]() {";
         for (size_t i = Dag->getNumArgs() - 1;; i--) {
           os << "auto brow_" << i << " = ";
           rev_call_arg(forward, Dag, pattern, i, os, vars);
@@ -917,6 +917,8 @@ void rev_call_arg(bool forward, const DagInit *ruleDag,
         }
         if (Dag->getNumArgs() == 1)
           os << "SmallVector<Value*, 1> vals = {to_blas_callconv(Builder2, ";
+        else
+          os << "return ";
         os << "get_blas_row(Builder2, ";
         for (size_t i = 0; i < Dag->getNumArgs(); i++) {
           os << "brow_" << i;
@@ -925,18 +927,18 @@ void rev_call_arg(bool forward, const DagInit *ruleDag,
         os << "byRef, cublas)";
         if (Dag->getNumArgs() == 1)
           os << "[0], byRef, cublas, julia_decl_type, allocationBuilder, "
-                "\"\")}; vals";
-        os << ";})";
+                "\"\")}; return vals";
+        os << ";}())";
         return;
       }
       if (Def->getName() == "Concat") {
-        os << "({";
+        os << "([&]() {";
         for (size_t i = 0; i < Dag->getNumArgs(); i++) {
           os << "auto concat_" << i << " = ";
           rev_call_arg(forward, Dag, pattern, i, os, vars);
           os << "; ";
         }
-        os << "concat_values<";
+        os << "return concat_values<";
         for (size_t i = 0; i < Dag->getNumArgs(); i++) {
           if (i != 0)
             os << ", ";
@@ -948,7 +950,7 @@ void rev_call_arg(bool forward, const DagInit *ruleDag,
             os << ", ";
           os << "concat_" << i;
         }
-        os << "); })";
+        os << "); }())";
         return;
       }
       if (Def->getName() == "ld") {
@@ -1209,7 +1211,7 @@ void rev_call_arg(bool forward, const DagInit *ruleDag,
             "(Value*)cubcall);\n"
          << "         resvec[0] = to_blas_fp_callconv(Builder2, resvec[0], "
             "byRefFloat, blasFPType, allocationBuilder, \"blascall\");\n"
-         << "         resvec;\n";
+        << "         resvec;\n";
       os << " })\n";
       return;
     }

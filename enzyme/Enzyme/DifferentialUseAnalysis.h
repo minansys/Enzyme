@@ -44,6 +44,12 @@
 #include "GradientUtils.h"
 #include "LibraryFuncs.h"
 
+#if defined(_MSC_VER)
+#define ENZYME_ALWAYS_INLINE __forceinline
+#else
+#define ENZYME_ALWAYS_INLINE __attribute__((always_inline)) inline
+#endif
+
 extern "C" {
 extern llvm::cl::opt<bool> EnzymePrintDiffUse;
 }
@@ -516,7 +522,7 @@ void minCut(const llvm::DataLayout &DL, llvm::LoopInfo &OrigLI,
             llvm::SetVector<llvm::Value *> &MinReq, const GradientUtils *gutils,
             llvm::TargetLibraryInfo &TLI);
 
-__attribute__((always_inline)) static inline void
+static ENZYME_ALWAYS_INLINE void
 forEachDirectInsertUser(llvm::function_ref<void(llvm::Instruction *)> f,
                         const GradientUtils *gutils, llvm::Instruction *IVI,
                         llvm::Value *val, bool useCheck) {
@@ -557,7 +563,7 @@ forEachDirectInsertUser(llvm::function_ref<void(llvm::Instruction *)> f,
   }
 }
 
-__attribute__((always_inline)) static inline void
+static ENZYME_ALWAYS_INLINE void
 forEachDifferentialUser(llvm::function_ref<void(llvm::Value *)> f,
                         const GradientUtils *gutils, llvm::Value *V,
                         bool useCheck = false) {

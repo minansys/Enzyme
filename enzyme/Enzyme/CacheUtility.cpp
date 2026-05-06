@@ -66,7 +66,7 @@ void CacheUtility::erase(Instruction *I) {
     scopeInstructions.erase(AI);
   }
   scopeMap.erase(I);
-  SE.eraseValueFromMap(I);
+  SE.forgetValue(I);
 
   if (!I->use_empty()) {
     std::string str;

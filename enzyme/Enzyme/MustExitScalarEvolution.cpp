@@ -41,6 +41,55 @@
 
 using namespace llvm;
 
+#if defined(_MSC_VER) && LLVM_VERSION_MAJOR >= 16
+
+// On MSVC the `#define private public` hack used by Enzyme to reach
+// ScalarEvolution internals causes linker symbol mangling drift against
+// LLVM's prebuilt libraries. The MSVC build therefore implements only
+// `computeExitLimit` on top of the public `getExitCount` API; the other
+// override points are intentionally not provided (see
+// MustExitScalarEvolution.h, where they are #if'd out for MSVC builds).
+MustExitScalarEvolution::MustExitScalarEvolution(Function &F,
+                                                 TargetLibraryInfo &TLI,
+                                                 AssumptionCache &AC,
+                                                 DominatorTree &DT,
+                                                 LoopInfo &LI)
+    : ScalarEvolution(F, TLI, AC, DT, LI),
+      GuaranteedUnreachable(getGuaranteedUnreachable(&F)) {}
+
+ScalarEvolution::ExitLimit MustExitScalarEvolution::computeExitLimit(
+    const Loop *L, BasicBlock *ExitingBlock, bool AllowPredicates) {
+  if (!L || !ExitingBlock || !L->contains(ExitingBlock))
+    return getCouldNotCompute();
+
+  bool HasReachableExit = false;
+  for (auto *Succ : successors(ExitingBlock)) {
+    if (!L->contains(Succ) && !GuaranteedUnreachable.count(Succ)) {
+      HasReachableExit = true;
+      break;
+    }
+  }
+  if (!HasReachableExit)
+    return getCouldNotCompute();
+
+  const SCEV *ExactNotTaken = getExitCount(L, ExitingBlock, Exact);
+  const SCEV *ConstantMaxNotTaken =
+      getExitCount(L, ExitingBlock, ConstantMaximum);
+  const SCEV *SymbolicMaxNotTaken =
+      getExitCount(L, ExitingBlock, SymbolicMaximum);
+
+  if (isa<SCEVCouldNotCompute>(ExactNotTaken) &&
+      isa<SCEVCouldNotCompute>(ConstantMaxNotTaken) &&
+      isa<SCEVCouldNotCompute>(SymbolicMaxNotTaken))
+    return getCouldNotCompute();
+
+  (void)AllowPredicates;
+  return ExitLimit(ExactNotTaken, ConstantMaxNotTaken, SymbolicMaxNotTaken,
+                   isBackedgeTakenCountMaxOrZero(L));
+}
+
+#else
+
 bool MustExitScalarEvolution::loopIsFiniteByAssumption(const Loop *L) {
   return true;
 }
@@ -1316,3 +1365,5 @@ ScalarEvolution::ExitLimit MustExitScalarEvolution::howManyLessThans(
 #endif
 
 #endif
+
+#endif // !( _MSC_VER && LLVM_VERSION_MAJOR >= 16 )
