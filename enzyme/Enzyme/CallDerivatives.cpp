@@ -666,8 +666,9 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
       bool forwardMode = Mode == DerivativeMode::ForwardMode ||
                          Mode == DerivativeMode::ForwardModeError;
 
-      IRBuilder<> Builder2 =
-          forwardMode ? IRBuilder<>(&call) : IRBuilder<>(call.getParent());
+      IRBuilder<> Builder2(call.getParent());
+      if (forwardMode)
+        Builder2.SetInsertPoint(&call);
       if (forwardMode) {
         getForwardBuilder(Builder2);
       } else {
@@ -805,8 +806,9 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
       bool forwardMode = Mode == DerivativeMode::ForwardMode ||
                          Mode == DerivativeMode::ForwardModeError;
 
-      IRBuilder<> Builder2 =
-          forwardMode ? IRBuilder<>(&call) : IRBuilder<>(call.getParent());
+      IRBuilder<> Builder2(call.getParent());
+      if (forwardMode)
+        Builder2.SetInsertPoint(&call);
       if (forwardMode) {
         getForwardBuilder(Builder2);
       } else {
@@ -920,8 +922,9 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
       bool forwardMode = Mode == DerivativeMode::ForwardMode ||
                          Mode == DerivativeMode::ForwardModeError;
 
-      IRBuilder<> Builder2 =
-          forwardMode ? IRBuilder<>(&call) : IRBuilder<>(call.getParent());
+      IRBuilder<> Builder2(call.getParent());
+      if (forwardMode)
+        Builder2.SetInsertPoint(&call);
       if (forwardMode) {
         getForwardBuilder(Builder2);
       } else {
@@ -1128,8 +1131,9 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
       bool forwardMode = Mode == DerivativeMode::ForwardMode ||
                          Mode == DerivativeMode::ForwardModeError;
 
-      IRBuilder<> Builder2 =
-          forwardMode ? IRBuilder<>(&call) : IRBuilder<>(call.getParent());
+      IRBuilder<> Builder2(call.getParent());
+      if (forwardMode)
+        Builder2.SetInsertPoint(&call);
       if (forwardMode) {
         getForwardBuilder(Builder2);
       } else {
@@ -1427,8 +1431,9 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
       bool forwardMode = Mode == DerivativeMode::ForwardMode ||
                          Mode == DerivativeMode::ForwardModeError;
 
-      IRBuilder<> Builder2 =
-          forwardMode ? IRBuilder<>(&call) : IRBuilder<>(call.getParent());
+      IRBuilder<> Builder2(call.getParent());
+      if (forwardMode)
+        Builder2.SetInsertPoint(&call);
       if (forwardMode) {
         getForwardBuilder(Builder2);
       } else {
@@ -1669,8 +1674,9 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
       bool forwardMode = Mode == DerivativeMode::ForwardMode ||
                          Mode == DerivativeMode::ForwardModeError;
 
-      IRBuilder<> Builder2 =
-          forwardMode ? IRBuilder<>(&call) : IRBuilder<>(call.getParent());
+      IRBuilder<> Builder2(call.getParent());
+      if (forwardMode)
+        Builder2.SetInsertPoint(&call);
       if (forwardMode) {
         getForwardBuilder(Builder2);
       } else {
@@ -1892,8 +1898,9 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
       bool forwardMode = Mode == DerivativeMode::ForwardMode ||
                          Mode == DerivativeMode::ForwardModeError;
 
-      IRBuilder<> Builder2 =
-          forwardMode ? IRBuilder<>(&call) : IRBuilder<>(call.getParent());
+      IRBuilder<> Builder2(call.getParent());
+      if (forwardMode)
+        Builder2.SetInsertPoint(&call);
       if (forwardMode) {
         getForwardBuilder(Builder2);
       } else {
@@ -2150,8 +2157,9 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
       bool forwardMode = Mode == DerivativeMode::ForwardMode ||
                          Mode == DerivativeMode::ForwardModeError;
 
-      IRBuilder<> Builder2 =
-          forwardMode ? IRBuilder<>(&call) : IRBuilder<>(call.getParent());
+      IRBuilder<> Builder2(call.getParent());
+      if (forwardMode)
+        Builder2.SetInsertPoint(&call);
       if (forwardMode) {
         getForwardBuilder(Builder2);
       } else {

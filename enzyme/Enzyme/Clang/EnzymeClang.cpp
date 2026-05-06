@@ -211,8 +211,6 @@ public:
       CGOpts.PassPlugins.push_back(pluginPath);
 #endif
     }
-    CI.getPreprocessorOpts().Includes.push_back("/enzyme/enzyme/version");
-
     std::string PredefineBuffer;
     PredefineBuffer.reserve(4080);
     llvm::raw_string_ostream Predefines(PredefineBuffer);
@@ -225,6 +223,9 @@ public:
     Builder.defineMacro("ENZYME_VERSION_PATCH",
                         std::to_string(ENZYME_VERSION_PATCH));
     CI.getPreprocessor().setPredefines(Predefines.str());
+
+#if !defined(_WIN32)
+    CI.getPreprocessorOpts().Includes.push_back("/enzyme/enzyme/version");
 
     auto baseFS = &CI.getFileManager().getVirtualFileSystem();
     llvm::vfs::OverlayFileSystem *fuseFS(
@@ -258,6 +259,7 @@ public:
                               /*isFramework=*/false);
     CI.getPreprocessor().getHeaderSearchInfo().AddSearchPath(DL,
                                                              /*isAngled=*/true);
+#endif
   }
   ~EnzymePlugin() {}
   void HandleTranslationUnit(ASTContext &context) override {}

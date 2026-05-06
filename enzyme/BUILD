@@ -11,6 +11,14 @@ package(
     default_visibility = ["//visibility:public"],
 )
 
+ENZYME_WARNING_COPTS = select({
+    "@platforms//os:windows": [],
+    "//conditions:default": [
+        "-Wno-unused-variable",
+        "-Wno-return-type",
+    ],
+})
+
 cc_library(
     name = "enzyme-tblgen-hdrs",
     hdrs = glob(["tools/enzyme-tblgen/*.h"]),
@@ -315,9 +323,7 @@ cc_library(
         "-DENZYME_VERSION_MAJOR=0",
         "-DENZYME_VERSION_MINOR=0",
         "-DENZYME_VERSION_PATCH=79",
-        "-Wno-unused-variable",
-        "-Wno-return-type",
-    ],
+    ] + ENZYME_WARNING_COPTS,
     data = ["@llvm-project//clang:builtin_headers_gen"],
     includes = [
         "Enzyme/Clang",  # for bundled_includes.h
@@ -371,11 +377,20 @@ expand_template(
 cc_binary(
     name = "enzyme-clang",
     srcs = ["enzyme-clang-driver.cpp"],
-    copts = [
-        "-Wno-implicit-fallthrough",
-        "-Wno-error=frame-larger-than=",
-        "-Denzyme_clang_main=clang_main",
-    ],
+    copts = select({
+        "@platforms//os:windows": [
+            "-Denzyme_clang_main=clang_main",
+        ],
+        "//conditions:default": [
+            "-Wno-implicit-fallthrough",
+            "-Wno-error=frame-larger-than=",
+            "-Denzyme_clang_main=clang_main",
+        ],
+    }),
+    linkopts = select({
+        "@platforms//os:windows": ["/STACK:10000000"],
+        "//conditions:default": [],
+    }),
     deps = [
         ":EnzymeStatic",
         "@llvm-project//clang:clang-driver",
