@@ -16,6 +16,13 @@ ENZYME_WARNING_COPTS = select({
     ],
 })
 
+ENZYME_LANGUAGE_COPTS = select({
+    "@platforms//os:windows": [
+        "/std:c++20",
+    ],
+    "//conditions:default": [],
+})
+
 cc_library(
     name = "enzyme-tblgen-hdrs",
     hdrs = glob(["tools/enzyme-tblgen/*.h"]),
@@ -160,7 +167,7 @@ cc_library(
         "-DENZYME_VERSION_MAJOR=0",
         "-DENZYME_VERSION_MINOR=0",
         "-DENZYME_VERSION_PATCH=79",
-    ] + ENZYME_WARNING_COPTS,
+    ] + ENZYME_WARNING_COPTS + ENZYME_LANGUAGE_COPTS,
     data = ["@llvm-project//clang:builtin_headers_gen"],
     includes = [
         "Enzyme/Clang",  # for bundled_includes.h
