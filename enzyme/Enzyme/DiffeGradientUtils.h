@@ -72,6 +72,9 @@ class DiffeGradientUtils final : public GradientUtils {
       DerivativeMode mode, bool runtimeActivity, bool strongZero,
       unsigned width, bool omp);
 
+  bool shouldUseAtomicShadowUpdate(llvm::Instruction *orig,
+                                   llvm::Value *origptr) const;
+
 public:
   /// Whether to free memory in reverse pass or split forward.
   bool FreeMemory;

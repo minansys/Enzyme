@@ -189,6 +189,35 @@ DiffeGradientUtils *DiffeGradientUtils::CreateFromClone(
   return res;
 }
 
+bool DiffeGradientUtils::shouldUseAtomicShadowUpdate(Instruction *orig,
+                                                     Value *origptr) const {
+  if (!AtomicAdd)
+    return false;
+
+  Value *base = getBaseObject(origptr);
+  auto arch = llvm::Triple(newFunc->getParent()->getTargetTriple()).getArch();
+
+  // Stack allocations and local shadow objects cannot be raced by another CUDA
+  // work item, so a normal load/add/store is sufficient.
+  if (isa<AllocaInst>(base) &&
+      (arch == Triple::nvptx || arch == Triple::nvptx64 ||
+       arch == Triple::amdgcn))
+    return false;
+
+  // Backwards-only shadows are created in this function and do not escape. This
+  // assumes that all additional parallelism in this function is outlined.
+  if (backwardsOnlyShadows.find(base) != backwardsOnlyShadows.end())
+    return false;
+
+  // The elementwise-read contract states that each CUDA work item reads a
+  // distinct input element and therefore accumulates into a distinct shadow
+  // location. Avoiding atomics here is the root CUDA atomic-add optimization.
+  if (elementwiseReadForContext(orig, origptr))
+    return false;
+
+  return true;
+}
+
 AllocaInst *DiffeGradientUtils::getDifferential(Value *val) {
   assert(mode != DerivativeMode::ForwardMode);
   assert(mode != DerivativeMode::ForwardModeSplit);
@@ -994,26 +1023,9 @@ void DiffeGradientUtils::addToInvertedPtrDiffe(Instruction *orig,
     dif = applyChainRule(addingType, BuilderM, rule, dif);
   }
 
-  auto TmpOrig = getBaseObject(origptr);
-
   // atomics
-  bool Atomic = AtomicAdd;
+  bool Atomic = shouldUseAtomicShadowUpdate(orig, origptr);
   auto Arch = llvm::Triple(newFunc->getParent()->getTargetTriple()).getArch();
-
-  // No need to do atomic on local memory for CUDA since it can't be raced
-  // upon
-  if (isa<AllocaInst>(TmpOrig) &&
-      (Arch == Triple::nvptx || Arch == Triple::nvptx64 ||
-       Arch == Triple::amdgcn)) {
-    Atomic = false;
-  }
-  // Moreover no need to do atomic on local shadows regardless since they are
-  // not captured/escaping and created in this function. This assumes that
-  // all additional parallelism in this function is outlined.
-  if (backwardsOnlyShadows.find(TmpOrig) != backwardsOnlyShadows.end())
-    Atomic = false;
-  if (Atomic && elementwiseReadForContext(orig, origptr))
-    Atomic = false;
 
   if (Atomic) {
     // For amdgcn constant AS is 4 and if the primal is in it we need to cast
