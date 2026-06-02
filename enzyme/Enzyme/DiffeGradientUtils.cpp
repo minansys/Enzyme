@@ -38,8 +38,14 @@
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Value.h"
+#if LLVM_VERSION_MAJOR >= 17
+#include "llvm/TargetParser/Triple.h"
+#else
+#include "llvm/ADT/Triple.h"
+#endif
 
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 
@@ -47,6 +53,7 @@
 #include "llvm/Support/ErrorHandling.h"
 
 #include "LibraryFuncs.h"
+#include "SimpleGVN.h"
 #include "Utils.h"
 
 using namespace llvm;
@@ -68,6 +75,57 @@ bool elementwiseReadForContext(const Instruction *orig, const Value *origptr) {
     }
   }
   return false;
+}
+
+bool sameAtomicUpdatePointer(Value *lhs, Value *rhs) {
+  if (lhs == rhs)
+    return true;
+
+  lhs = lhs->stripPointerCasts();
+  rhs = rhs->stripPointerCasts();
+  if (lhs == rhs)
+    return true;
+
+  auto *lhsI = dyn_cast<Instruction>(lhs);
+  auto *rhsI = dyn_cast<Instruction>(rhs);
+  return lhsI && rhsI && lhsI->isIdenticalToWhenDefined(rhsI);
+}
+
+Value *foldPreviousAtomicFAdd(IRBuilder<> &Builder, AtomicRMWInst::BinOp op,
+                              Value *ptr, Value *dif, MaybeAlign align,
+                              AtomicOrdering ordering,
+                              SyncScope::ID syncScope) {
+  BasicBlock *block = Builder.GetInsertBlock();
+  if (!block)
+    return dif;
+
+  auto it = Builder.GetInsertPoint();
+  while (it != block->begin()) {
+    --it;
+    Instruction *prev = &*it;
+
+    if (isa<DbgInfoIntrinsic>(prev))
+      continue;
+
+    if (auto *rmw = dyn_cast<AtomicRMWInst>(prev)) {
+      if (rmw->getOperation() != op || rmw->isVolatile() || !rmw->use_empty() ||
+          rmw->getOrdering() != ordering ||
+          rmw->getSyncScopeID() != syncScope ||
+          !sameAtomicUpdatePointer(rmw->getPointerOperand(), ptr))
+        return dif;
+      if (align && rmw->getAlign() != *align)
+        return dif;
+
+      Value *folded = Builder.CreateFAdd(rmw->getValOperand(), dif);
+      rmw->eraseFromParent();
+      return folded;
+    }
+
+    if (prev->mayReadOrWriteMemory() || prev->mayHaveSideEffects())
+      return dif;
+  }
+
+  return dif;
 }
 } // namespace
 
@@ -1014,6 +1072,9 @@ void DiffeGradientUtils::addToInvertedPtrDiffe(Instruction *orig,
     Atomic = false;
   if (Atomic && elementwiseReadForContext(orig, origptr))
     Atomic = false;
+  const bool FoldCudaAtomicAdds =
+      EnzymeEnableCudaRepeatedLoads &&
+      (Arch == Triple::nvptx || Arch == Triple::nvptx64);
 
   if (Atomic) {
     // For amdgcn constant AS is 4 and if the primal is in it we need to cast
@@ -1076,6 +1137,10 @@ void DiffeGradientUtils::addToInvertedPtrDiffe(Instruction *orig,
               }
             }
           }
+          if (FoldCudaAtomicAdds)
+            vdif = foldPreviousAtomicFAdd(BuilderM, op, vptr, vdif, alignv,
+                                          AtomicOrdering::Monotonic,
+                                          SyncScope::System);
           BuilderM.CreateAtomicRMW(op, vptr, vdif, alignv,
                                    AtomicOrdering::Monotonic,
                                    SyncScope::System);
@@ -1095,6 +1160,10 @@ void DiffeGradientUtils::addToInvertedPtrDiffe(Instruction *orig,
             }
           }
         }
+        if (FoldCudaAtomicAdds)
+          dif = foldPreviousAtomicFAdd(BuilderM, op, ptr, dif, alignv,
+                                       AtomicOrdering::Monotonic,
+                                       SyncScope::System);
         BuilderM.CreateAtomicRMW(op, ptr, dif, alignv,
                                  AtomicOrdering::Monotonic, SyncScope::System);
       };

@@ -34,10 +34,16 @@
 
 #include "PassUtils.h"
 #include "llvm/IR/PassManager.h"
+#include "llvm/Support/CommandLine.h"
 
 namespace llvm {
+class AAResults;
 class FunctionPass;
-}
+} // namespace llvm
+
+extern llvm::cl::opt<bool> EnzymeEnableCudaRepeatedLoads;
+
+bool simplifyRepeatedGlobalLoads(llvm::Function &F, llvm::AAResults &AA);
 
 class SimpleGVNNewPM final : public PassParent<SimpleGVNNewPM> {
   friend PassParent<SimpleGVNNewPM>;

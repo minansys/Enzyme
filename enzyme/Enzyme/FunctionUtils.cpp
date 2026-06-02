@@ -28,6 +28,7 @@
 #include "EnzymeLogic.h"
 #include "GradientUtils.h"
 #include "LibraryFuncs.h"
+#include "SimpleGVN.h"
 
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/BasicBlock.h"
@@ -2295,6 +2296,14 @@ Function *PreProcessCache::preprocessForClone(Function *F,
   NewF->addFnAttr(Attribute::WillReturn);
   NewF->addFnAttr(Attribute::MustProgress);
   setFullWillReturn(NewF);
+
+  if (EnzymeEnableCudaRepeatedLoads) {
+    auto &AA = FAM.getResult<AAManager>(*NewF);
+    if (simplifyRepeatedGlobalLoads(*NewF, AA)) {
+      PreservedAnalyses PA;
+      FAM.invalidate(*NewF, PA);
+    }
+  }
 
   if (EnzymePreopt) {
     if (EnzymeInline) {

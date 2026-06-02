@@ -21,6 +21,8 @@
 // This file contains a GVN-like optimization pass that forwards loads from
 // noalias/nocapture arguments to their corresponding stores, with support
 // for offsets and type conversions.
+// It also performs conservative repeated-load forwarding for NVPTX global
+// memory loads when no intervening instruction can clobber the loaded address.
 //
 // This pass addresses the limitation of LLVM's built-in GVN pass which has
 // a small limit on the number of instructions/memory offsets it analyzes
@@ -56,6 +58,11 @@
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#if LLVM_VERSION_MAJOR >= 17
+#include "llvm/TargetParser/Triple.h"
+#else
+#include "llvm/ADT/Triple.h"
+#endif
 
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
@@ -92,6 +99,11 @@ using namespace llvm;
 #undef DEBUG_TYPE
 #endif
 #define DEBUG_TYPE "simple-gvn"
+
+llvm::cl::opt<bool> EnzymeEnableCudaRepeatedLoads(
+    "enzyme-enable-cuda-repeated-loads", cl::init(false), cl::Hidden,
+    cl::desc("Enable CUDA repeated global load forwarding and adjoint atomic "
+             "folding"));
 
 namespace {
 
@@ -245,6 +257,106 @@ static bool memoryRangesAlias(const APInt &Offset1, uint64_t Size1,
 
   // Otherwise, they may alias
   return true;
+}
+
+static bool isNVPTXModule(const Module *M) {
+  if (!M)
+    return false;
+  Triple::ArchType Arch = Triple(M->getTargetTriple()).getArch();
+  return Arch == Triple::nvptx || Arch == Triple::nvptx64;
+}
+
+static bool isRepeatedGlobalLoadCandidate(LoadInst *LI) {
+  return LI->isSimple() && LI->getPointerAddressSpace() == 1;
+}
+
+static bool sameLoadPointer(Value *LHS, Value *RHS) {
+  if (LHS == RHS)
+    return true;
+
+  LHS = LHS->stripPointerCasts();
+  RHS = RHS->stripPointerCasts();
+  if (LHS == RHS)
+    return true;
+
+  auto *LHSGEP = dyn_cast<GetElementPtrInst>(LHS);
+  auto *RHSGEP = dyn_cast<GetElementPtrInst>(RHS);
+  return LHSGEP && RHSGEP && LHSGEP->isIdenticalToWhenDefined(RHSGEP);
+}
+
+static bool canForwardRepeatedLoad(LoadInst *Prev, LoadInst *LI) {
+  return Prev->getType() == LI->getType() &&
+         Prev->getPointerAddressSpace() == LI->getPointerAddressSpace() &&
+         sameLoadPointer(Prev->getPointerOperand(), LI->getPointerOperand());
+}
+
+static bool mayClobberLoad(Instruction *MaybeClobber, LoadInst *LI,
+                           AAResults &AA) {
+  if (!MaybeClobber->mayWriteToMemory())
+    return false;
+  return isModSet(AA.getModRefInfo(MaybeClobber, MemoryLocation::get(LI)));
+}
+
+static void invalidateAvailableLoads(Instruction *I,
+                                     SmallVectorImpl<LoadInst *> &Available,
+                                     AAResults &AA) {
+  if (Available.empty())
+    return;
+
+  if (I->mayWriteToMemory()) {
+    for (auto It = Available.begin(); It != Available.end();) {
+      if (mayClobberLoad(I, *It, AA))
+        It = Available.erase(It);
+      else
+        ++It;
+    }
+    return;
+  }
+
+  if (I->mayHaveSideEffects())
+    Available.clear();
+}
+
+static bool simplifyRepeatedGlobalLoadsImpl(Function &F, AAResults &AA) {
+  if (!EnzymeEnableCudaRepeatedLoads || !isNVPTXModule(F.getParent()))
+    return false;
+
+  bool Changed = false;
+  for (BasicBlock &BB : F) {
+    SmallVector<LoadInst *, 8> AvailableLoads;
+    for (auto It = BB.begin(), End = BB.end(); It != End;) {
+      Instruction *I = &*It++;
+
+      if (auto *LI = dyn_cast<LoadInst>(I)) {
+        if (isRepeatedGlobalLoadCandidate(LI)) {
+          LoadInst *ForwardFrom = nullptr;
+          for (LoadInst *Prev : AvailableLoads) {
+            if (canForwardRepeatedLoad(Prev, LI)) {
+              ForwardFrom = Prev;
+              break;
+            }
+          }
+
+          if (ForwardFrom) {
+            LLVM_DEBUG(dbgs() << "SimpleGVN: Forwarding repeated global load\n"
+                              << "  Load: " << *ForwardFrom << "\n"
+                              << "  Redundant load: " << *LI << "\n");
+            LI->replaceAllUsesWith(ForwardFrom);
+            LI->eraseFromParent();
+            Changed = true;
+            continue;
+          }
+
+          AvailableLoads.push_back(LI);
+          continue;
+        }
+      }
+
+      invalidateAvailableLoads(I, AvailableLoads, AA);
+    }
+  }
+
+  return Changed;
 }
 
 // Collect memory operations (loads, stores) and calls for a given pointer value
@@ -578,16 +690,28 @@ public:
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.addRequired<DominatorTreeWrapperPass>();
+    if (EnzymeEnableCudaRepeatedLoads)
+      AU.addRequired<AAResultsWrapperPass>();
   }
 
   bool runOnFunction(Function &F) override {
     auto &DT = getAnalysis<DominatorTreeWrapperPass>().getDomTree();
     const DataLayout &DL = F.getParent()->getDataLayout();
-    return simplifyGVN(F, DT, DL);
+    bool Changed = false;
+    if (EnzymeEnableCudaRepeatedLoads) {
+      auto &AA = getAnalysis<AAResultsWrapperPass>().getAAResults();
+      Changed |= simplifyRepeatedGlobalLoadsImpl(F, AA);
+    }
+    Changed |= simplifyGVN(F, DT, DL);
+    return Changed;
   }
 };
 
 } // namespace
+
+bool simplifyRepeatedGlobalLoads(Function &F, AAResults &AA) {
+  return simplifyRepeatedGlobalLoadsImpl(F, AA);
+}
 
 FunctionPass *createSimpleGVNPass() { return new SimpleGVN(); }
 
@@ -604,7 +728,9 @@ SimpleGVNNewPM::Result SimpleGVNNewPM::run(Function &F,
                                            FunctionAnalysisManager &FAM) {
   bool Changed = false;
   const DataLayout &DL = F.getParent()->getDataLayout();
-  Changed = simplifyGVN(F, FAM.getResult<DominatorTreeAnalysis>(F), DL);
+  if (EnzymeEnableCudaRepeatedLoads)
+    Changed |= simplifyRepeatedGlobalLoadsImpl(F, FAM.getResult<AAManager>(F));
+  Changed |= simplifyGVN(F, FAM.getResult<DominatorTreeAnalysis>(F), DL);
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
 
