@@ -42,8 +42,11 @@ class FunctionPass;
 } // namespace llvm
 
 extern llvm::cl::opt<bool> EnzymeEnableCudaRepeatedLoads;
+extern llvm::cl::opt<bool> EnzymeEnableCudaAtomicTailMerge;
 
 bool simplifyRepeatedGlobalLoads(llvm::Function &F, llvm::AAResults &AA);
+bool coalesceRepeatedCudaAtomicFAdds(llvm::Function &F, llvm::AAResults &AA);
+bool mergeCudaShadowAtomicFAddTails(llvm::Function &F, llvm::AAResults &AA);
 
 class SimpleGVNNewPM final : public PassParent<SimpleGVNNewPM> {
   friend PassParent<SimpleGVNNewPM>;

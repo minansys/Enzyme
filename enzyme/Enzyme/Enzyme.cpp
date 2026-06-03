@@ -78,6 +78,7 @@
 #include "EnzymeLogic.h"
 #include "GradientUtils.h"
 #include "PassUtils.h"
+#include "SimpleGVN.h"
 #include "TraceInterface.h"
 #include "TraceUtils.h"
 #include "Utils.h"
@@ -1627,6 +1628,17 @@ public:
                   &*fn->getEntryBlock().begin(),
                   "Could not generate derivative function of ", n);
       return false;
+    }
+
+    if (EnzymeEnableCudaRepeatedLoads) {
+      auto &AA = Logic.PPC.FAM.getResult<AAManager>(*newFunc);
+      bool CudaRepeatedLoadChanged = simplifyRepeatedGlobalLoads(*newFunc, AA);
+      CudaRepeatedLoadChanged |= coalesceRepeatedCudaAtomicFAdds(*newFunc, AA);
+      CudaRepeatedLoadChanged |= mergeCudaShadowAtomicFAddTails(*newFunc, AA);
+      if (CudaRepeatedLoadChanged) {
+        PreservedAnalyses PA;
+        Logic.PPC.FAM.invalidate(*newFunc, PA);
+      }
     }
 
     if (differentialReturn) {

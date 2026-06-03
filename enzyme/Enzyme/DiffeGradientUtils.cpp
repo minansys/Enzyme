@@ -1077,6 +1077,38 @@ void DiffeGradientUtils::addToInvertedPtrDiffe(Instruction *orig,
       (Arch == Triple::nvptx || Arch == Triple::nvptx64);
 
   if (Atomic) {
+    auto setDerivativeAtomicMetadata = [&](AtomicRMWInst *RMW, size_t idx) {
+      RMW->setMetadata("enzyme_shadow_atomic",
+                       MDNode::get(RMW->getContext(), {}));
+      SmallVector<Metadata *, 1> scopeMD = {
+          getDerivativeAliasScope(origptr, idx)};
+      if (auto *origValI = dyn_cast_or_null<Instruction>(origVal))
+        if (auto *MD = origValI->getMetadata(LLVMContext::MD_alias_scope))
+          for (auto &M : cast<MDNode>(MD)->operands())
+            scopeMD.push_back(M);
+      RMW->setMetadata(LLVMContext::MD_alias_scope,
+                       MDNode::get(RMW->getContext(), scopeMD));
+
+      SmallVector<Metadata *, 1> MDs;
+      for (ssize_t j = -1; j < getWidth(); j++) {
+        if (j != (ssize_t)idx)
+          MDs.push_back(getDerivativeAliasScope(origptr, j));
+      }
+      if (auto *origValI = dyn_cast_or_null<Instruction>(origVal))
+        if (auto *MD = origValI->getMetadata(LLVMContext::MD_noalias))
+          for (auto &M : cast<MDNode>(MD)->operands())
+            MDs.push_back(M);
+      if (!MDs.empty())
+        RMW->setMetadata(LLVMContext::MD_noalias,
+                         MDNode::get(RMW->getContext(), MDs));
+
+      RMW->setMetadata(LLVMContext::MD_tbaa,
+                       orig->getMetadata(LLVMContext::MD_tbaa));
+      RMW->setMetadata(LLVMContext::MD_tbaa_struct,
+                       orig->getMetadata(LLVMContext::MD_tbaa_struct));
+      RMW->setDebugLoc(getNewFromOriginal(orig->getDebugLoc()));
+    };
+
     // For amdgcn constant AS is 4 and if the primal is in it we need to cast
     // the derivative value to AS 1
     if (Arch == Triple::amdgcn &&
@@ -1116,10 +1148,12 @@ void DiffeGradientUtils::addToInvertedPtrDiffe(Instruction *orig,
      }
      */
     AtomicRMWInst::BinOp op = AtomicRMWInst::FAdd;
+    size_t idx = 0;
     if (auto vt = dyn_cast<VectorType>(addingType)) {
       assert(!vt->getElementCount().isScalable());
       size_t numElems = vt->getElementCount().getKnownMinValue();
       auto rule = [&](Value *dif, Value *ptr) {
+        size_t shadowIdx = idx++;
         for (size_t i = 0; i < numElems; ++i) {
           auto vdif = BuilderM.CreateExtractElement(dif, i);
           vdif = SanitizeDerivatives(orig, vdif, BuilderM);
@@ -1141,14 +1175,16 @@ void DiffeGradientUtils::addToInvertedPtrDiffe(Instruction *orig,
             vdif = foldPreviousAtomicFAdd(BuilderM, op, vptr, vdif, alignv,
                                           AtomicOrdering::Monotonic,
                                           SyncScope::System);
-          BuilderM.CreateAtomicRMW(op, vptr, vdif, alignv,
-                                   AtomicOrdering::Monotonic,
-                                   SyncScope::System);
+          auto *RMW = BuilderM.CreateAtomicRMW(op, vptr, vdif, alignv,
+                                               AtomicOrdering::Monotonic,
+                                               SyncScope::System);
+          setDerivativeAtomicMetadata(RMW, shadowIdx);
         }
       };
       applyChainRule(BuilderM, rule, dif, ptr);
     } else {
       auto rule = [&](Value *dif, Value *ptr) {
+        size_t shadowIdx = idx++;
         dif = SanitizeDerivatives(orig, dif, BuilderM);
         MaybeAlign alignv = align;
         if (alignv) {
@@ -1164,8 +1200,9 @@ void DiffeGradientUtils::addToInvertedPtrDiffe(Instruction *orig,
           dif = foldPreviousAtomicFAdd(BuilderM, op, ptr, dif, alignv,
                                        AtomicOrdering::Monotonic,
                                        SyncScope::System);
-        BuilderM.CreateAtomicRMW(op, ptr, dif, alignv,
-                                 AtomicOrdering::Monotonic, SyncScope::System);
+        auto *RMW = BuilderM.CreateAtomicRMW(
+            op, ptr, dif, alignv, AtomicOrdering::Monotonic, SyncScope::System);
+        setDerivativeAtomicMetadata(RMW, shadowIdx);
       };
       applyChainRule(BuilderM, rule, dif, ptr);
     }

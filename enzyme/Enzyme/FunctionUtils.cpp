@@ -3111,6 +3111,8 @@ Function *PreProcessCache::CloneFunctionWithReturns(
       if (F->getAttributes().hasParamAttr(ii, attr)) {
         NewF->addParamAttr(jj, F->getAttributes().getParamAttr(ii, attr));
       }
+    if (EnzymeNoAlias && j->getType()->isPointerTy())
+      NewF->addParamAttr(jj, Attribute::NoAlias);
     for (auto ty : PrimalParamAttrsToPreserve)
       if (F->getAttributes().hasParamAttr(ii, ty)) {
         auto attr = F->getAttributes().getParamAttr(ii, ty);
@@ -3153,6 +3155,8 @@ Function *PreProcessCache::CloneFunctionWithReturns(
       ptrInputs[i] = (j + 1);
       // TODO: find a way to keep the attributes in vector mode.
       if (width == 1) {
+        if (EnzymeNoAlias && (j + 1)->getType()->isPointerTy())
+          NewF->addParamAttr(jj + 1, Attribute::NoAlias);
         for (auto ty : ShadowParamAttrsToPreserve) {
           if (F->getAttributes().hasParamAttr(ii, ty)) {
             auto attr = F->getAttributes().getParamAttr(ii, ty);

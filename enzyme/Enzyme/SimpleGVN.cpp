@@ -56,8 +56,11 @@
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+
+#include <algorithm>
 #if LLVM_VERSION_MAJOR >= 17
 #include "llvm/TargetParser/Triple.h"
 #else
@@ -104,6 +107,10 @@ llvm::cl::opt<bool> EnzymeEnableCudaRepeatedLoads(
     "enzyme-enable-cuda-repeated-loads", cl::init(false), cl::Hidden,
     cl::desc("Enable CUDA repeated global load forwarding and adjoint atomic "
              "folding"));
+
+llvm::cl::opt<bool> EnzymeEnableCudaAtomicTailMerge(
+    "enzyme-enable-cuda-atomic-tail-merge", cl::init(false), cl::Hidden,
+    cl::desc("Enable CUDA Enzyme shadow atomic tail merging"));
 
 namespace {
 
@@ -267,7 +274,14 @@ static bool isNVPTXModule(const Module *M) {
 }
 
 static bool isRepeatedGlobalLoadCandidate(LoadInst *LI) {
-  return LI->isSimple() && LI->getPointerAddressSpace() == 1;
+  if (!LI->isSimple())
+    return false;
+
+  // CUDA C++ device pointers commonly reach LLVM as generic addrspace(0)
+  // pointers even when they refer to global memory. The forwarding below is
+  // guarded by AA clobber checks, so it is also safe for generic pointers.
+  unsigned AS = LI->getPointerAddressSpace();
+  return AS == 0 || AS == 1;
 }
 
 static bool sameLoadPointer(Value *LHS, Value *RHS) {
@@ -284,10 +298,14 @@ static bool sameLoadPointer(Value *LHS, Value *RHS) {
   return LHSGEP && RHSGEP && LHSGEP->isIdenticalToWhenDefined(RHSGEP);
 }
 
-static bool canForwardRepeatedLoad(LoadInst *Prev, LoadInst *LI) {
-  return Prev->getType() == LI->getType() &&
-         Prev->getPointerAddressSpace() == LI->getPointerAddressSpace() &&
-         sameLoadPointer(Prev->getPointerOperand(), LI->getPointerOperand());
+static bool canForwardRepeatedLoad(LoadInst *Prev, LoadInst *LI,
+                                   AAResults &AA) {
+  if (Prev->getType() != LI->getType() ||
+      Prev->getPointerAddressSpace() != LI->getPointerAddressSpace())
+    return false;
+  if (sameLoadPointer(Prev->getPointerOperand(), LI->getPointerOperand()))
+    return true;
+  return AA.isMustAlias(MemoryLocation::get(Prev), MemoryLocation::get(LI));
 }
 
 static bool mayClobberLoad(Instruction *MaybeClobber, LoadInst *LI,
@@ -331,7 +349,7 @@ static bool simplifyRepeatedGlobalLoadsImpl(Function &F, AAResults &AA) {
         if (isRepeatedGlobalLoadCandidate(LI)) {
           LoadInst *ForwardFrom = nullptr;
           for (LoadInst *Prev : AvailableLoads) {
-            if (canForwardRepeatedLoad(Prev, LI)) {
+            if (canForwardRepeatedLoad(Prev, LI, AA)) {
               ForwardFrom = Prev;
               break;
             }
@@ -354,6 +372,339 @@ static bool simplifyRepeatedGlobalLoadsImpl(Function &F, AAResults &AA) {
 
       invalidateAvailableLoads(I, AvailableLoads, AA);
     }
+  }
+
+  return Changed;
+}
+
+static bool sameAtomicUpdatePointer(Value *LHS, Value *RHS) {
+  if (LHS == RHS)
+    return true;
+
+  LHS = LHS->stripPointerCasts();
+  RHS = RHS->stripPointerCasts();
+  if (LHS == RHS)
+    return true;
+
+  auto *LHSI = dyn_cast<Instruction>(LHS);
+  auto *RHSI = dyn_cast<Instruction>(RHS);
+  return LHSI && RHSI && LHSI->isIdenticalToWhenDefined(RHSI);
+}
+
+static bool isCudaAtomicFAddCandidate(AtomicRMWInst *RMW) {
+  return RMW->getMetadata("enzyme_shadow_atomic") &&
+         RMW->getOperation() == AtomicRMWInst::FAdd && !RMW->isVolatile() &&
+         RMW->use_empty() && RMW->getOrdering() == AtomicOrdering::Monotonic &&
+         RMW->getValOperand()->getType()->isFloatingPointTy();
+}
+
+static bool sameAtomicLocation(AtomicRMWInst *Prev, AtomicRMWInst *RMW,
+                               AAResults &AA) {
+  if (sameAtomicUpdatePointer(Prev->getPointerOperand(),
+                              RMW->getPointerOperand()))
+    return true;
+  return AA.isMustAlias(MemoryLocation::get(Prev), MemoryLocation::get(RMW));
+}
+
+static bool canCoalesceAtomicFAdd(AtomicRMWInst *Prev, AtomicRMWInst *RMW,
+                                  AAResults &AA) {
+  if (!isCudaAtomicFAddCandidate(Prev) || !isCudaAtomicFAddCandidate(RMW))
+    return false;
+  if (Prev->getOrdering() != RMW->getOrdering() ||
+      Prev->getSyncScopeID() != RMW->getSyncScopeID() ||
+      Prev->getAlign() != RMW->getAlign())
+    return false;
+  return sameAtomicLocation(Prev, RMW, AA);
+}
+
+static bool instructionMayAccessLocation(Instruction *I,
+                                         const MemoryLocation &Loc,
+                                         AAResults &AA) {
+  if (!I->mayReadOrWriteMemory())
+    return false;
+  return !isNoModRef(AA.getModRefInfo(I, Loc));
+}
+
+static void invalidatePendingAtomicFAdds(
+    Instruction *I,
+    SmallVectorImpl<std::pair<AtomicRMWInst *, MemoryLocation>> &Pending,
+    AAResults &AA) {
+  if (Pending.empty())
+    return;
+
+  if (I->mayHaveSideEffects() && !isa<AtomicRMWInst>(I)) {
+    Pending.clear();
+    return;
+  }
+
+  if (!I->mayReadOrWriteMemory())
+    return;
+
+  for (auto It = Pending.begin(); It != Pending.end();) {
+    if (instructionMayAccessLocation(I, It->second, AA))
+      It = Pending.erase(It);
+    else
+      ++It;
+  }
+}
+
+static bool coalesceRepeatedCudaAtomicFAddsImpl(Function &F, AAResults &AA) {
+  if (!EnzymeEnableCudaRepeatedLoads || !isNVPTXModule(F.getParent()))
+    return false;
+
+  bool Changed = false;
+  for (BasicBlock &BB : F) {
+    SmallVector<std::pair<AtomicRMWInst *, MemoryLocation>, 8> Pending;
+    for (auto It = BB.begin(), End = BB.end(); It != End;) {
+      Instruction *I = &*It++;
+      auto *RMW = dyn_cast<AtomicRMWInst>(I);
+      if (!RMW || !isCudaAtomicFAddCandidate(RMW)) {
+        invalidatePendingAtomicFAdds(I, Pending, AA);
+        continue;
+      }
+
+      AtomicRMWInst *FoldWith = nullptr;
+      unsigned FoldIndex = 0;
+      for (auto I = 0u; I < Pending.size(); ++I) {
+        if (canCoalesceAtomicFAdd(Pending[I].first, RMW, AA)) {
+          FoldWith = Pending[I].first;
+          FoldIndex = I;
+          break;
+        }
+      }
+
+      if (!FoldWith) {
+        invalidatePendingAtomicFAdds(RMW, Pending, AA);
+        Pending.push_back({RMW, MemoryLocation::get(RMW)});
+        continue;
+      }
+
+      IRBuilder<> Builder(RMW);
+      Value *Folded =
+          Builder.CreateFAdd(FoldWith->getValOperand(), RMW->getValOperand());
+      auto *NewRMW = Builder.CreateAtomicRMW(
+          RMW->getOperation(), RMW->getPointerOperand(), Folded,
+          RMW->getAlign(), RMW->getOrdering(), RMW->getSyncScopeID());
+      NewRMW->copyMetadata(*RMW);
+      NewRMW->setDebugLoc(RMW->getDebugLoc());
+
+      FoldWith->eraseFromParent();
+      RMW->eraseFromParent();
+      Pending.erase(Pending.begin() + FoldIndex);
+
+      invalidatePendingAtomicFAdds(NewRMW, Pending, AA);
+      Pending.push_back({NewRMW, MemoryLocation::get(NewRMW)});
+      Changed = true;
+    }
+  }
+  return Changed;
+}
+
+struct AtomicTailGroup {
+  BasicBlock *Succ;
+  SmallVector<BasicBlock *, 4> Preds;
+  SmallVector<SmallVector<AtomicRMWInst *, 8>, 4> Atomics;
+};
+
+static bool sameTailMergeAtomicShape(AtomicRMWInst *LHS, AtomicRMWInst *RHS) {
+  return LHS->getOperation() == RHS->getOperation() &&
+         LHS->getOrdering() == RHS->getOrdering() &&
+         LHS->getSyncScopeID() == RHS->getSyncScopeID() &&
+         LHS->getAlign() == RHS->getAlign() &&
+         LHS->getPointerOperand()->getType() ==
+             RHS->getPointerOperand()->getType() &&
+         LHS->getValOperand()->getType() == RHS->getValOperand()->getType();
+}
+
+static bool sameTailMergeShape(ArrayRef<AtomicRMWInst *> LHS,
+                               ArrayRef<AtomicRMWInst *> RHS) {
+  if (LHS.size() != RHS.size())
+    return false;
+  for (auto I = 0u; I < LHS.size(); ++I)
+    if (!sameTailMergeAtomicShape(LHS[I], RHS[I]))
+      return false;
+  return true;
+}
+
+static bool
+canMoveAtomicAfterInstructions(AtomicRMWInst *RMW,
+                               ArrayRef<Instruction *> LaterNonAtomicInsts,
+                               AAResults &AA) {
+  MemoryLocation Loc = MemoryLocation::get(RMW);
+  for (Instruction *I : LaterNonAtomicInsts) {
+    if (isa<DbgInfoIntrinsic>(I))
+      continue;
+    if (isa<AtomicRMWInst>(I) || isa<AtomicCmpXchgInst>(I) || isa<FenceInst>(I))
+      return false;
+    if (I->mayHaveSideEffects() && !I->mayReadOrWriteMemory())
+      return false;
+    if (instructionMayAccessLocation(I, Loc, AA))
+      return false;
+  }
+  return true;
+}
+
+static bool
+collectMovableCudaShadowAtomics(BasicBlock *BB, AAResults &AA,
+                                SmallVectorImpl<AtomicRMWInst *> &RMWs) {
+  auto *BI = dyn_cast<BranchInst>(BB->getTerminator());
+  if (!BI || !BI->isUnconditional())
+    return false;
+
+  SmallVector<Instruction *, 16> LaterNonAtomicInsts;
+  for (Instruction &I : llvm::reverse(*BB)) {
+    if (&I == BB->getTerminator() || isa<DbgInfoIntrinsic>(&I))
+      continue;
+
+    if (auto *RMW = dyn_cast<AtomicRMWInst>(&I);
+        RMW && isCudaAtomicFAddCandidate(RMW)) {
+      if (!canMoveAtomicAfterInstructions(RMW, LaterNonAtomicInsts, AA))
+        return false;
+      RMWs.push_back(RMW);
+      continue;
+    }
+
+    LaterNonAtomicInsts.push_back(&I);
+  }
+
+  std::reverse(RMWs.begin(), RMWs.end());
+  return !RMWs.empty();
+}
+
+static bool
+compatibleTailMergeGroup(const SmallVectorImpl<AtomicRMWInst *> &Base,
+                         const SmallVectorImpl<AtomicRMWInst *> &RMWs) {
+  return sameTailMergeShape(Base, RMWs);
+}
+
+static bool findCudaShadowAtomicTailGroup(BasicBlock *Succ, AAResults &AA,
+                                          AtomicTailGroup &Group) {
+  if (!EnzymeEnableCudaAtomicTailMerge || pred_empty(Succ) ||
+      isa<PHINode>(Succ->begin()))
+    return false;
+
+  SmallVector<BasicBlock *, 8> Preds(predecessors(Succ));
+  SmallVector<SmallVector<AtomicRMWInst *, 8>, 8> PredAtomics;
+  for (BasicBlock *Pred : Preds) {
+    SmallVector<AtomicRMWInst *, 8> RMWs;
+    if (collectMovableCudaShadowAtomics(Pred, AA, RMWs))
+      PredAtomics.push_back(std::move(RMWs));
+    else
+      PredAtomics.push_back({});
+  }
+
+  for (auto I = 0u; I < Preds.size(); ++I) {
+    if (PredAtomics[I].empty())
+      continue;
+
+    SmallVector<unsigned, 4> Matching;
+    Matching.push_back(I);
+    for (auto J = I + 1; J < Preds.size(); ++J) {
+      if (!PredAtomics[J].empty() &&
+          compatibleTailMergeGroup(PredAtomics[I], PredAtomics[J]))
+        Matching.push_back(J);
+    }
+
+    if (Matching.size() < 2)
+      continue;
+
+    Group.Succ = Succ;
+    for (unsigned Idx : Matching) {
+      Group.Preds.push_back(Preds[Idx]);
+      Group.Atomics.push_back(std::move(PredAtomics[Idx]));
+    }
+    return true;
+  }
+
+  return false;
+}
+
+static void copyCommonAtomicMetadata(AtomicRMWInst *NewRMW,
+                                     ArrayRef<AtomicRMWInst *> OldRMWs) {
+  NewRMW->setMetadata("enzyme_shadow_atomic",
+                      MDNode::get(NewRMW->getContext(), {}));
+  for (unsigned Kind : {LLVMContext::MD_tbaa, LLVMContext::MD_tbaa_struct}) {
+    MDNode *MD = OldRMWs.front()->getMetadata(Kind);
+    bool AllSame = true;
+    for (AtomicRMWInst *RMW : OldRMWs.drop_front()) {
+      if (RMW->getMetadata(Kind) != MD) {
+        AllSame = false;
+        break;
+      }
+    }
+    if (AllSame)
+      NewRMW->setMetadata(Kind, MD);
+  }
+}
+
+static bool applyCudaShadowAtomicTailMerge(const AtomicTailGroup &Group) {
+  LLVMContext &Ctx = Group.Succ->getContext();
+  BasicBlock *MergeBB = BasicBlock::Create(Ctx, "enzyme.atomic.merge",
+                                           Group.Succ->getParent(), Group.Succ);
+  BranchInst::Create(Group.Succ, MergeBB);
+
+  for (BasicBlock *Pred : Group.Preds) {
+    auto *BI = cast<BranchInst>(Pred->getTerminator());
+    BI->setSuccessor(0, MergeBB);
+  }
+
+  IRBuilder<> Builder(MergeBB->getTerminator());
+  unsigned NumAtomics = Group.Atomics.front().size();
+  SmallVector<PHINode *, 8> PtrPhis;
+  SmallVector<PHINode *, 8> ValPhis;
+  SmallVector<SmallVector<AtomicRMWInst *, 4>, 8> OldRMWGroups;
+
+  for (unsigned I = 0; I < NumAtomics; ++I) {
+    AtomicRMWInst *Template = Group.Atomics.front()[I];
+    auto *PtrPhi = PHINode::Create(Template->getPointerOperand()->getType(),
+                                   Group.Preds.size(), "atomic.ptr",
+                                   MergeBB->getTerminator());
+    auto *ValPhi = PHINode::Create(Template->getValOperand()->getType(),
+                                   Group.Preds.size(), "atomic.val",
+                                   MergeBB->getTerminator());
+
+    SmallVector<AtomicRMWInst *, 4> OldRMWs;
+    for (auto PredIdx = 0u; PredIdx < Group.Preds.size(); ++PredIdx) {
+      AtomicRMWInst *RMW = Group.Atomics[PredIdx][I];
+      PtrPhi->addIncoming(RMW->getPointerOperand(), Group.Preds[PredIdx]);
+      ValPhi->addIncoming(RMW->getValOperand(), Group.Preds[PredIdx]);
+      OldRMWs.push_back(RMW);
+    }
+
+    PtrPhis.push_back(PtrPhi);
+    ValPhis.push_back(ValPhi);
+    OldRMWGroups.push_back(std::move(OldRMWs));
+  }
+
+  for (unsigned I = 0; I < NumAtomics; ++I) {
+    AtomicRMWInst *Template = Group.Atomics.front()[I];
+    auto *NewRMW = Builder.CreateAtomicRMW(
+        Template->getOperation(), PtrPhis[I], ValPhis[I], Template->getAlign(),
+        Template->getOrdering(), Template->getSyncScopeID());
+    copyCommonAtomicMetadata(NewRMW, OldRMWGroups[I]);
+  }
+
+  for (const auto &RMWs : Group.Atomics)
+    for (AtomicRMWInst *RMW : RMWs)
+      RMW->eraseFromParent();
+
+  return true;
+}
+
+static bool mergeCudaShadowAtomicFAddTailsImpl(Function &F, AAResults &AA) {
+  if (!EnzymeEnableCudaRepeatedLoads || !EnzymeEnableCudaAtomicTailMerge ||
+      !isNVPTXModule(F.getParent()))
+    return false;
+
+  bool Changed = false;
+  SmallVector<BasicBlock *, 8> Blocks;
+  for (BasicBlock &BB : F)
+    Blocks.push_back(&BB);
+
+  for (BasicBlock *Succ : Blocks) {
+    AtomicTailGroup Group;
+    if (findCudaShadowAtomicTailGroup(Succ, AA, Group))
+      Changed |= applyCudaShadowAtomicTailMerge(Group);
   }
 
   return Changed;
@@ -701,6 +1052,8 @@ public:
     if (EnzymeEnableCudaRepeatedLoads) {
       auto &AA = getAnalysis<AAResultsWrapperPass>().getAAResults();
       Changed |= simplifyRepeatedGlobalLoadsImpl(F, AA);
+      Changed |= coalesceRepeatedCudaAtomicFAddsImpl(F, AA);
+      Changed |= mergeCudaShadowAtomicFAddTailsImpl(F, AA);
     }
     Changed |= simplifyGVN(F, DT, DL);
     return Changed;
@@ -711,6 +1064,14 @@ public:
 
 bool simplifyRepeatedGlobalLoads(Function &F, AAResults &AA) {
   return simplifyRepeatedGlobalLoadsImpl(F, AA);
+}
+
+bool coalesceRepeatedCudaAtomicFAdds(Function &F, AAResults &AA) {
+  return coalesceRepeatedCudaAtomicFAddsImpl(F, AA);
+}
+
+bool mergeCudaShadowAtomicFAddTails(Function &F, AAResults &AA) {
+  return mergeCudaShadowAtomicFAddTailsImpl(F, AA);
 }
 
 FunctionPass *createSimpleGVNPass() { return new SimpleGVN(); }
@@ -728,8 +1089,12 @@ SimpleGVNNewPM::Result SimpleGVNNewPM::run(Function &F,
                                            FunctionAnalysisManager &FAM) {
   bool Changed = false;
   const DataLayout &DL = F.getParent()->getDataLayout();
-  if (EnzymeEnableCudaRepeatedLoads)
-    Changed |= simplifyRepeatedGlobalLoadsImpl(F, FAM.getResult<AAManager>(F));
+  if (EnzymeEnableCudaRepeatedLoads) {
+    auto &AA = FAM.getResult<AAManager>(F);
+    Changed |= simplifyRepeatedGlobalLoadsImpl(F, AA);
+    Changed |= coalesceRepeatedCudaAtomicFAddsImpl(F, AA);
+    Changed |= mergeCudaShadowAtomicFAddTailsImpl(F, AA);
+  }
   Changed |= simplifyGVN(F, FAM.getResult<DominatorTreeAnalysis>(F), DL);
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }

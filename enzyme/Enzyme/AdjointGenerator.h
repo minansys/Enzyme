@@ -4978,6 +4978,9 @@ public:
           if (call.getAttributes().hasParamAttr(i, attr)) {
             structAttrs[args.size()].push_back(call.getParamAttr(i, attr));
           }
+        if (EnzymeNoAlias && call.getArgOperand(i)->getType()->isPointerTy())
+          structAttrs[args.size()].push_back(
+              Attribute::get(call.getContext(), Attribute::NoAlias));
         for (auto ty : PrimalParamAttrsToPreserve)
           if (call.getAttributes().hasParamAttr(i, ty)) {
             auto attr = call.getAttributes().getParamAttr(i, ty);
@@ -5025,12 +5028,16 @@ public:
           continue;
         }
 
-        if (gutils->getWidth() == 1)
+        if (gutils->getWidth() == 1) {
+          if (EnzymeNoAlias && call.getArgOperand(i)->getType()->isPointerTy())
+            structAttrs[args.size()].push_back(
+                Attribute::get(call.getContext(), Attribute::NoAlias));
           for (auto ty : ShadowParamAttrsToPreserve)
             if (call.getAttributes().hasParamAttr(i, ty)) {
               auto attr = call.getAttributes().getParamAttr(i, ty);
               structAttrs[args.size()].push_back(attr);
             }
+        }
 
         for (auto attr : {"enzymejl_returnRoots", "enzymejl_parmtype",
                           "enzymejl_parmtype_ref", "enzyme_type",
@@ -5273,6 +5280,9 @@ public:
             convertSRetTypeToString(
                 call.getParamAttr(i, Attribute::StructRet).getValueAsType())));
       }
+      if (EnzymeNoAlias && argi->getType()->isPointerTy())
+        structAttrs[pre_args.size()].push_back(
+            Attribute::get(call.getContext(), Attribute::NoAlias));
       for (auto ty : PrimalParamAttrsToPreserve)
         if (call.getAttributes().hasParamAttr(i, ty)) {
           auto attr = call.getAttributes().getParamAttr(i, ty);
@@ -5344,12 +5354,16 @@ public:
       auto argType = argi->getType();
 
       if (argTy == DIFFE_TYPE::DUP_ARG || argTy == DIFFE_TYPE::DUP_NONEED) {
-        if (gutils->getWidth() == 1)
+        if (gutils->getWidth() == 1) {
+          if (EnzymeNoAlias && call.getArgOperand(i)->getType()->isPointerTy())
+            structAttrs[pre_args.size()].push_back(
+                Attribute::get(call.getContext(), Attribute::NoAlias));
           for (auto ty : ShadowParamAttrsToPreserve)
             if (call.getAttributes().hasParamAttr(i, ty)) {
               auto attr = call.getAttributes().getParamAttr(i, ty);
               structAttrs[pre_args.size()].push_back(attr);
             }
+        }
 
         for (auto attr : {"enzymejl_returnRoots", "enzymejl_parmtype",
                           "enzymejl_parmtype_ref", "enzyme_type",
