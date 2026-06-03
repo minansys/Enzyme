@@ -42,6 +42,9 @@ declare void @__enzyme_autodiff(ptr, ...)
 ; OFF: store float 0.000000e+00
 ; OFF: atomicrmw fadd {{.*}} monotonic
 ; OFF: atomicrmw fadd {{.*}} monotonic
+; OFF-NOT: !enzyme_shadow_atomic
+; OFF-NOT: !alias.scope
+; OFF-NOT: !noalias
 ; OFF-NOT: atomicrmw
 ; OFF: ret void
 

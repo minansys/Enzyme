@@ -1072,7 +1072,7 @@ void DiffeGradientUtils::addToInvertedPtrDiffe(Instruction *orig,
     Atomic = false;
   if (Atomic && elementwiseReadForContext(orig, origptr))
     Atomic = false;
-  const bool FoldCudaAtomicAdds =
+  const bool OptimizeCudaAtomicAdds =
       EnzymeEnableCudaRepeatedLoads &&
       (Arch == Triple::nvptx || Arch == Triple::nvptx64);
 
@@ -1171,14 +1171,15 @@ void DiffeGradientUtils::addToInvertedPtrDiffe(Instruction *orig,
               }
             }
           }
-          if (FoldCudaAtomicAdds)
+          if (OptimizeCudaAtomicAdds)
             vdif = foldPreviousAtomicFAdd(BuilderM, op, vptr, vdif, alignv,
                                           AtomicOrdering::Monotonic,
                                           SyncScope::System);
           auto *RMW = BuilderM.CreateAtomicRMW(op, vptr, vdif, alignv,
                                                AtomicOrdering::Monotonic,
                                                SyncScope::System);
-          setDerivativeAtomicMetadata(RMW, shadowIdx);
+          if (OptimizeCudaAtomicAdds)
+            setDerivativeAtomicMetadata(RMW, shadowIdx);
         }
       };
       applyChainRule(BuilderM, rule, dif, ptr);
@@ -1196,13 +1197,14 @@ void DiffeGradientUtils::addToInvertedPtrDiffe(Instruction *orig,
             }
           }
         }
-        if (FoldCudaAtomicAdds)
+        if (OptimizeCudaAtomicAdds)
           dif = foldPreviousAtomicFAdd(BuilderM, op, ptr, dif, alignv,
                                        AtomicOrdering::Monotonic,
                                        SyncScope::System);
         auto *RMW = BuilderM.CreateAtomicRMW(
             op, ptr, dif, alignv, AtomicOrdering::Monotonic, SyncScope::System);
-        setDerivativeAtomicMetadata(RMW, shadowIdx);
+        if (OptimizeCudaAtomicAdds)
+          setDerivativeAtomicMetadata(RMW, shadowIdx);
       };
       applyChainRule(BuilderM, rule, dif, ptr);
     }
