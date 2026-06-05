@@ -40,8 +40,7 @@ declare void @__enzyme_autodiff(ptr, ...)
 ; OFF: %a = load float, ptr addrspace(1) %p0
 ; OFF: %sum = fadd float %aa, %aa
 ; OFF: store float 0.000000e+00
-; OFF: atomicrmw fadd {{.*}} monotonic
-; OFF: atomicrmw fadd {{.*}} monotonic
+; OFF-COUNT-2: atomicrmw fadd {{.*}} monotonic
 ; OFF-NOT: !enzyme_shadow_atomic
 ; OFF-NOT: !alias.scope
 ; OFF-NOT: !noalias
@@ -54,6 +53,6 @@ declare void @__enzyme_autodiff(ptr, ...)
 ; ON: %sum = fadd float %aa, %aa
 ; ON: store float 0.000000e+00
 ; ON: fadd fast float
-; ON: atomicrmw fadd {{.*}} monotonic{{.*}} !alias.scope !{{[0-9]+}}, !noalias !{{[0-9]+}}, !enzyme_shadow_atomic !{{[0-9]+}}
+; ON-COUNT-1: atomicrmw fadd {{.*}} monotonic{{.*}} !alias.scope !{{[0-9]+}}, !noalias !{{[0-9]+}}, !enzyme_shadow_atomic !{{[0-9]+}}
 ; ON-NOT: atomicrmw
 ; ON: ret void

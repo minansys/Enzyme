@@ -68,6 +68,14 @@ __device__ __host__ static inline float perturb_for_slot(int slot, int i) {
   return scale * unit;
 }
 
+__device__ __host__ static inline float fold_x_for_cell(int i) {
+  return 0.7f + 0.0009f * (float)(i & 1023) - 0.0002f * (float)((i * 13) & 255);
+}
+
+__device__ __host__ static inline float fold_dout_for_slot(int i) {
+  return -0.35f + 0.0011f * (float)((i * 19) & 511);
+}
+
 __global__ void init_primal(float **vel, float *p, float *nu, float *invvol,
                             int ncell) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -334,6 +342,59 @@ typedef void (*fvm3_fn)(float **, float **, float **, float *, float *,
 extern __device__ void __enzyme_autodiff(fvm3_fn, ...);
 extern __device__ int enzyme_dup;
 extern __device__ int enzyme_const;
+
+__device__ void foldable_atomic_source(float *x, float *out, int cell) {
+  float x0 = x[cell];
+  out[2 * cell] = x0 * x0;
+
+  // This second load intentionally remains a real load in unoptimized input IR:
+  // the intervening store may alias x without noalias information.
+  float x1 = x[cell];
+  out[2 * cell + 1] = x1 * x1;
+}
+
+typedef void (*atomic_fold_fn)(float *, float *, int);
+extern __device__ void __enzyme_autodiff(atomic_fold_fn, ...);
+
+__global__ void init_atomic_fold(float *x, float *dx, float *dx_ref, float *out,
+                                 float *out_ref, float *dout, float *dout_ref,
+                                 int ncell) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < ncell) {
+    x[idx] = fold_x_for_cell(idx);
+    dx[idx] = 0.0f;
+    dx_ref[idx] = 0.0f;
+  }
+  if (idx < 2 * ncell) {
+    out[idx] = 0.0f;
+    out_ref[idx] = 0.0f;
+    float seed = fold_dout_for_slot(idx);
+    dout[idx] = seed;
+    dout_ref[idx] = seed;
+  }
+}
+
+__global__ void enzyme_atomic_fold_grad(float *x, float *dx, float *out,
+                                        float *dout, int ncell) {
+  int cell = blockIdx.x * blockDim.x + threadIdx.x;
+  if (cell >= ncell)
+    return;
+
+  __enzyme_autodiff(foldable_atomic_source, enzyme_dup, x, dx, enzyme_dup, out,
+                    dout, enzyme_const, cell);
+}
+
+__global__ void manual_atomic_fold_grad(float *x, float *dx, float *out,
+                                        float *dout, int ncell) {
+  int cell = blockIdx.x * blockDim.x + threadIdx.x;
+  if (cell >= ncell)
+    return;
+
+  float value = x[cell];
+  out[2 * cell] = value * value;
+  out[2 * cell + 1] = value * value;
+  atomicAdd(&dx[cell], 2.0f * value * (dout[2 * cell] + dout[2 * cell + 1]));
+}
 
 __global__ void forward_fvm3_direct(float **vel, float **gradv, float **gradp,
                                     float *p, float *nu, float **res,
@@ -899,6 +960,56 @@ static int verify_forward_match(const char *label, float **actual,
   return 0;
 }
 
+static int verify_atomic_fold_case(int ncell, int threads) {
+  float *x = nullptr;
+  float *dx = nullptr;
+  float *dx_ref = nullptr;
+  float *out = nullptr;
+  float *out_ref = nullptr;
+  float *dout = nullptr;
+  float *dout_ref = nullptr;
+  int blocks = (ncell + threads - 1) / threads;
+  int out_blocks = (2 * ncell + threads - 1) / threads;
+
+  CUDA_CHECK(cudaMalloc(&x, (size_t)ncell * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&dx, (size_t)ncell * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&dx_ref, (size_t)ncell * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&out, (size_t)2 * ncell * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&out_ref, (size_t)2 * ncell * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&dout, (size_t)2 * ncell * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&dout_ref, (size_t)2 * ncell * sizeof(float)));
+
+  init_atomic_fold<<<out_blocks, threads>>>(x, dx, dx_ref, out, out_ref, dout,
+                                            dout_ref, ncell);
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  enzyme_atomic_fold_grad<<<blocks, threads>>>(x, dx, out, dout, ncell);
+  manual_atomic_fold_grad<<<blocks, threads>>>(x, dx_ref, out_ref, dout_ref,
+                                               ncell);
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  ErrorSummary summary;
+  init_error_summary(&summary);
+  int err = compare_device_arrays("atomic_fold out", 0, out, out_ref, 2 * ncell,
+                                  1.0e-5, 1.0e-5, &summary);
+  if (err == 0)
+    err = compare_device_arrays("atomic_fold dx", 0, dx, dx_ref, ncell, 1.0e-5,
+                                1.0e-5, &summary);
+  if (err == 0)
+    print_error_summary("atomic_fold", &summary);
+
+  cudaFree(x);
+  cudaFree(dx);
+  cudaFree(dx_ref);
+  cudaFree(out);
+  cudaFree(out_ref);
+  cudaFree(dout);
+  cudaFree(dout_ref);
+  return err;
+}
+
 static int sum_partials(double *partials, int blocks, double *sum) {
   double *host = (double *)malloc((size_t)blocks * sizeof(double));
   if (!host) {
@@ -1161,6 +1272,10 @@ int main(int argc, char **argv) {
   int threads = 256;
   int cell_blocks = (ncell + threads - 1) / threads;
   int face_blocks = (nface + threads - 1) / threads;
+
+  int atomic_verify = verify_atomic_fold_case(ncell, threads);
+  if (atomic_verify != 0)
+    return atomic_verify;
 
   float *vel_rows[3] = {};
   float *dvel_rows[3] = {};
