@@ -818,8 +818,20 @@ public:
                 Builder2.CreateLoad(I.getType(), ip, I.isVolatile());
 
             dif1->setAlignment(I.getAlign());
-            dif1->setOrdering(order);
-            dif1->setSyncScopeID(I.getSyncScopeID());
+            bool UseAtomicShadowLoad = true;
+            if (I.getType()->isFPOrFPVectorTy()) {
+              StringRef TargetTriple =
+                  I.getFunction()->getParent()->getTargetTriple();
+#if LLVM_VERSION_MAJOR >= 18
+              UseAtomicShadowLoad = !TargetTriple.starts_with("nvptx");
+#else
+              UseAtomicShadowLoad = !TargetTriple.startswith("nvptx");
+#endif
+            }
+            if (UseAtomicShadowLoad) {
+              dif1->setOrdering(order);
+              dif1->setSyncScopeID(I.getSyncScopeID());
+            }
             return dif1;
           };
           Value *diff = applyChainRule(I.getType(), Builder2, rule, ip);

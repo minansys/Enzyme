@@ -79,6 +79,7 @@
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/IR/Value.h"
 
 #include "llvm/Analysis/AliasAnalysis.h"
@@ -111,6 +112,11 @@ llvm::cl::opt<bool> EnzymeEnableCudaRepeatedLoads(
 llvm::cl::opt<bool> EnzymeEnableCudaAtomicTailMerge(
     "enzyme-enable-cuda-atomic-tail-merge", cl::init(false), cl::Hidden,
     cl::desc("Enable CUDA Enzyme shadow atomic tail merging"));
+
+llvm::cl::opt<bool> EnzymeEnableCudaPointerTableLoads(
+    "enzyme-enable-cuda-pointer-table-loads", cl::init(false), cl::Hidden,
+    cl::desc("Assume CUDA pointer-table row writes are disjoint from readonly "
+             "argument/global storage for repeated-load forwarding"));
 
 namespace {
 
@@ -284,6 +290,62 @@ static bool isRepeatedGlobalLoadCandidate(LoadInst *LI) {
   return AS == 0 || AS == 1;
 }
 
+static Value *getPointerBase(Value *V) {
+  SmallPtrSet<Value *, 8> Seen;
+  while (V && Seen.insert(V).second) {
+    V = V->stripPointerCasts();
+    if (auto *GEP = dyn_cast<GEPOperator>(V)) {
+      V = GEP->getPointerOperand();
+      continue;
+    }
+    return V;
+  }
+  return V;
+}
+
+static bool isReadonlyArgOrGlobalBase(Value *Base) {
+  Base = getPointerBase(Base);
+  if (auto *Arg = dyn_cast_or_null<Argument>(Base))
+    return Arg->hasAttribute(Attribute::ReadOnly);
+  if (auto *GV = dyn_cast_or_null<GlobalVariable>(Base))
+    return GV->isConstant();
+  return false;
+}
+
+static bool isReadonlyArgOrGlobalLoad(LoadInst *LI) {
+  return isRepeatedGlobalLoadCandidate(LI) &&
+         isReadonlyArgOrGlobalBase(LI->getPointerOperand());
+}
+
+static bool isPointerTableEntryLoad(LoadInst *LI) {
+  return LI->getType()->isPointerTy() && isReadonlyArgOrGlobalLoad(LI);
+}
+
+static Value *getMemoryAccessPointer(Instruction *I) {
+  if (auto *SI = dyn_cast<StoreInst>(I))
+    return SI->getPointerOperand();
+  if (auto *RMW = dyn_cast<AtomicRMWInst>(I))
+    return RMW->getPointerOperand();
+  if (auto *CXI = dyn_cast<AtomicCmpXchgInst>(I))
+    return CXI->getPointerOperand();
+  return nullptr;
+}
+
+static bool isCudaPointerTableRowAccess(Instruction *I) {
+  Value *AccessPtr = getMemoryAccessPointer(I);
+  if (!AccessPtr)
+    return false;
+
+  auto *RowLoad = dyn_cast_or_null<LoadInst>(getPointerBase(AccessPtr));
+  return RowLoad && isPointerTableEntryLoad(RowLoad);
+}
+
+static bool canIgnorePointerTableRowClobber(Instruction *MaybeClobber,
+                                            LoadInst *LI) {
+  return EnzymeEnableCudaPointerTableLoads && isReadonlyArgOrGlobalLoad(LI) &&
+         isCudaPointerTableRowAccess(MaybeClobber);
+}
+
 static bool sameLoadPointer(Value *LHS, Value *RHS) {
   if (LHS == RHS)
     return true;
@@ -311,6 +373,8 @@ static bool canForwardRepeatedLoad(LoadInst *Prev, LoadInst *LI,
 static bool mayClobberLoad(Instruction *MaybeClobber, LoadInst *LI,
                            AAResults &AA) {
   if (!MaybeClobber->mayWriteToMemory())
+    return false;
+  if (canIgnorePointerTableRowClobber(MaybeClobber, LI))
     return false;
   return isModSet(AA.getModRefInfo(MaybeClobber, MemoryLocation::get(LI)));
 }

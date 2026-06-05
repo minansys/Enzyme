@@ -43,6 +43,7 @@ class FunctionPass;
 
 extern llvm::cl::opt<bool> EnzymeEnableCudaRepeatedLoads;
 extern llvm::cl::opt<bool> EnzymeEnableCudaAtomicTailMerge;
+extern llvm::cl::opt<bool> EnzymeEnableCudaPointerTableLoads;
 
 bool simplifyRepeatedGlobalLoads(llvm::Function &F, llvm::AAResults &AA);
 bool coalesceRepeatedCudaAtomicFAdds(llvm::Function &F, llvm::AAResults &AA);
