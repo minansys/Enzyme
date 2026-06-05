@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 
+#include <float.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -58,6 +59,13 @@ __device__ __host__ static inline float dres_for_cell(int dim, int i) {
   float base = dim == 0 ? 0.5f : (dim == 1 ? -0.25f : 0.125f);
   int scale = dim == 0 ? 13 : (dim == 1 ? 29 : 37);
   return base + 0.0015f * (float)((i * scale) & 255);
+}
+
+__device__ __host__ static inline float perturb_for_slot(int slot, int i) {
+  unsigned h = hash_u32((unsigned)i ^ (0x9e3779b9u * (unsigned)(slot + 1)));
+  float unit = (float)(h & 2047u) * (1.0f / 1023.5f) - 1.0f;
+  float scale = 0.25f + 0.03f * (float)(slot % 7);
+  return scale * unit;
 }
 
 __global__ void init_primal(float **vel, float *p, float *nu, float *invvol,
@@ -327,6 +335,18 @@ extern __device__ void __enzyme_autodiff(fvm3_fn, ...);
 extern __device__ int enzyme_dup;
 extern __device__ int enzyme_const;
 
+__global__ void forward_fvm3_direct(float **vel, float **gradv, float **gradp,
+                                    float *p, float *nu, float **res,
+                                    int *owner, int *neighbor, float *snx,
+                                    float *sny, float *snz, float *area,
+                                    float *inv_dist, float *invvol, int nface) {
+  int face = blockIdx.x * blockDim.x + threadIdx.x;
+  if (face >= nface)
+    return;
+  momentum_fvm3_direct(vel, gradv, gradp, p, nu, res, owner, neighbor, snx, sny,
+                       snz, area, inv_dist, invvol, face);
+}
+
 __global__ void forward_fvm3_cached(float **vel, float **gradv, float **gradp,
                                     float *p, float *nu, float **res,
                                     int *owner, int *neighbor, float *snx,
@@ -575,6 +595,94 @@ __global__ void manual_fvm3_grad(float **vel, float **dvel, float **gradv,
   atomicAdd(&dgp2[right], -dz * prf_adj);
 }
 
+__global__ void perturb_inputs(float **vel, float *p, float *nu, float **gradv,
+                               float **gradp, int ncell, float eps) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = 17 * ncell;
+  if (idx >= total)
+    return;
+
+  int slot = idx / ncell;
+  int cell = idx - slot * ncell;
+  float delta = eps * perturb_for_slot(slot, cell);
+  if (slot < 3) {
+    vel[slot][cell] += delta;
+  } else if (slot == 3) {
+    p[cell] += delta;
+  } else if (slot == 4) {
+    nu[cell] += delta;
+  } else if (slot < 14) {
+    gradv[slot - 5][cell] += delta;
+  } else {
+    gradp[slot - 14][cell] += delta;
+  }
+}
+
+__global__ void objective_dot_residual(float **res, float **dres,
+                                       double *partials, int ncell) {
+  extern __shared__ double cache[];
+  int tid = threadIdx.x;
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = 3 * ncell;
+  double sum = 0.0;
+
+  if (idx < total) {
+    int row = idx / ncell;
+    int cell = idx - row * ncell;
+    sum = (double)res[row][cell] * (double)dres[row][cell];
+  }
+  cache[tid] = sum;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride)
+      cache[tid] += cache[tid + stride];
+    __syncthreads();
+  }
+
+  if (tid == 0)
+    partials[blockIdx.x] = cache[0];
+}
+
+__global__ void adjoint_dot_perturb(float **dvel, float *dp, float *dnu,
+                                    float **dgradv, float **dgradp,
+                                    double *partials, int ncell) {
+  extern __shared__ double cache[];
+  int tid = threadIdx.x;
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = 17 * ncell;
+  double sum = 0.0;
+
+  if (idx < total) {
+    int slot = idx / ncell;
+    int cell = idx - slot * ncell;
+    float adj = 0.0f;
+    if (slot < 3) {
+      adj = dvel[slot][cell];
+    } else if (slot == 3) {
+      adj = dp[cell];
+    } else if (slot == 4) {
+      adj = dnu[cell];
+    } else if (slot < 14) {
+      adj = dgradv[slot - 5][cell];
+    } else {
+      adj = dgradp[slot - 14][cell];
+    }
+    sum = (double)adj * (double)perturb_for_slot(slot, cell);
+  }
+  cache[tid] = sum;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride)
+      cache[tid] += cache[tid + stride];
+    __syncthreads();
+  }
+
+  if (tid == 0)
+    partials[blockIdx.x] = cache[0];
+}
+
 static int make_rows(float ***rows, float **host_rows, int count) {
   CUDA_CHECK(cudaMalloc(rows, (size_t)count * sizeof(float *)));
   CUDA_CHECK(cudaMemcpy(*rows, host_rows, (size_t)count * sizeof(float *),
@@ -626,8 +734,49 @@ static int reset_for_ad(float **dvel, float *dp, float *dnu, float **dgradv,
   return 0;
 }
 
-static int compare_device_arrays(const char *label, float *actual,
-                                 float *expected, int n) {
+typedef struct {
+  double max_abs;
+  double max_rel;
+  double sum_sq;
+  long long count;
+  int worst_row;
+  int worst_index;
+  float worst_actual;
+  float worst_expected;
+  char worst_label[96];
+} ErrorSummary;
+
+static void init_error_summary(ErrorSummary *summary) {
+  summary->max_abs = 0.0;
+  summary->max_rel = 0.0;
+  summary->sum_sq = 0.0;
+  summary->count = 0;
+  summary->worst_row = -1;
+  summary->worst_index = -1;
+  summary->worst_actual = 0.0f;
+  summary->worst_expected = 0.0f;
+  summary->worst_label[0] = '\0';
+}
+
+static double error_rmse(const ErrorSummary *summary) {
+  if (summary->count == 0)
+    return 0.0;
+  return sqrt(summary->sum_sq / (double)summary->count);
+}
+
+static void print_error_summary(const char *label,
+                                const ErrorSummary *summary) {
+  printf("check=%s max_abs=%.6e max_rel=%.6e rmse=%.6e worst=%s[%d,%d] "
+         "actual=%.8e expected=%.8e\n",
+         label, summary->max_abs, summary->max_rel, error_rmse(summary),
+         summary->worst_label[0] ? summary->worst_label : "none",
+         summary->worst_row, summary->worst_index, summary->worst_actual,
+         summary->worst_expected);
+}
+
+static int compare_device_arrays(const char *label, int row, float *actual,
+                                 float *expected, int n, double abs_tol,
+                                 double rel_tol, ErrorSummary *summary) {
   float *hactual = (float *)malloc((size_t)n * sizeof(float));
   float *hexpected = (float *)malloc((size_t)n * sizeof(float));
   if (!hactual || !hexpected) {
@@ -642,35 +791,53 @@ static int compare_device_arrays(const char *label, float *actual,
   CUDA_CHECK(cudaMemcpy(hexpected, expected, (size_t)n * sizeof(float),
                         cudaMemcpyDeviceToHost));
 
+  int bad = 0;
   for (int i = 0; i < n; ++i) {
-    float tolerance = fmaxf(1.0f, fabsf(hexpected[i]) * 2.5e-2f);
-    if (fabsf(hactual[i] - hexpected[i]) > tolerance) {
-      fprintf(stderr, "%s mismatch at %d: actual=%g expected=%g tolerance=%g\n",
-              label, i, hactual[i], hexpected[i], tolerance);
-      free(hactual);
-      free(hexpected);
-      return 4;
+    double diff = fabs((double)hactual[i] - (double)hexpected[i]);
+    double denom = fmax(1.0e-12, fabs((double)hexpected[i]));
+    double rel = diff / denom;
+    double tolerance = abs_tol + rel_tol * fabs((double)hexpected[i]);
+    summary->sum_sq += diff * diff;
+    summary->count += 1;
+    if (diff > summary->max_abs) {
+      summary->max_abs = diff;
+      summary->max_rel = rel;
+      summary->worst_row = row;
+      summary->worst_index = i;
+      summary->worst_actual = hactual[i];
+      summary->worst_expected = hexpected[i];
+      snprintf(summary->worst_label, sizeof(summary->worst_label), "%s", label);
+    }
+    if (diff > tolerance) {
+      if (bad == 0) {
+        fprintf(stderr,
+                "%s mismatch row=%d index=%d actual=%.8e expected=%.8e "
+                "abs=%.6e rel=%.6e tolerance=%.6e\n",
+                label, row, i, hactual[i], hexpected[i], diff, rel, tolerance);
+      }
+      bad += 1;
     }
   }
 
   free(hactual);
   free(hexpected);
+  if (bad != 0) {
+    fprintf(stderr, "%s had %d values outside tolerance\n", label, bad);
+    return 4;
+  }
   return 0;
 }
 
-#define CHECK_COMPARE(label, actual, expected, n)                              \
-  do {                                                                         \
-    int cmp__ = compare_device_arrays(label, actual, expected, n);             \
-    if (cmp__ != 0)                                                            \
-      return cmp__;                                                            \
-  } while (0)
-
 static int verify_rows(const char *prefix, float **actual, float **expected,
-                       int rows, int ncell) {
+                       int rows, int ncell, double abs_tol, double rel_tol,
+                       ErrorSummary *summary) {
   char label[96];
   for (int r = 0; r < rows; ++r) {
     snprintf(label, sizeof(label), "%s row %d", prefix, r);
-    CHECK_COMPARE(label, actual[r], expected[r], ncell);
+    int err = compare_device_arrays(label, r, actual[r], expected[r], ncell,
+                                    abs_tol, rel_tol, summary);
+    if (err != 0)
+      return err;
   }
   return 0;
 }
@@ -682,54 +849,208 @@ static int verify_against_manual(const char *label, float **dvel, float *dp,
                                  float **dgradp_ref, float **res_ref,
                                  int ncell) {
   char name[96];
+  ErrorSummary summary;
+  init_error_summary(&summary);
+  double abs_tol = 3.0e-2;
+  double rel_tol = 3.0e-2;
+
   snprintf(name, sizeof(name), "%s res", label);
-  int err = verify_rows(name, res, res_ref, 3, ncell);
+  int err =
+      verify_rows(name, res, res_ref, 3, ncell, abs_tol, rel_tol, &summary);
   if (err != 0)
     return err;
   snprintf(name, sizeof(name), "%s dvel", label);
-  err = verify_rows(name, dvel, dvel_ref, 3, ncell);
+  err = verify_rows(name, dvel, dvel_ref, 3, ncell, abs_tol, rel_tol, &summary);
   if (err != 0)
     return err;
   snprintf(name, sizeof(name), "%s dgradv", label);
-  err = verify_rows(name, dgradv, dgradv_ref, 9, ncell);
+  err = verify_rows(name, dgradv, dgradv_ref, 9, ncell, abs_tol, rel_tol,
+                    &summary);
   if (err != 0)
     return err;
   snprintf(name, sizeof(name), "%s dgradp", label);
-  err = verify_rows(name, dgradp, dgradp_ref, 3, ncell);
+  err = verify_rows(name, dgradp, dgradp_ref, 3, ncell, abs_tol, rel_tol,
+                    &summary);
   if (err != 0)
     return err;
   snprintf(name, sizeof(name), "%s dp", label);
-  CHECK_COMPARE(name, dp, dp_ref, ncell);
+  err = compare_device_arrays(name, 0, dp, dp_ref, ncell, abs_tol, rel_tol,
+                              &summary);
+  if (err != 0)
+    return err;
   snprintf(name, sizeof(name), "%s dnu", label);
-  CHECK_COMPARE(name, dnu, dnu_ref, ncell);
+  err = compare_device_arrays(name, 0, dnu, dnu_ref, ncell, abs_tol, rel_tol,
+                              &summary);
+  if (err != 0)
+    return err;
+  print_error_summary(label, &summary);
   return 0;
 }
 
-static int time_forward(float **vel, float **gradv, float **gradp, float *p,
-                        float *nu, float **res, int *owner, int *neighbor,
-                        float *snx, float *sny, float *snz, float *area,
-                        float *inv_dist, float *invvol, int ncell, int nface,
-                        int face_blocks, int threads, int reps, float *ms) {
-  cudaEvent_t start;
-  cudaEvent_t stop;
-  CUDA_CHECK(cudaEventCreate(&start));
-  CUDA_CHECK(cudaEventCreate(&stop));
-  CUDA_CHECK(cudaEventRecord(start));
-  for (int r = 0; r < reps; ++r) {
-    reset_for_forward(res, ncell, threads);
-    forward_fvm3_cached<<<face_blocks, threads>>>(
-        vel, gradv, gradp, p, nu, res, owner, neighbor, snx, sny, snz, area,
-        inv_dist, invvol, nface);
-  }
-  CUDA_CHECK(cudaGetLastError());
-  CUDA_CHECK(cudaEventRecord(stop));
-  CUDA_CHECK(cudaEventSynchronize(stop));
-  CUDA_CHECK(cudaEventElapsedTime(ms, start, stop));
-  *ms /= (float)reps;
-  CUDA_CHECK(cudaEventDestroy(start));
-  CUDA_CHECK(cudaEventDestroy(stop));
+static int verify_forward_match(const char *label, float **actual,
+                                float **expected, int ncell) {
+  ErrorSummary summary;
+  init_error_summary(&summary);
+  int err =
+      verify_rows(label, actual, expected, 3, ncell, 3.0e-3, 1.0e-3, &summary);
+  if (err != 0)
+    return err;
+  print_error_summary(label, &summary);
   return 0;
 }
+
+static int sum_partials(double *partials, int blocks, double *sum) {
+  double *host = (double *)malloc((size_t)blocks * sizeof(double));
+  if (!host) {
+    fprintf(stderr, "host allocation failed while reducing partial sums\n");
+    return 3;
+  }
+  CUDA_CHECK(cudaMemcpy(host, partials, (size_t)blocks * sizeof(double),
+                        cudaMemcpyDeviceToHost));
+  double total = 0.0;
+  for (int i = 0; i < blocks; ++i)
+    total += host[i];
+  free(host);
+  *sum = total;
+  return 0;
+}
+
+static int residual_objective(float **vel, float **gradv, float **gradp,
+                              float *p, float *nu, float **res, float **dres,
+                              int *owner, int *neighbor, float *snx, float *sny,
+                              float *snz, float *area, float *inv_dist,
+                              float *invvol, int ncell, int nface,
+                              int face_blocks, int threads, double *partials,
+                              double *objective) {
+  int obj_blocks = (3 * ncell + threads - 1) / threads;
+  reset_for_forward(res, ncell, threads);
+  forward_fvm3_cached<<<face_blocks, threads>>>(vel, gradv, gradp, p, nu, res,
+                                                owner, neighbor, snx, sny, snz,
+                                                area, inv_dist, invvol, nface);
+  CUDA_CHECK(cudaGetLastError());
+  objective_dot_residual<<<obj_blocks, threads, threads * sizeof(double)>>>(
+      res, dres, partials, ncell);
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaDeviceSynchronize());
+  return sum_partials(partials, obj_blocks, objective);
+}
+
+static int adjoint_directional_dot(float **dvel, float *dp, float *dnu,
+                                   float **dgradv, float **dgradp, int ncell,
+                                   int threads, double *partials, double *dot) {
+  int dot_blocks = (17 * ncell + threads - 1) / threads;
+  adjoint_dot_perturb<<<dot_blocks, threads, threads * sizeof(double)>>>(
+      dvel, dp, dnu, dgradv, dgradp, partials, ncell);
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaDeviceSynchronize());
+  return sum_partials(partials, dot_blocks, dot);
+}
+
+static int finite_difference_check(float **vel, float **gradv, float **gradp,
+                                   float *p, float *nu, float **dvel, float *dp,
+                                   float *dnu, float **dgradv, float **dgradp,
+                                   float **res, float **dres, int *owner,
+                                   int *neighbor, float *snx, float *sny,
+                                   float *snz, float *area, float *inv_dist,
+                                   float *invvol, int ncell, int nface,
+                                   int face_blocks, int threads) {
+  int max_blocks = (17 * ncell + threads - 1) / threads;
+  int perturb_blocks = max_blocks;
+  int seed_blocks = (3 * ncell + threads - 1) / threads;
+  double *partials = nullptr;
+  CUDA_CHECK(cudaMalloc(&partials, (size_t)max_blocks * sizeof(double)));
+
+  reset_residual_and_seed<<<seed_blocks, threads>>>(res, dres, ncell);
+  CUDA_CHECK(cudaGetLastError());
+
+  double adjoint_dot = 0.0;
+  int err = adjoint_directional_dot(dvel, dp, dnu, dgradv, dgradp, ncell,
+                                    threads, partials, &adjoint_dot);
+  if (err != 0) {
+    cudaFree(partials);
+    return err;
+  }
+
+  const float eps = 1.0e-3f;
+  double objective_plus = 0.0;
+  double objective_minus = 0.0;
+
+  perturb_inputs<<<perturb_blocks, threads>>>(vel, p, nu, gradv, gradp, ncell,
+                                              eps);
+  CUDA_CHECK(cudaGetLastError());
+  err = residual_objective(vel, gradv, gradp, p, nu, res, dres, owner, neighbor,
+                           snx, sny, snz, area, inv_dist, invvol, ncell, nface,
+                           face_blocks, threads, partials, &objective_plus);
+  if (err != 0) {
+    cudaFree(partials);
+    return err;
+  }
+
+  perturb_inputs<<<perturb_blocks, threads>>>(vel, p, nu, gradv, gradp, ncell,
+                                              -2.0f * eps);
+  CUDA_CHECK(cudaGetLastError());
+  err = residual_objective(vel, gradv, gradp, p, nu, res, dres, owner, neighbor,
+                           snx, sny, snz, area, inv_dist, invvol, ncell, nface,
+                           face_blocks, threads, partials, &objective_minus);
+  if (err != 0) {
+    cudaFree(partials);
+    return err;
+  }
+
+  perturb_inputs<<<perturb_blocks, threads>>>(vel, p, nu, gradv, gradp, ncell,
+                                              eps);
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  cudaFree(partials);
+
+  double finite_diff = (objective_plus - objective_minus) / (2.0 * eps);
+  double abs_err = fabs(finite_diff - adjoint_dot);
+  double rel_err = abs_err / fmax(1.0, fabs(finite_diff));
+  printf("check=finite_difference objective_plus=%.12e "
+         "objective_minus=%.12e finite_diff=%.12e adjoint_dot=%.12e "
+         "abs=%.6e rel=%.6e\n",
+         objective_plus, objective_minus, finite_diff, adjoint_dot, abs_err,
+         rel_err);
+
+  double tolerance = 2.0e-1 + 5.0e-2 * fabs(finite_diff);
+  if (abs_err > tolerance) {
+    fprintf(stderr, "finite-difference check failed: abs=%.6e tolerance=%.6e\n",
+            abs_err, tolerance);
+    return 5;
+  }
+  return 0;
+}
+
+#define DEFINE_TIME_FORWARD(timer_name, kernel_name)                           \
+  static int timer_name(float **vel, float **gradv, float **gradp, float *p,   \
+                        float *nu, float **res, int *owner, int *neighbor,     \
+                        float *snx, float *sny, float *snz, float *area,       \
+                        float *inv_dist, float *invvol, int ncell, int nface,  \
+                        int face_blocks, int threads, int reps, float *ms) {   \
+    cudaEvent_t start;                                                         \
+    cudaEvent_t stop;                                                          \
+    CUDA_CHECK(cudaEventCreate(&start));                                       \
+    CUDA_CHECK(cudaEventCreate(&stop));                                        \
+    CUDA_CHECK(cudaEventRecord(start));                                        \
+    for (int r = 0; r < reps; ++r) {                                           \
+      reset_for_forward(res, ncell, threads);                                  \
+      kernel_name<<<face_blocks, threads>>>(vel, gradv, gradp, p, nu, res,     \
+                                            owner, neighbor, snx, sny, snz,    \
+                                            area, inv_dist, invvol, nface);    \
+    }                                                                          \
+    CUDA_CHECK(cudaGetLastError());                                            \
+    CUDA_CHECK(cudaEventRecord(stop));                                         \
+    CUDA_CHECK(cudaEventSynchronize(stop));                                    \
+    CUDA_CHECK(cudaEventElapsedTime(ms, start, stop));                         \
+    *ms /= (float)reps;                                                        \
+    CUDA_CHECK(cudaEventDestroy(start));                                       \
+    CUDA_CHECK(cudaEventDestroy(stop));                                        \
+    return 0;                                                                  \
+  }
+
+DEFINE_TIME_FORWARD(time_forward_direct, forward_fvm3_direct)
+DEFINE_TIME_FORWARD(time_forward_cached, forward_fvm3_cached)
 
 #define DEFINE_TIME_AD(timer_name, kernel_name)                                \
   static int timer_name(                                                       \
@@ -763,12 +1084,77 @@ DEFINE_TIME_AD(time_manual, manual_fvm3_grad)
 DEFINE_TIME_AD(time_enzyme_direct, enzyme_fvm3_direct_grad)
 DEFINE_TIME_AD(time_enzyme_cached, enzyme_fvm3_cached_grad)
 
+typedef int (*forward_timer_fn)(float **, float **, float **, float *, float *,
+                                float **, int *, int *, float *, float *,
+                                float *, float *, float *, float *, int, int,
+                                int, int, int, float *);
+
+typedef int (*ad_timer_fn)(float **, float **, float **, float **, float **,
+                           float **, float *, float *, float *, float *,
+                           float **, float **, int *, int *, float *, float *,
+                           float *, float *, float *, float *, int, int, int,
+                           int, int, float *);
+
+static int best_forward_time(forward_timer_fn timer, float **vel, float **gradv,
+                             float **gradp, float *p, float *nu, float **res,
+                             int *owner, int *neighbor, float *snx, float *sny,
+                             float *snz, float *area, float *inv_dist,
+                             float *invvol, int ncell, int nface,
+                             int face_blocks, int threads, int reps, int rounds,
+                             float *best, float *mean) {
+  *best = FLT_MAX;
+  *mean = 0.0f;
+  for (int r = 0; r < rounds; ++r) {
+    float sample = 0.0f;
+    int err = timer(vel, gradv, gradp, p, nu, res, owner, neighbor, snx, sny,
+                    snz, area, inv_dist, invvol, ncell, nface, face_blocks,
+                    threads, reps, &sample);
+    if (err != 0)
+      return err;
+    if (sample < *best)
+      *best = sample;
+    *mean += sample;
+  }
+  *mean /= (float)rounds;
+  return 0;
+}
+
+static int best_ad_time(ad_timer_fn timer, float **vel, float **dvel,
+                        float **gradv, float **dgradv, float **gradp,
+                        float **dgradp, float *p, float *dp, float *nu,
+                        float *dnu, float **res, float **dres, int *owner,
+                        int *neighbor, float *snx, float *sny, float *snz,
+                        float *area, float *inv_dist, float *invvol, int ncell,
+                        int nface, int face_blocks, int threads, int reps,
+                        int rounds, float *best, float *mean) {
+  *best = FLT_MAX;
+  *mean = 0.0f;
+  for (int r = 0; r < rounds; ++r) {
+    float sample = 0.0f;
+    int err = timer(vel, dvel, gradv, dgradv, gradp, dgradp, p, dp, nu, dnu,
+                    res, dres, owner, neighbor, snx, sny, snz, area, inv_dist,
+                    invvol, ncell, nface, face_blocks, threads, reps, &sample);
+    if (err != 0)
+      return err;
+    if (sample < *best)
+      *best = sample;
+    *mean += sample;
+  }
+  *mean /= (float)rounds;
+  return 0;
+}
+
 int main(int argc, char **argv) {
   int ncell = argc > 1 ? atoi(argv[1]) : (1 << 20);
   int nface = argc > 2 ? atoi(argv[2]) : 4 * ncell;
   int reps = argc > 3 ? atoi(argv[3]) : 50;
+  int rounds = argc > 4 ? atoi(argv[4]) : 5;
   if (ncell < 2 || nface < 1) {
     fprintf(stderr, "ncell must be >= 2 and nface must be >= 1\n");
+    return 6;
+  }
+  if (reps < 1 || rounds < 1) {
+    fprintf(stderr, "reps and rounds must both be >= 1\n");
     return 6;
   }
 
@@ -857,19 +1243,45 @@ int main(int argc, char **argv) {
   CUDA_CHECK(cudaMalloc(&area, (size_t)nface * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&inv_dist, (size_t)nface * sizeof(float)));
 
-  make_rows(&vel, vel_rows, 3);
-  make_rows(&dvel, dvel_rows, 3);
-  make_rows(&dvel_ref, dvel_ref_rows, 3);
-  make_rows(&res, res_rows, 3);
-  make_rows(&dres, dres_rows, 3);
-  make_rows(&res_ref, res_ref_rows, 3);
-  make_rows(&dres_ref, dres_ref_rows, 3);
-  make_rows(&gradv, gradv_rows, 9);
-  make_rows(&dgradv, dgradv_rows, 9);
-  make_rows(&dgradv_ref, dgradv_ref_rows, 9);
-  make_rows(&gradp, gradp_rows, 3);
-  make_rows(&dgradp, dgradp_rows, 3);
-  make_rows(&dgradp_ref, dgradp_ref_rows, 3);
+  err = make_rows(&vel, vel_rows, 3);
+  if (err != 0)
+    return err;
+  err = make_rows(&dvel, dvel_rows, 3);
+  if (err != 0)
+    return err;
+  err = make_rows(&dvel_ref, dvel_ref_rows, 3);
+  if (err != 0)
+    return err;
+  err = make_rows(&res, res_rows, 3);
+  if (err != 0)
+    return err;
+  err = make_rows(&dres, dres_rows, 3);
+  if (err != 0)
+    return err;
+  err = make_rows(&res_ref, res_ref_rows, 3);
+  if (err != 0)
+    return err;
+  err = make_rows(&dres_ref, dres_ref_rows, 3);
+  if (err != 0)
+    return err;
+  err = make_rows(&gradv, gradv_rows, 9);
+  if (err != 0)
+    return err;
+  err = make_rows(&dgradv, dgradv_rows, 9);
+  if (err != 0)
+    return err;
+  err = make_rows(&dgradv_ref, dgradv_ref_rows, 9);
+  if (err != 0)
+    return err;
+  err = make_rows(&gradp, gradp_rows, 3);
+  if (err != 0)
+    return err;
+  err = make_rows(&dgradp, dgradp_rows, 3);
+  if (err != 0)
+    return err;
+  err = make_rows(&dgradp_ref, dgradp_ref_rows, 3);
+  if (err != 0)
+    return err;
 
   init_primal<<<cell_blocks, threads>>>(vel, p, nu, invvol, ncell);
   init_unstructured_faces<<<face_blocks, threads>>>(
@@ -884,6 +1296,21 @@ int main(int argc, char **argv) {
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaDeviceSynchronize());
 
+  reset_for_forward(res, ncell, threads);
+  reset_for_forward(res_ref, ncell, threads);
+  forward_fvm3_direct<<<face_blocks, threads>>>(vel, gradv, gradp, p, nu, res,
+                                                owner, neighbor, snx, sny, snz,
+                                                area, inv_dist, invvol, nface);
+  forward_fvm3_cached<<<face_blocks, threads>>>(
+      vel, gradv, gradp, p, nu, res_ref, owner, neighbor, snx, sny, snz, area,
+      inv_dist, invvol, nface);
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaDeviceSynchronize());
+  int verify = verify_forward_match("forward_direct_vs_cached", res_rows,
+                                    res_ref_rows, ncell);
+  if (verify != 0)
+    return verify;
+
   reset_for_ad(dvel, dp, dnu, dgradv, dgradp, res, dres, ncell, threads);
   reset_for_ad(dvel_ref, dp_ref, dnu_ref, dgradv_ref, dgradp_ref, res_ref,
                dres_ref, ncell, threads);
@@ -897,10 +1324,10 @@ int main(int argc, char **argv) {
       inv_dist, invvol, nface);
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaDeviceSynchronize());
-  int verify = verify_against_manual("direct", dvel_rows, dp, dnu, dgradv_rows,
-                                     dgradp_rows, res_rows, dvel_ref_rows,
-                                     dp_ref, dnu_ref, dgradv_ref_rows,
-                                     dgradp_ref_rows, res_ref_rows, ncell);
+  verify = verify_against_manual("direct", dvel_rows, dp, dnu, dgradv_rows,
+                                 dgradp_rows, res_rows, dvel_ref_rows, dp_ref,
+                                 dnu_ref, dgradv_ref_rows, dgradp_ref_rows,
+                                 res_ref_rows, ncell);
   if (verify != 0)
     return verify;
 
@@ -924,42 +1351,84 @@ int main(int argc, char **argv) {
   if (verify != 0)
     return verify;
 
-  float forward_ms = 0.0f;
-  float manual_ms = 0.0f;
-  float enzyme_direct_ms = 0.0f;
-  float enzyme_cached_ms = 0.0f;
-  int timing = time_forward(vel, gradv, gradp, p, nu, res, owner, neighbor, snx,
-                            sny, snz, area, inv_dist, invvol, ncell, nface,
-                            face_blocks, threads, reps, &forward_ms);
+  verify = finite_difference_check(
+      vel, gradv, gradp, p, nu, dvel_ref, dp_ref, dnu_ref, dgradv_ref,
+      dgradp_ref, res_ref, dres_ref, owner, neighbor, snx, sny, snz, area,
+      inv_dist, invvol, ncell, nface, face_blocks, threads);
+  if (verify != 0)
+    return verify;
+
+  init_primal<<<cell_blocks, threads>>>(vel, p, nu, invvol, ncell);
+  reset_gradients(gradv, gradp, ncell, cell_blocks, threads);
+  green_gauss_gradients<<<face_blocks, threads>>>(vel, p, gradv, gradp, owner,
+                                                  neighbor, snx, sny, snz, area,
+                                                  invvol, nface);
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  float forward_direct_best_ms = 0.0f;
+  float forward_direct_mean_ms = 0.0f;
+  float forward_cached_best_ms = 0.0f;
+  float forward_cached_mean_ms = 0.0f;
+  float manual_best_ms = 0.0f;
+  float manual_mean_ms = 0.0f;
+  float enzyme_direct_best_ms = 0.0f;
+  float enzyme_direct_mean_ms = 0.0f;
+  float enzyme_cached_best_ms = 0.0f;
+  float enzyme_cached_mean_ms = 0.0f;
+  int timing = best_forward_time(
+      time_forward_direct, vel, gradv, gradp, p, nu, res, owner, neighbor, snx,
+      sny, snz, area, inv_dist, invvol, ncell, nface, face_blocks, threads,
+      reps, rounds, &forward_direct_best_ms, &forward_direct_mean_ms);
+  if (timing != 0)
+    return timing;
+  timing = best_forward_time(
+      time_forward_cached, vel, gradv, gradp, p, nu, res, owner, neighbor, snx,
+      sny, snz, area, inv_dist, invvol, ncell, nface, face_blocks, threads,
+      reps, rounds, &forward_cached_best_ms, &forward_cached_mean_ms);
   if (timing != 0)
     return timing;
   timing =
-      time_manual(vel, dvel, gradv, dgradv, gradp, dgradp, p, dp, nu, dnu, res,
-                  dres, owner, neighbor, snx, sny, snz, area, inv_dist, invvol,
-                  ncell, nface, face_blocks, threads, reps, &manual_ms);
+      best_ad_time(time_manual, vel, dvel, gradv, dgradv, gradp, dgradp, p, dp,
+                   nu, dnu, res, dres, owner, neighbor, snx, sny, snz, area,
+                   inv_dist, invvol, ncell, nface, face_blocks, threads, reps,
+                   rounds, &manual_best_ms, &manual_mean_ms);
   if (timing != 0)
     return timing;
-  timing = time_enzyme_direct(vel, dvel, gradv, dgradv, gradp, dgradp, p, dp,
-                              nu, dnu, res, dres, owner, neighbor, snx, sny,
-                              snz, area, inv_dist, invvol, ncell, nface,
-                              face_blocks, threads, reps, &enzyme_direct_ms);
+  timing = best_ad_time(time_enzyme_direct, vel, dvel, gradv, dgradv, gradp,
+                        dgradp, p, dp, nu, dnu, res, dres, owner, neighbor, snx,
+                        sny, snz, area, inv_dist, invvol, ncell, nface,
+                        face_blocks, threads, reps, rounds,
+                        &enzyme_direct_best_ms, &enzyme_direct_mean_ms);
   if (timing != 0)
     return timing;
-  timing = time_enzyme_cached(vel, dvel, gradv, dgradv, gradp, dgradp, p, dp,
-                              nu, dnu, res, dres, owner, neighbor, snx, sny,
-                              snz, area, inv_dist, invvol, ncell, nface,
-                              face_blocks, threads, reps, &enzyme_cached_ms);
+  timing = best_ad_time(time_enzyme_cached, vel, dvel, gradv, dgradv, gradp,
+                        dgradp, p, dp, nu, dnu, res, dres, owner, neighbor, snx,
+                        sny, snz, area, inv_dist, invvol, ncell, nface,
+                        face_blocks, threads, reps, rounds,
+                        &enzyme_cached_best_ms, &enzyme_cached_mean_ms);
   if (timing != 0)
     return timing;
 
-  printf("cells=%d faces=%d reps=%d forward_ms=%.6f manual_ms=%.6f "
-         "enzyme_direct_ms=%.6f enzyme_cached_ms=%.6f "
-         "enzyme_direct_over_forward=%.3fx enzyme_cached_over_forward=%.3fx "
-         "enzyme_direct_over_manual=%.3fx enzyme_cached_over_manual=%.3fx\n",
-         ncell, nface, reps, forward_ms, manual_ms, enzyme_direct_ms,
-         enzyme_cached_ms, enzyme_direct_ms / forward_ms,
-         enzyme_cached_ms / forward_ms, enzyme_direct_ms / manual_ms,
-         enzyme_cached_ms / manual_ms);
+  printf("cells=%d faces=%d reps=%d rounds=%d "
+         "forward_direct_best_ms=%.6f forward_direct_mean_ms=%.6f "
+         "forward_cached_best_ms=%.6f forward_cached_mean_ms=%.6f "
+         "manual_best_ms=%.6f manual_mean_ms=%.6f "
+         "enzyme_direct_best_ms=%.6f enzyme_direct_mean_ms=%.6f "
+         "enzyme_cached_best_ms=%.6f enzyme_cached_mean_ms=%.6f "
+         "enzyme_direct_over_forward_cached=%.3fx "
+         "enzyme_cached_over_forward_cached=%.3fx "
+         "enzyme_direct_over_manual=%.3fx enzyme_cached_over_manual=%.3fx "
+         "enzyme_direct_over_cached=%.3fx\n",
+         ncell, nface, reps, rounds, forward_direct_best_ms,
+         forward_direct_mean_ms, forward_cached_best_ms, forward_cached_mean_ms,
+         manual_best_ms, manual_mean_ms, enzyme_direct_best_ms,
+         enzyme_direct_mean_ms, enzyme_cached_best_ms, enzyme_cached_mean_ms,
+         enzyme_direct_best_ms / forward_cached_best_ms,
+         enzyme_cached_best_ms / forward_cached_best_ms,
+         enzyme_direct_best_ms / manual_best_ms,
+         enzyme_cached_best_ms / manual_best_ms,
+         enzyme_direct_best_ms / enzyme_cached_best_ms);
 
   free_rows(vel_rows, 3);
   free_rows(dvel_rows, 3);
