@@ -1630,11 +1630,15 @@ public:
       return false;
     }
 
-    if (EnzymeEnableCudaRepeatedLoads) {
+    // Generated CUDA reverse kernels may be materialized after the local
+    // autodiff hook, so run the shadow-atomic cleanup once over the module.
+    if (EnzymeEnableCudaRepeatedLoads || EnzymeEnableCudaShadowAtomicCache) {
       auto &AA = Logic.PPC.FAM.getResult<AAManager>(*newFunc);
-      bool CudaRepeatedLoadChanged = simplifyRepeatedGlobalLoads(*newFunc, AA);
+      bool CudaRepeatedLoadChanged = false;
+      if (EnzymeEnableCudaRepeatedLoads)
+        CudaRepeatedLoadChanged |= simplifyRepeatedGlobalLoads(*newFunc, AA);
       CudaRepeatedLoadChanged |= coalesceRepeatedCudaAtomicFAdds(*newFunc, AA);
-      CudaRepeatedLoadChanged |= mergeCudaShadowAtomicFAddTails(*newFunc, AA);
+      CudaRepeatedLoadChanged |= cacheCudaShadowAtomicFAdds(*newFunc, AA);
       if (CudaRepeatedLoadChanged) {
         PreservedAnalyses PA;
         Logic.PPC.FAM.invalidate(*newFunc, PA);
@@ -2990,6 +2994,27 @@ public:
       call->eraseFromParent();
     }
 
+    if (EnzymeEnableCudaRepeatedLoads || EnzymeEnableCudaShadowAtomicCache) {
+      SmallVector<Function *, 32> Worklist;
+      for (Function &F : M)
+        if (!F.empty())
+          Worklist.push_back(&F);
+
+      for (Function *F : Worklist) {
+        auto &AA = Logic.PPC.FAM.getResult<AAManager>(*F);
+        bool CudaRepeatedLoadChanged = false;
+        if (EnzymeEnableCudaRepeatedLoads)
+          CudaRepeatedLoadChanged |= simplifyRepeatedGlobalLoads(*F, AA);
+        CudaRepeatedLoadChanged |= coalesceRepeatedCudaAtomicFAdds(*F, AA);
+        CudaRepeatedLoadChanged |= cacheCudaShadowAtomicFAdds(*F, AA);
+        if (CudaRepeatedLoadChanged) {
+          PreservedAnalyses PA;
+          Logic.PPC.FAM.invalidate(*F, PA);
+          changed = true;
+        }
+      }
+    }
+
     for (const auto &pair : Logic.PPC.cache)
       pair.second->eraseFromParent();
     Logic.clear();
@@ -3217,6 +3242,9 @@ void augmentPassBuilder(llvm::PassBuilder &PB) {
 #endif
     MPM.addPass(createModuleToFunctionPassAdaptor(std::move(OptimizerPM)));
     MPM.addPass(EnzymeNewPM(/*PostOpt=*/true));
+    FunctionPassManager EnzymeCudaPM;
+    EnzymeCudaPM.addPass(SimpleGVNNewPM());
+    MPM.addPass(createModuleToFunctionPassAdaptor(std::move(EnzymeCudaPM)));
     MPM.addPass(PreserveNVVMNewPM(/*Begin*/ false));
 #if LLVM_VERSION_MAJOR >= 16
     OptimizerPM2.addPass(llvm::GVNPass());

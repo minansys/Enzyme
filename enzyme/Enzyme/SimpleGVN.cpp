@@ -56,6 +56,7 @@
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -105,18 +106,16 @@ using namespace llvm;
 #define DEBUG_TYPE "simple-gvn"
 
 llvm::cl::opt<bool> EnzymeEnableCudaRepeatedLoads(
-    "enzyme-enable-cuda-repeated-loads", cl::init(false), cl::Hidden,
+    "enzyme-enable-cuda-repeated-loads", cl::init(true), cl::Hidden,
     cl::desc("Enable CUDA repeated global load forwarding and adjoint atomic "
              "folding"));
 
-llvm::cl::opt<bool> EnzymeEnableCudaAtomicTailMerge(
-    "enzyme-enable-cuda-atomic-tail-merge", cl::init(false), cl::Hidden,
-    cl::desc("Enable CUDA Enzyme shadow atomic tail merging"));
+llvm::cl::opt<bool> EnzymeEnableCudaShadowAtomicCache(
+    "enzyme-enable-cuda-shadow-atomic-cache", cl::init(true), cl::Hidden,
+    cl::desc("Cache CUDA Enzyme shadow atomic fadds in per-thread local slots "
+             "before flushing to global memory"));
 
-llvm::cl::opt<bool> EnzymeEnableCudaPointerTableLoads(
-    "enzyme-enable-cuda-pointer-table-loads", cl::init(false), cl::Hidden,
-    cl::desc("Assume CUDA pointer-table row writes are disjoint from readonly "
-             "argument/global storage for repeated-load forwarding"));
+static constexpr unsigned ShadowAtomicCacheSlots = 16;
 
 namespace {
 
@@ -290,60 +289,18 @@ static bool isRepeatedGlobalLoadCandidate(LoadInst *LI) {
   return AS == 0 || AS == 1;
 }
 
-static Value *getPointerBase(Value *V) {
-  SmallPtrSet<Value *, 8> Seen;
-  while (V && Seen.insert(V).second) {
-    V = V->stripPointerCasts();
-    if (auto *GEP = dyn_cast<GEPOperator>(V)) {
-      V = GEP->getPointerOperand();
-      continue;
-    }
-    return V;
-  }
-  return V;
-}
+static bool sameScalarExpression(Value *LHS, Value *RHS) {
+  if (LHS == RHS)
+    return true;
 
-static bool isReadonlyArgOrGlobalBase(Value *Base) {
-  Base = getPointerBase(Base);
-  if (auto *Arg = dyn_cast_or_null<Argument>(Base))
-    return Arg->hasAttribute(Attribute::ReadOnly);
-  if (auto *GV = dyn_cast_or_null<GlobalVariable>(Base))
-    return GV->isConstant();
-  return false;
-}
+  LHS = LHS->stripPointerCasts();
+  RHS = RHS->stripPointerCasts();
+  if (LHS == RHS)
+    return true;
 
-static bool isReadonlyArgOrGlobalLoad(LoadInst *LI) {
-  return isRepeatedGlobalLoadCandidate(LI) &&
-         isReadonlyArgOrGlobalBase(LI->getPointerOperand());
-}
-
-static bool isPointerTableEntryLoad(LoadInst *LI) {
-  return LI->getType()->isPointerTy() && isReadonlyArgOrGlobalLoad(LI);
-}
-
-static Value *getMemoryAccessPointer(Instruction *I) {
-  if (auto *SI = dyn_cast<StoreInst>(I))
-    return SI->getPointerOperand();
-  if (auto *RMW = dyn_cast<AtomicRMWInst>(I))
-    return RMW->getPointerOperand();
-  if (auto *CXI = dyn_cast<AtomicCmpXchgInst>(I))
-    return CXI->getPointerOperand();
-  return nullptr;
-}
-
-static bool isCudaPointerTableRowAccess(Instruction *I) {
-  Value *AccessPtr = getMemoryAccessPointer(I);
-  if (!AccessPtr)
-    return false;
-
-  auto *RowLoad = dyn_cast_or_null<LoadInst>(getPointerBase(AccessPtr));
-  return RowLoad && isPointerTableEntryLoad(RowLoad);
-}
-
-static bool canIgnorePointerTableRowClobber(Instruction *MaybeClobber,
-                                            LoadInst *LI) {
-  return EnzymeEnableCudaPointerTableLoads && isReadonlyArgOrGlobalLoad(LI) &&
-         isCudaPointerTableRowAccess(MaybeClobber);
+  auto *LHSI = dyn_cast<Instruction>(LHS);
+  auto *RHSI = dyn_cast<Instruction>(RHS);
+  return LHSI && RHSI && LHSI->isIdenticalToWhenDefined(RHSI);
 }
 
 static bool sameLoadPointer(Value *LHS, Value *RHS) {
@@ -357,11 +314,36 @@ static bool sameLoadPointer(Value *LHS, Value *RHS) {
 
   auto *LHSGEP = dyn_cast<GetElementPtrInst>(LHS);
   auto *RHSGEP = dyn_cast<GetElementPtrInst>(RHS);
-  return LHSGEP && RHSGEP && LHSGEP->isIdenticalToWhenDefined(RHSGEP);
+  if (!LHSGEP || !RHSGEP ||
+      LHSGEP->getSourceElementType() != RHSGEP->getSourceElementType() ||
+      LHSGEP->getNumOperands() != RHSGEP->getNumOperands())
+    return false;
+
+  if (!sameLoadPointer(LHSGEP->getPointerOperand(),
+                       RHSGEP->getPointerOperand()))
+    return false;
+
+  for (auto I = 1u; I < LHSGEP->getNumOperands(); ++I)
+    if (!sameScalarExpression(LHSGEP->getOperand(I), RHSGEP->getOperand(I)))
+      return false;
+
+  return true;
 }
 
-static bool canForwardRepeatedLoad(LoadInst *Prev, LoadInst *LI,
-                                   AAResults &AA) {
+static bool canForwardRepeatedLoad(LoadInst *Prev, LoadInst *LI, AAResults &AA,
+                                   DominatorTree &DT) {
+  if (!DT.dominates(Prev, LI))
+    return false;
+  if (Prev->getType() != LI->getType() ||
+      Prev->getPointerAddressSpace() != LI->getPointerAddressSpace())
+    return false;
+  if (sameLoadPointer(Prev->getPointerOperand(), LI->getPointerOperand()))
+    return true;
+  return AA.isMustAlias(MemoryLocation::get(Prev), MemoryLocation::get(LI));
+}
+
+static bool sameRepeatedLoadLocation(LoadInst *Prev, LoadInst *LI,
+                                     AAResults &AA) {
   if (Prev->getType() != LI->getType() ||
       Prev->getPointerAddressSpace() != LI->getPointerAddressSpace())
     return false;
@@ -373,8 +355,6 @@ static bool canForwardRepeatedLoad(LoadInst *Prev, LoadInst *LI,
 static bool mayClobberLoad(Instruction *MaybeClobber, LoadInst *LI,
                            AAResults &AA) {
   if (!MaybeClobber->mayWriteToMemory())
-    return false;
-  if (canIgnorePointerTableRowClobber(MaybeClobber, LI))
     return false;
   return isModSet(AA.getModRefInfo(MaybeClobber, MemoryLocation::get(LI)));
 }
@@ -399,13 +379,85 @@ static void invalidateAvailableLoads(Instruction *I,
     Available.clear();
 }
 
+static SmallVector<LoadInst *, 8> getLoadsAvailableFromAllPredecessors(
+    BasicBlock &BB, DenseMap<BasicBlock *, SmallVector<LoadInst *, 8>>
+                        &AvailableAtEnd) {
+  SmallVector<LoadInst *, 8> AvailableLoads;
+  SmallVector<BasicBlock *, 4> Preds(predecessors(&BB));
+  if (Preds.empty())
+    return AvailableLoads;
+
+  auto First = AvailableAtEnd.find(Preds.front());
+  if (First == AvailableAtEnd.end())
+    return AvailableLoads;
+
+  AvailableLoads = First->second;
+  for (BasicBlock *Pred : ArrayRef<BasicBlock *>(Preds).drop_front()) {
+    auto It = AvailableAtEnd.find(Pred);
+    if (It == AvailableAtEnd.end())
+      return {};
+
+    SmallPtrSet<LoadInst *, 8> PredLoads(It->second.begin(), It->second.end());
+    for (auto LoadIt = AvailableLoads.begin(); LoadIt != AvailableLoads.end();) {
+      if (!PredLoads.contains(*LoadIt))
+        LoadIt = AvailableLoads.erase(LoadIt);
+      else
+        ++LoadIt;
+    }
+    if (AvailableLoads.empty())
+      break;
+  }
+
+  return AvailableLoads;
+}
+
+static Value *createPhiForLoadAvailableFromAllPredecessors(
+    LoadInst *LI, BasicBlock &BB,
+    DenseMap<BasicBlock *, SmallVector<LoadInst *, 8>> &AvailableAtEnd,
+    AAResults &AA) {
+  SmallVector<BasicBlock *, 4> Preds(predecessors(&BB));
+  if (Preds.size() < 2)
+    return nullptr;
+
+  SmallVector<LoadInst *, 4> IncomingLoads;
+  for (BasicBlock *Pred : Preds) {
+    auto It = AvailableAtEnd.find(Pred);
+    if (It == AvailableAtEnd.end())
+      return nullptr;
+
+    LoadInst *Incoming = nullptr;
+    for (LoadInst *Prev : It->second) {
+      if (sameRepeatedLoadLocation(Prev, LI, AA)) {
+        Incoming = Prev;
+        break;
+      }
+    }
+    if (!Incoming)
+      return nullptr;
+    IncomingLoads.push_back(Incoming);
+  }
+
+  auto *InsertBefore = BB.getFirstNonPHI();
+  auto *Phi = PHINode::Create(LI->getType(), Preds.size(),
+                              LI->getName() + ".available", InsertBefore);
+  Phi->setDebugLoc(LI->getDebugLoc());
+  for (auto I = 0u; I < Preds.size(); ++I)
+    Phi->addIncoming(IncomingLoads[I], Preds[I]);
+  return Phi;
+}
+
 static bool simplifyRepeatedGlobalLoadsImpl(Function &F, AAResults &AA) {
   if (!EnzymeEnableCudaRepeatedLoads || !isNVPTXModule(F.getParent()))
     return false;
 
   bool Changed = false;
-  for (BasicBlock &BB : F) {
-    SmallVector<LoadInst *, 8> AvailableLoads;
+  DominatorTree DT(F);
+  DenseMap<BasicBlock *, SmallVector<LoadInst *, 8>> AvailableAtEnd;
+  for (BasicBlock *BBPtr : ReversePostOrderTraversal<Function *>(&F)) {
+    BasicBlock &BB = *BBPtr;
+    SmallVector<LoadInst *, 8> AvailableLoads =
+        getLoadsAvailableFromAllPredecessors(BB, AvailableAtEnd);
+
     for (auto It = BB.begin(), End = BB.end(); It != End;) {
       Instruction *I = &*It++;
 
@@ -413,7 +465,7 @@ static bool simplifyRepeatedGlobalLoadsImpl(Function &F, AAResults &AA) {
         if (isRepeatedGlobalLoadCandidate(LI)) {
           LoadInst *ForwardFrom = nullptr;
           for (LoadInst *Prev : AvailableLoads) {
-            if (canForwardRepeatedLoad(Prev, LI, AA)) {
+            if (canForwardRepeatedLoad(Prev, LI, AA, DT)) {
               ForwardFrom = Prev;
               break;
             }
@@ -429,6 +481,17 @@ static bool simplifyRepeatedGlobalLoadsImpl(Function &F, AAResults &AA) {
             continue;
           }
 
+          if (Value *Phi = createPhiForLoadAvailableFromAllPredecessors(
+                  LI, BB, AvailableAtEnd, AA)) {
+            LLVM_DEBUG(dbgs() << "SimpleGVN: PHI-forwarding repeated global "
+                                 "load from predecessors\n"
+                              << "  Redundant load: " << *LI << "\n");
+            LI->replaceAllUsesWith(Phi);
+            LI->eraseFromParent();
+            Changed = true;
+            continue;
+          }
+
           AvailableLoads.push_back(LI);
           continue;
         }
@@ -436,6 +499,7 @@ static bool simplifyRepeatedGlobalLoadsImpl(Function &F, AAResults &AA) {
 
       invalidateAvailableLoads(I, AvailableLoads, AA);
     }
+    AvailableAtEnd[&BB] = AvailableLoads;
   }
 
   return Changed;
@@ -460,6 +524,23 @@ static bool isCudaAtomicFAddCandidate(AtomicRMWInst *RMW) {
          RMW->getOperation() == AtomicRMWInst::FAdd && !RMW->isVolatile() &&
          RMW->use_empty() && RMW->getOrdering() == AtomicOrdering::Monotonic &&
          RMW->getValOperand()->getType()->isFloatingPointTy();
+}
+
+static bool isCudaAtomicFAddShape(AtomicRMWInst *RMW) {
+  return RMW->getOperation() == AtomicRMWInst::FAdd && !RMW->isVolatile() &&
+         RMW->use_empty() && RMW->getOrdering() == AtomicOrdering::Monotonic &&
+         RMW->getValOperand()->getType()->isFloatingPointTy();
+}
+
+static bool isEnzymeGeneratedReverseFunction(const Function &F) {
+  StringRef Name = F.getName();
+  return Name.starts_with("diffe_") || Name.contains("_cuda_reverse");
+}
+
+static bool isCudaAtomicFAddCacheCandidate(AtomicRMWInst *RMW) {
+  return isCudaAtomicFAddCandidate(RMW) ||
+         (isCudaAtomicFAddShape(RMW) &&
+          isEnzymeGeneratedReverseFunction(*RMW->getFunction()));
 }
 
 static bool sameAtomicLocation(AtomicRMWInst *Prev, AtomicRMWInst *RMW,
@@ -564,211 +645,300 @@ static bool coalesceRepeatedCudaAtomicFAddsImpl(Function &F, AAResults &AA) {
   return Changed;
 }
 
-struct AtomicTailGroup {
-  BasicBlock *Succ;
-  SmallVector<BasicBlock *, 4> Preds;
-  SmallVector<SmallVector<AtomicRMWInst *, 8>, 4> Atomics;
+struct ShadowAtomicCacheState {
+  AllocaInst *Valid = nullptr;
+  AllocaInst *Ptrs = nullptr;
+  AllocaInst *Vals = nullptr;
+  FunctionCallee AddFn;
+  FunctionCallee FlushFn;
 };
 
-static bool sameTailMergeAtomicShape(AtomicRMWInst *LHS, AtomicRMWInst *RHS) {
-  return LHS->getOperation() == RHS->getOperation() &&
-         LHS->getOrdering() == RHS->getOrdering() &&
-         LHS->getSyncScopeID() == RHS->getSyncScopeID() &&
-         LHS->getAlign() == RHS->getAlign() &&
-         LHS->getPointerOperand()->getType() ==
-             RHS->getPointerOperand()->getType() &&
-         LHS->getValOperand()->getType() == RHS->getValOperand()->getType();
+static std::string getShadowAtomicCacheSuffix(Type *ValTy, Type *PtrTy,
+                                              unsigned Slots) {
+  std::string Name;
+  raw_string_ostream OS(Name);
+  OS << (ValTy->isFloatTy() ? "f32" : "f64") << "_as"
+     << cast<PointerType>(PtrTy)->getAddressSpace() << "_s" << Slots;
+  return OS.str();
 }
 
-static bool sameTailMergeShape(ArrayRef<AtomicRMWInst *> LHS,
-                               ArrayRef<AtomicRMWInst *> RHS) {
-  if (LHS.size() != RHS.size())
-    return false;
-  for (auto I = 0u; I < LHS.size(); ++I)
-    if (!sameTailMergeAtomicShape(LHS[I], RHS[I]))
-      return false;
-  return true;
+static void addAlwaysInline(Function *F) {
+  F->addFnAttr(Attribute::AlwaysInline);
+  F->addFnAttr(Attribute::NoUnwind);
 }
 
-static bool
-canMoveAtomicAfterInstructions(AtomicRMWInst *RMW,
-                               ArrayRef<Instruction *> LaterNonAtomicInsts,
-                               AAResults &AA) {
-  MemoryLocation Loc = MemoryLocation::get(RMW);
-  for (Instruction *I : LaterNonAtomicInsts) {
-    if (isa<DbgInfoIntrinsic>(I))
-      continue;
-    if (isa<AtomicRMWInst>(I) || isa<AtomicCmpXchgInst>(I) || isa<FenceInst>(I))
-      return false;
-    if (I->mayHaveSideEffects() && !I->mayReadOrWriteMemory())
-      return false;
-    if (instructionMayAccessLocation(I, Loc, AA))
-      return false;
+static FunctionCallee getOrCreateShadowAtomicCacheAdd(Module &M, Type *PtrTy,
+                                                      Type *ValTy,
+                                                      unsigned Slots) {
+  LLVMContext &Ctx = M.getContext();
+  Type *I1Ty = Type::getInt1Ty(Ctx);
+  Type *VoidTy = Type::getVoidTy(Ctx);
+  auto *ValidTy = PointerType::get(Ctx, 0);
+  auto *PtrArrayTy = PointerType::get(Ctx, 0);
+  auto *ValArrayTy = PointerType::get(Ctx, 0);
+
+  std::string Name = "__enzyme_cuda_shadow_atomic_cache_add_" +
+                     getShadowAtomicCacheSuffix(ValTy, PtrTy, Slots);
+  FunctionType *FTy =
+      FunctionType::get(VoidTy, {ValidTy, PtrArrayTy, ValArrayTy, PtrTy, ValTy},
+                        false);
+  if (Function *Existing = M.getFunction(Name))
+    return FunctionCallee(FTy, Existing);
+
+  Function *F =
+      Function::Create(FTy, GlobalValue::InternalLinkage, Name, M);
+  addAlwaysInline(F);
+  auto AI = F->arg_begin();
+  Value *ValidArg = &*AI++;
+  Value *PtrsArg = &*AI++;
+  Value *ValsArg = &*AI++;
+  Value *DstArg = &*AI++;
+  Value *ValArg = &*AI++;
+  ValidArg->setName("valid");
+  PtrsArg->setName("ptrs");
+  ValsArg->setName("vals");
+  DstArg->setName("dst");
+  ValArg->setName("val");
+
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
+  IRBuilder<> B(Entry);
+  BasicBlock *FullBB = BasicBlock::Create(Ctx, "full", F);
+  BasicBlock *RetBB = BasicBlock::Create(Ctx, "ret", F);
+  BasicBlock *Cur = Entry;
+
+  for (unsigned I = 0; I < Slots; ++I) {
+    B.SetInsertPoint(Cur);
+    Value *Idxs[] = {B.getInt64(0), B.getInt64(I)};
+    auto *ValidPtr = B.CreateInBoundsGEP(ArrayType::get(I1Ty, Slots), ValidArg,
+                                         Idxs, "valid.slot");
+    Value *IsValid = B.CreateLoad(I1Ty, ValidPtr, "is.valid");
+    BasicBlock *CheckPtrBB = BasicBlock::Create(Ctx, "check.ptr", F);
+    BasicBlock *EmptyBB = BasicBlock::Create(Ctx, "empty", F);
+    B.CreateCondBr(IsValid, CheckPtrBB, EmptyBB);
+
+    B.SetInsertPoint(CheckPtrBB);
+    auto *PtrSlot = B.CreateInBoundsGEP(ArrayType::get(PtrTy, Slots), PtrsArg,
+                                        Idxs, "ptr.slot");
+    Value *OldPtr = B.CreateLoad(PtrTy, PtrSlot, "old.ptr");
+    Value *SamePtr = B.CreateICmpEQ(OldPtr, DstArg, "same.ptr");
+    BasicBlock *AccumulateBB = BasicBlock::Create(Ctx, "accumulate", F);
+    BasicBlock *NextBB = I + 1 == Slots ? FullBB
+                                        : BasicBlock::Create(Ctx, "next", F);
+    B.CreateCondBr(SamePtr, AccumulateBB, NextBB);
+
+    B.SetInsertPoint(AccumulateBB);
+    auto *ValSlot = B.CreateInBoundsGEP(ArrayType::get(ValTy, Slots), ValsArg,
+                                        Idxs, "val.slot");
+    Value *OldVal = B.CreateLoad(ValTy, ValSlot, "old.val");
+    Value *NewVal = B.CreateFAdd(OldVal, ValArg, "new.val");
+    B.CreateStore(NewVal, ValSlot);
+    B.CreateBr(RetBB);
+
+    B.SetInsertPoint(EmptyBB);
+    auto *EmptyPtrSlot = B.CreateInBoundsGEP(ArrayType::get(PtrTy, Slots),
+                                            PtrsArg, Idxs, "ptr.empty.slot");
+    auto *EmptyValSlot = B.CreateInBoundsGEP(ArrayType::get(ValTy, Slots),
+                                            ValsArg, Idxs, "val.empty.slot");
+    B.CreateStore(DstArg, EmptyPtrSlot);
+    B.CreateStore(ValArg, EmptyValSlot);
+    B.CreateStore(ConstantInt::getTrue(Ctx), ValidPtr);
+    B.CreateBr(RetBB);
+
+    Cur = NextBB;
   }
-  return true;
+
+  B.SetInsertPoint(FullBB);
+  Value *Idxs[] = {B.getInt64(0), B.getInt64(0)};
+  auto *PtrSlot =
+      B.CreateInBoundsGEP(ArrayType::get(PtrTy, Slots), PtrsArg, Idxs);
+  auto *ValSlot =
+      B.CreateInBoundsGEP(ArrayType::get(ValTy, Slots), ValsArg, Idxs);
+  Value *FlushPtr = B.CreateLoad(PtrTy, PtrSlot);
+  Value *FlushVal = B.CreateLoad(ValTy, ValSlot);
+  B.CreateAtomicRMW(AtomicRMWInst::FAdd, FlushPtr, FlushVal,
+                    M.getDataLayout().getABITypeAlign(ValTy),
+                    AtomicOrdering::Monotonic, SyncScope::System);
+  B.CreateStore(DstArg, PtrSlot);
+  B.CreateStore(ValArg, ValSlot);
+  B.CreateBr(RetBB);
+
+  B.SetInsertPoint(RetBB);
+  B.CreateRetVoid();
+  return FunctionCallee(FTy, F);
 }
 
-static bool
-collectMovableCudaShadowAtomics(BasicBlock *BB, AAResults &AA,
-                                SmallVectorImpl<AtomicRMWInst *> &RMWs) {
-  auto *BI = dyn_cast<BranchInst>(BB->getTerminator());
-  if (!BI || !BI->isUnconditional())
-    return false;
+static FunctionCallee getOrCreateShadowAtomicCacheFlush(Module &M, Type *PtrTy,
+                                                        Type *ValTy,
+                                                        unsigned Slots) {
+  LLVMContext &Ctx = M.getContext();
+  Type *I1Ty = Type::getInt1Ty(Ctx);
+  Type *VoidTy = Type::getVoidTy(Ctx);
+  auto *ValidTy = PointerType::get(Ctx, 0);
+  auto *PtrArrayTy = PointerType::get(Ctx, 0);
+  auto *ValArrayTy = PointerType::get(Ctx, 0);
 
-  SmallVector<Instruction *, 16> LaterNonAtomicInsts;
-  for (Instruction &I : llvm::reverse(*BB)) {
-    if (&I == BB->getTerminator() || isa<DbgInfoIntrinsic>(&I))
-      continue;
+  std::string Name = "__enzyme_cuda_shadow_atomic_cache_flush_" +
+                     getShadowAtomicCacheSuffix(ValTy, PtrTy, Slots);
+  FunctionType *FTy =
+      FunctionType::get(VoidTy, {ValidTy, PtrArrayTy, ValArrayTy}, false);
+  if (Function *Existing = M.getFunction(Name))
+    return FunctionCallee(FTy, Existing);
 
-    if (auto *RMW = dyn_cast<AtomicRMWInst>(&I);
-        RMW && isCudaAtomicFAddCandidate(RMW)) {
-      if (!canMoveAtomicAfterInstructions(RMW, LaterNonAtomicInsts, AA))
-        return false;
-      RMWs.push_back(RMW);
-      continue;
-    }
+  Function *F =
+      Function::Create(FTy, GlobalValue::InternalLinkage, Name, M);
+  addAlwaysInline(F);
+  auto AI = F->arg_begin();
+  Value *ValidArg = &*AI++;
+  Value *PtrsArg = &*AI++;
+  Value *ValsArg = &*AI++;
 
-    LaterNonAtomicInsts.push_back(&I);
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
+  BasicBlock *RetBB = BasicBlock::Create(Ctx, "ret", F);
+  IRBuilder<> B(Entry);
+  BasicBlock *Cur = Entry;
+
+  for (unsigned I = 0; I < Slots; ++I) {
+    B.SetInsertPoint(Cur);
+    Value *Idxs[] = {B.getInt64(0), B.getInt64(I)};
+    auto *ValidPtr = B.CreateInBoundsGEP(ArrayType::get(I1Ty, Slots), ValidArg,
+                                         Idxs, "valid.slot");
+    Value *IsValid = B.CreateLoad(I1Ty, ValidPtr, "is.valid");
+    BasicBlock *FlushBB = BasicBlock::Create(Ctx, "flush.slot", F);
+    BasicBlock *NextBB = I + 1 == Slots ? RetBB
+                                        : BasicBlock::Create(Ctx, "next", F);
+    B.CreateCondBr(IsValid, FlushBB, NextBB);
+
+    B.SetInsertPoint(FlushBB);
+    auto *PtrSlot = B.CreateInBoundsGEP(ArrayType::get(PtrTy, Slots), PtrsArg,
+                                        Idxs, "ptr.slot");
+    auto *ValSlot = B.CreateInBoundsGEP(ArrayType::get(ValTy, Slots), ValsArg,
+                                        Idxs, "val.slot");
+    Value *FlushPtr = B.CreateLoad(PtrTy, PtrSlot);
+    Value *FlushVal = B.CreateLoad(ValTy, ValSlot);
+    B.CreateAtomicRMW(AtomicRMWInst::FAdd, FlushPtr, FlushVal,
+                      M.getDataLayout().getABITypeAlign(ValTy),
+                      AtomicOrdering::Monotonic, SyncScope::System);
+    B.CreateStore(ConstantInt::getFalse(Ctx), ValidPtr);
+    B.CreateBr(NextBB);
+    Cur = NextBB;
   }
 
-  std::reverse(RMWs.begin(), RMWs.end());
-  return !RMWs.empty();
+  B.SetInsertPoint(RetBB);
+  B.CreateRetVoid();
+  return FunctionCallee(FTy, F);
 }
 
-static bool
-compatibleTailMergeGroup(const SmallVectorImpl<AtomicRMWInst *> &Base,
-                         const SmallVectorImpl<AtomicRMWInst *> &RMWs) {
-  return sameTailMergeShape(Base, RMWs);
-}
+static ShadowAtomicCacheState &
+getShadowAtomicCacheState(Function &F, Type *PtrTy, Type *ValTy,
+                          DenseMap<std::pair<Type *, Type *>,
+                                   ShadowAtomicCacheState> &Caches) {
+  auto Key = std::make_pair(PtrTy, ValTy);
+  auto It = Caches.find(Key);
+  if (It != Caches.end())
+    return It->second;
 
-static bool findCudaShadowAtomicTailGroup(BasicBlock *Succ, AAResults &AA,
-                                          AtomicTailGroup &Group) {
-  if (!EnzymeEnableCudaAtomicTailMerge || pred_empty(Succ) ||
-      isa<PHINode>(Succ->begin()))
-    return false;
+  unsigned Slots = ShadowAtomicCacheSlots;
+  LLVMContext &Ctx = F.getContext();
+  IRBuilder<> AllocaB(&F.getEntryBlock(), F.getEntryBlock().begin());
+  IRBuilder<> InitB(&*F.getEntryBlock().getFirstInsertionPt());
+  auto *ValidTy = ArrayType::get(Type::getInt1Ty(Ctx), Slots);
+  auto *PtrArrayTy = ArrayType::get(PtrTy, Slots);
+  auto *ValArrayTy = ArrayType::get(ValTy, Slots);
 
-  SmallVector<BasicBlock *, 8> Preds(predecessors(Succ));
-  SmallVector<SmallVector<AtomicRMWInst *, 8>, 8> PredAtomics;
-  for (BasicBlock *Pred : Preds) {
-    SmallVector<AtomicRMWInst *, 8> RMWs;
-    if (collectMovableCudaShadowAtomics(Pred, AA, RMWs))
-      PredAtomics.push_back(std::move(RMWs));
-    else
-      PredAtomics.push_back({});
+  ShadowAtomicCacheState State;
+  State.Valid = AllocaB.CreateAlloca(ValidTy, nullptr, "enzyme.atomic.valid");
+  State.Ptrs = AllocaB.CreateAlloca(PtrArrayTy, nullptr, "enzyme.atomic.ptrs");
+  State.Vals = AllocaB.CreateAlloca(ValArrayTy, nullptr, "enzyme.atomic.vals");
+  State.AddFn =
+      getOrCreateShadowAtomicCacheAdd(*F.getParent(), PtrTy, ValTy, Slots);
+  State.FlushFn =
+      getOrCreateShadowAtomicCacheFlush(*F.getParent(), PtrTy, ValTy, Slots);
+
+  for (unsigned I = 0; I < Slots; ++I) {
+    Value *Idxs[] = {InitB.getInt64(0), InitB.getInt64(I)};
+    auto *ValidPtr = InitB.CreateInBoundsGEP(ValidTy, State.Valid, Idxs);
+    InitB.CreateStore(ConstantInt::getFalse(Ctx), ValidPtr);
   }
 
-  for (auto I = 0u; I < Preds.size(); ++I) {
-    if (PredAtomics[I].empty())
-      continue;
+  auto Inserted = Caches.insert({Key, State});
+  return Inserted.first->second;
+}
 
-    SmallVector<unsigned, 4> Matching;
-    Matching.push_back(I);
-    for (auto J = I + 1; J < Preds.size(); ++J) {
-      if (!PredAtomics[J].empty() &&
-          compatibleTailMergeGroup(PredAtomics[I], PredAtomics[J]))
-        Matching.push_back(J);
-    }
-
-    if (Matching.size() < 2)
-      continue;
-
-    Group.Succ = Succ;
-    for (unsigned Idx : Matching) {
-      Group.Preds.push_back(Preds[Idx]);
-      Group.Atomics.push_back(std::move(PredAtomics[Idx]));
-    }
+static bool shouldFlushShadowAtomicCacheBefore(
+    Instruction *I, ArrayRef<MemoryLocation> Pending, AAResults &AA) {
+  if (Pending.empty())
+    return false;
+  if (isa<DbgInfoIntrinsic>(I))
+    return false;
+  if (isa<AtomicRMWInst>(I) || isa<AtomicCmpXchgInst>(I) || isa<FenceInst>(I))
     return true;
+  if (auto *CB = dyn_cast<CallBase>(I)) {
+    if (Function *Callee = CB->getCalledFunction()) {
+      if (Callee->getName().starts_with("__enzyme_cuda_shadow_atomic_cache_"))
+        return false;
+    }
   }
-
+  if (I->mayHaveSideEffects() && !I->mayReadOrWriteMemory())
+    return true;
+  if (!I->mayReadOrWriteMemory())
+    return false;
+  for (const MemoryLocation &Loc : Pending)
+    if (instructionMayAccessLocation(I, Loc, AA))
+      return true;
   return false;
 }
 
-static void copyCommonAtomicMetadata(AtomicRMWInst *NewRMW,
-                                     ArrayRef<AtomicRMWInst *> OldRMWs) {
-  NewRMW->setMetadata("enzyme_shadow_atomic",
-                      MDNode::get(NewRMW->getContext(), {}));
-  for (unsigned Kind : {LLVMContext::MD_tbaa, LLVMContext::MD_tbaa_struct}) {
-    MDNode *MD = OldRMWs.front()->getMetadata(Kind);
-    bool AllSame = true;
-    for (AtomicRMWInst *RMW : OldRMWs.drop_front()) {
-      if (RMW->getMetadata(Kind) != MD) {
-        AllSame = false;
-        break;
-      }
-    }
-    if (AllSame)
-      NewRMW->setMetadata(Kind, MD);
+static void flushShadowAtomicCaches(
+    IRBuilder<> &Builder,
+    DenseMap<std::pair<Type *, Type *>, ShadowAtomicCacheState> &Caches,
+    SmallVectorImpl<MemoryLocation> &Pending) {
+  if (Pending.empty())
+    return;
+  for (auto &Pair : Caches) {
+    ShadowAtomicCacheState &State = Pair.second;
+    Builder.CreateCall(State.FlushFn, {State.Valid, State.Ptrs, State.Vals});
   }
+  Pending.clear();
 }
 
-static bool applyCudaShadowAtomicTailMerge(const AtomicTailGroup &Group) {
-  LLVMContext &Ctx = Group.Succ->getContext();
-  BasicBlock *MergeBB = BasicBlock::Create(Ctx, "enzyme.atomic.merge",
-                                           Group.Succ->getParent(), Group.Succ);
-  BranchInst::Create(Group.Succ, MergeBB);
-
-  for (BasicBlock *Pred : Group.Preds) {
-    auto *BI = cast<BranchInst>(Pred->getTerminator());
-    BI->setSuccessor(0, MergeBB);
-  }
-
-  IRBuilder<> Builder(MergeBB->getTerminator());
-  unsigned NumAtomics = Group.Atomics.front().size();
-  SmallVector<PHINode *, 8> PtrPhis;
-  SmallVector<PHINode *, 8> ValPhis;
-  SmallVector<SmallVector<AtomicRMWInst *, 4>, 8> OldRMWGroups;
-
-  for (unsigned I = 0; I < NumAtomics; ++I) {
-    AtomicRMWInst *Template = Group.Atomics.front()[I];
-    auto *PtrPhi = PHINode::Create(Template->getPointerOperand()->getType(),
-                                   Group.Preds.size(), "atomic.ptr",
-                                   MergeBB->getTerminator());
-    auto *ValPhi = PHINode::Create(Template->getValOperand()->getType(),
-                                   Group.Preds.size(), "atomic.val",
-                                   MergeBB->getTerminator());
-
-    SmallVector<AtomicRMWInst *, 4> OldRMWs;
-    for (auto PredIdx = 0u; PredIdx < Group.Preds.size(); ++PredIdx) {
-      AtomicRMWInst *RMW = Group.Atomics[PredIdx][I];
-      PtrPhi->addIncoming(RMW->getPointerOperand(), Group.Preds[PredIdx]);
-      ValPhi->addIncoming(RMW->getValOperand(), Group.Preds[PredIdx]);
-      OldRMWs.push_back(RMW);
-    }
-
-    PtrPhis.push_back(PtrPhi);
-    ValPhis.push_back(ValPhi);
-    OldRMWGroups.push_back(std::move(OldRMWs));
-  }
-
-  for (unsigned I = 0; I < NumAtomics; ++I) {
-    AtomicRMWInst *Template = Group.Atomics.front()[I];
-    auto *NewRMW = Builder.CreateAtomicRMW(
-        Template->getOperation(), PtrPhis[I], ValPhis[I], Template->getAlign(),
-        Template->getOrdering(), Template->getSyncScopeID());
-    copyCommonAtomicMetadata(NewRMW, OldRMWGroups[I]);
-  }
-
-  for (const auto &RMWs : Group.Atomics)
-    for (AtomicRMWInst *RMW : RMWs)
-      RMW->eraseFromParent();
-
-  return true;
-}
-
-static bool mergeCudaShadowAtomicFAddTailsImpl(Function &F, AAResults &AA) {
-  if (!EnzymeEnableCudaRepeatedLoads || !EnzymeEnableCudaAtomicTailMerge ||
-      !isNVPTXModule(F.getParent()))
+static bool cacheCudaShadowAtomicFAddsImpl(Function &F, AAResults &AA) {
+  if (!EnzymeEnableCudaShadowAtomicCache || !isNVPTXModule(F.getParent()))
     return false;
 
   bool Changed = false;
-  SmallVector<BasicBlock *, 8> Blocks;
-  for (BasicBlock &BB : F)
-    Blocks.push_back(&BB);
+  DenseMap<std::pair<Type *, Type *>, ShadowAtomicCacheState> Caches;
+  for (BasicBlock &BB : F) {
+    SmallVector<MemoryLocation, 16> Pending;
+    for (auto It = BB.begin(), End = BB.end(); It != End;) {
+      Instruction *I = &*It++;
 
-  for (BasicBlock *Succ : Blocks) {
-    AtomicTailGroup Group;
-    if (findCudaShadowAtomicTailGroup(Succ, AA, Group))
-      Changed |= applyCudaShadowAtomicTailMerge(Group);
+      auto *RMW = dyn_cast<AtomicRMWInst>(I);
+      if (RMW && isCudaAtomicFAddCacheCandidate(RMW)) {
+        Type *ValTy = RMW->getValOperand()->getType();
+        if (ValTy->isFloatTy() || ValTy->isDoubleTy()) {
+          ShadowAtomicCacheState &State = getShadowAtomicCacheState(
+              F, RMW->getPointerOperand()->getType(), ValTy, Caches);
+          IRBuilder<> Builder(RMW);
+          Builder.CreateCall(State.AddFn, {State.Valid, State.Ptrs, State.Vals,
+                                           RMW->getPointerOperand(),
+                                           RMW->getValOperand()});
+          Pending.push_back(MemoryLocation::get(RMW));
+          RMW->eraseFromParent();
+          Changed = true;
+          continue;
+        }
+      }
+
+      if (shouldFlushShadowAtomicCacheBefore(I, Pending, AA)) {
+        IRBuilder<> Builder(I);
+        flushShadowAtomicCaches(Builder, Caches, Pending);
+      }
+    }
+
+    if (!Pending.empty()) {
+      IRBuilder<> Builder(BB.getTerminator());
+      flushShadowAtomicCaches(Builder, Caches, Pending);
+    }
   }
 
   return Changed;
@@ -1105,7 +1275,7 @@ public:
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.addRequired<DominatorTreeWrapperPass>();
-    if (EnzymeEnableCudaRepeatedLoads)
+    if (EnzymeEnableCudaRepeatedLoads || EnzymeEnableCudaShadowAtomicCache)
       AU.addRequired<AAResultsWrapperPass>();
   }
 
@@ -1113,11 +1283,12 @@ public:
     auto &DT = getAnalysis<DominatorTreeWrapperPass>().getDomTree();
     const DataLayout &DL = F.getParent()->getDataLayout();
     bool Changed = false;
-    if (EnzymeEnableCudaRepeatedLoads) {
+    if (EnzymeEnableCudaRepeatedLoads || EnzymeEnableCudaShadowAtomicCache) {
       auto &AA = getAnalysis<AAResultsWrapperPass>().getAAResults();
-      Changed |= simplifyRepeatedGlobalLoadsImpl(F, AA);
+      if (EnzymeEnableCudaRepeatedLoads)
+        Changed |= simplifyRepeatedGlobalLoadsImpl(F, AA);
       Changed |= coalesceRepeatedCudaAtomicFAddsImpl(F, AA);
-      Changed |= mergeCudaShadowAtomicFAddTailsImpl(F, AA);
+      Changed |= cacheCudaShadowAtomicFAddsImpl(F, AA);
     }
     Changed |= simplifyGVN(F, DT, DL);
     return Changed;
@@ -1134,8 +1305,8 @@ bool coalesceRepeatedCudaAtomicFAdds(Function &F, AAResults &AA) {
   return coalesceRepeatedCudaAtomicFAddsImpl(F, AA);
 }
 
-bool mergeCudaShadowAtomicFAddTails(Function &F, AAResults &AA) {
-  return mergeCudaShadowAtomicFAddTailsImpl(F, AA);
+bool cacheCudaShadowAtomicFAdds(Function &F, AAResults &AA) {
+  return cacheCudaShadowAtomicFAddsImpl(F, AA);
 }
 
 FunctionPass *createSimpleGVNPass() { return new SimpleGVN(); }
@@ -1153,11 +1324,12 @@ SimpleGVNNewPM::Result SimpleGVNNewPM::run(Function &F,
                                            FunctionAnalysisManager &FAM) {
   bool Changed = false;
   const DataLayout &DL = F.getParent()->getDataLayout();
-  if (EnzymeEnableCudaRepeatedLoads) {
+  if (EnzymeEnableCudaRepeatedLoads || EnzymeEnableCudaShadowAtomicCache) {
     auto &AA = FAM.getResult<AAManager>(F);
-    Changed |= simplifyRepeatedGlobalLoadsImpl(F, AA);
+    if (EnzymeEnableCudaRepeatedLoads)
+      Changed |= simplifyRepeatedGlobalLoadsImpl(F, AA);
     Changed |= coalesceRepeatedCudaAtomicFAddsImpl(F, AA);
-    Changed |= mergeCudaShadowAtomicFAddTailsImpl(F, AA);
+    Changed |= cacheCudaShadowAtomicFAddsImpl(F, AA);
   }
   Changed |= simplifyGVN(F, FAM.getResult<DominatorTreeAnalysis>(F), DL);
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();

@@ -1,9 +1,13 @@
-; RUN: if [ %llvmver -lt 17 ]; then %opt < %s %newLoadEnzyme -opaque-pointers -passes="simple-gvn" -S | FileCheck %s --check-prefix=OFF; fi
-; RUN: if [ %llvmver -ge 17 ]; then %opt < %s %newLoadEnzyme -passes="simple-gvn" -S | FileCheck %s --check-prefix=OFF; fi
-; RUN: if [ %llvmver -lt 17 ]; then %opt < %s %newLoadEnzyme -opaque-pointers -enzyme-enable-cuda-repeated-loads=1 -passes="simple-gvn" -S | FileCheck %s --check-prefix=ON; fi
-; RUN: if [ %llvmver -ge 17 ]; then %opt < %s %newLoadEnzyme -enzyme-enable-cuda-repeated-loads=1 -passes="simple-gvn" -S | FileCheck %s --check-prefix=ON; fi
+; RUN: if [ %llvmver -lt 17 ]; then %opt < %s %newLoadEnzyme -opaque-pointers -enzyme-enable-cuda-shadow-atomic-cache=0 -passes="simple-gvn" -S | FileCheck %s --check-prefix=OFF; fi
+; RUN: if [ %llvmver -ge 17 ]; then %opt < %s %newLoadEnzyme -enzyme-enable-cuda-shadow-atomic-cache=0 -passes="simple-gvn" -S | FileCheck %s --check-prefix=OFF; fi
+; RUN: if [ %llvmver -lt 17 ]; then %opt < %s %newLoadEnzyme -opaque-pointers -enzyme-enable-cuda-repeated-loads=1 -enzyme-enable-cuda-shadow-atomic-cache=0 -passes="simple-gvn" -S | FileCheck %s --check-prefix=ON; fi
+; RUN: if [ %llvmver -ge 17 ]; then %opt < %s %newLoadEnzyme -enzyme-enable-cuda-repeated-loads=1 -enzyme-enable-cuda-shadow-atomic-cache=0 -passes="simple-gvn" -S | FileCheck %s --check-prefix=ON; fi
+; RUN: if [ %llvmver -lt 17 ]; then %opt < %s %newLoadEnzyme -opaque-pointers -enzyme-enable-cuda-repeated-loads=0 -enzyme-enable-cuda-shadow-atomic-cache=1 -passes="simple-gvn" -S | FileCheck %s --check-prefix=CACHE; fi
+; RUN: if [ %llvmver -ge 17 ]; then %opt < %s %newLoadEnzyme -enzyme-enable-cuda-repeated-loads=0 -enzyme-enable-cuda-shadow-atomic-cache=1 -passes="simple-gvn" -S | FileCheck %s --check-prefix=CACHE; fi
 
 target triple = "nvptx64-nvidia-cuda"
+
+%Table = type { ptr }
 
 define void @fold_float_noalias_interleaved(ptr noalias %du, ptr noalias %dv,
                                             i64 %i, float %a, float %b,
@@ -85,6 +89,27 @@ entry:
   ret void
 }
 
+define void @fold_byval_table_row(ptr byval(%Table) %table, i64 %i, float %a,
+                                  float %b) {
+entry:
+  %slot0 = getelementptr inbounds %Table, ptr %table, i64 0, i32 0
+  %row0 = load ptr, ptr %slot0, align 8
+  %p0 = getelementptr inbounds float, ptr %row0, i64 %i
+  atomicrmw fadd ptr %p0, float %a monotonic, !enzyme_shadow_atomic !5
+  %slot1 = getelementptr inbounds %Table, ptr %table, i64 0, i32 0
+  %row1 = load ptr, ptr %slot1, align 8
+  %p1 = getelementptr inbounds float, ptr %row1, i64 %i
+  atomicrmw fadd ptr %p1, float %b monotonic, !enzyme_shadow_atomic !5
+  ret void
+}
+
+define void @diffe_untagged_cache(ptr %p, double %a, double %b) {
+entry:
+  atomicrmw fadd ptr %p, double %a monotonic
+  atomicrmw fadd ptr %p, double %b monotonic
+  ret void
+}
+
 !0 = !{!1}
 !1 = distinct !{!1, !2, !"du"}
 !2 = distinct !{!2, !"shadow-domain"}
@@ -155,3 +180,10 @@ entry:
 ; ON: atomicrmw fadd ptr %p0, float %a monotonic
 ; ON: atomicrmw fadd ptr %p1, float %b monotonic
 ; ON: ret void
+
+; CACHE-LABEL: define void @diffe_untagged_cache(
+; CACHE-NOT: atomicrmw fadd ptr %p, double %a monotonic
+; CACHE: call void @__enzyme_cuda_shadow_atomic_cache_add_f64_as0_s16
+; CACHE: call void @__enzyme_cuda_shadow_atomic_cache_add_f64_as0_s16
+; CACHE: call void @__enzyme_cuda_shadow_atomic_cache_flush_f64_as0_s16
+; CACHE: ret void
