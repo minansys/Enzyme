@@ -59,6 +59,7 @@
 
 extern "C" {
 extern llvm::cl::opt<bool> EnzymeAlwaysInlineDiff;
+extern llvm::cl::opt<bool> EnzymeNoAlias;
 }
 
 // Perform an analysis to detect functions which only write to visible memory

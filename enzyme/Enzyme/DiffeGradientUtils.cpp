@@ -38,8 +38,14 @@
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Value.h"
+#if LLVM_VERSION_MAJOR >= 17
+#include "llvm/TargetParser/Triple.h"
+#else
+#include "llvm/ADT/Triple.h"
+#endif
 
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 
@@ -47,6 +53,7 @@
 #include "llvm/Support/ErrorHandling.h"
 
 #include "LibraryFuncs.h"
+#include "SimpleGVN.h"
 #include "Utils.h"
 
 using namespace llvm;
@@ -68,6 +75,57 @@ bool elementwiseReadForContext(const Instruction *orig, const Value *origptr) {
     }
   }
   return false;
+}
+
+bool sameAtomicUpdatePointer(Value *lhs, Value *rhs) {
+  if (lhs == rhs)
+    return true;
+
+  lhs = lhs->stripPointerCasts();
+  rhs = rhs->stripPointerCasts();
+  if (lhs == rhs)
+    return true;
+
+  auto *lhsI = dyn_cast<Instruction>(lhs);
+  auto *rhsI = dyn_cast<Instruction>(rhs);
+  return lhsI && rhsI && lhsI->isIdenticalToWhenDefined(rhsI);
+}
+
+Value *foldPreviousAtomicFAdd(IRBuilder<> &Builder, AtomicRMWInst::BinOp op,
+                              Value *ptr, Value *dif, MaybeAlign align,
+                              AtomicOrdering ordering,
+                              SyncScope::ID syncScope) {
+  BasicBlock *block = Builder.GetInsertBlock();
+  if (!block)
+    return dif;
+
+  auto it = Builder.GetInsertPoint();
+  while (it != block->begin()) {
+    --it;
+    Instruction *prev = &*it;
+
+    if (isa<DbgInfoIntrinsic>(prev))
+      continue;
+
+    if (auto *rmw = dyn_cast<AtomicRMWInst>(prev)) {
+      if (rmw->getOperation() != op || rmw->isVolatile() || !rmw->use_empty() ||
+          rmw->getOrdering() != ordering ||
+          rmw->getSyncScopeID() != syncScope ||
+          !sameAtomicUpdatePointer(rmw->getPointerOperand(), ptr))
+        return dif;
+      if (align && rmw->getAlign() != *align)
+        return dif;
+
+      Value *folded = Builder.CreateFAdd(rmw->getValOperand(), dif);
+      rmw->eraseFromParent();
+      return folded;
+    }
+
+    if (prev->mayReadOrWriteMemory() || prev->mayHaveSideEffects())
+      return dif;
+  }
+
+  return dif;
 }
 } // namespace
 
@@ -1014,8 +1072,43 @@ void DiffeGradientUtils::addToInvertedPtrDiffe(Instruction *orig,
     Atomic = false;
   if (Atomic && elementwiseReadForContext(orig, origptr))
     Atomic = false;
+  const bool OptimizeCudaAtomicAdds =
+      EnzymeEnableCudaRepeatedLoads &&
+      (Arch == Triple::nvptx || Arch == Triple::nvptx64);
 
   if (Atomic) {
+    auto setDerivativeAtomicMetadata = [&](AtomicRMWInst *RMW, size_t idx) {
+      RMW->setMetadata("enzyme_shadow_atomic",
+                       MDNode::get(RMW->getContext(), {}));
+      SmallVector<Metadata *, 1> scopeMD = {
+          getDerivativeAliasScope(origptr, idx)};
+      if (auto *origValI = dyn_cast_or_null<Instruction>(origVal))
+        if (auto *MD = origValI->getMetadata(LLVMContext::MD_alias_scope))
+          for (auto &M : cast<MDNode>(MD)->operands())
+            scopeMD.push_back(M);
+      RMW->setMetadata(LLVMContext::MD_alias_scope,
+                       MDNode::get(RMW->getContext(), scopeMD));
+
+      SmallVector<Metadata *, 1> MDs;
+      for (ssize_t j = -1; j < getWidth(); j++) {
+        if (j != (ssize_t)idx)
+          MDs.push_back(getDerivativeAliasScope(origptr, j));
+      }
+      if (auto *origValI = dyn_cast_or_null<Instruction>(origVal))
+        if (auto *MD = origValI->getMetadata(LLVMContext::MD_noalias))
+          for (auto &M : cast<MDNode>(MD)->operands())
+            MDs.push_back(M);
+      if (!MDs.empty())
+        RMW->setMetadata(LLVMContext::MD_noalias,
+                         MDNode::get(RMW->getContext(), MDs));
+
+      RMW->setMetadata(LLVMContext::MD_tbaa,
+                       orig->getMetadata(LLVMContext::MD_tbaa));
+      RMW->setMetadata(LLVMContext::MD_tbaa_struct,
+                       orig->getMetadata(LLVMContext::MD_tbaa_struct));
+      RMW->setDebugLoc(getNewFromOriginal(orig->getDebugLoc()));
+    };
+
     // For amdgcn constant AS is 4 and if the primal is in it we need to cast
     // the derivative value to AS 1
     if (Arch == Triple::amdgcn &&
@@ -1055,10 +1148,12 @@ void DiffeGradientUtils::addToInvertedPtrDiffe(Instruction *orig,
      }
      */
     AtomicRMWInst::BinOp op = AtomicRMWInst::FAdd;
+    size_t idx = 0;
     if (auto vt = dyn_cast<VectorType>(addingType)) {
       assert(!vt->getElementCount().isScalable());
       size_t numElems = vt->getElementCount().getKnownMinValue();
       auto rule = [&](Value *dif, Value *ptr) {
+        size_t shadowIdx = idx++;
         for (size_t i = 0; i < numElems; ++i) {
           auto vdif = BuilderM.CreateExtractElement(dif, i);
           vdif = SanitizeDerivatives(orig, vdif, BuilderM);
@@ -1076,14 +1171,21 @@ void DiffeGradientUtils::addToInvertedPtrDiffe(Instruction *orig,
               }
             }
           }
-          BuilderM.CreateAtomicRMW(op, vptr, vdif, alignv,
-                                   AtomicOrdering::Monotonic,
-                                   SyncScope::System);
+          if (OptimizeCudaAtomicAdds)
+            vdif = foldPreviousAtomicFAdd(BuilderM, op, vptr, vdif, alignv,
+                                          AtomicOrdering::Monotonic,
+                                          SyncScope::System);
+          auto *RMW = BuilderM.CreateAtomicRMW(op, vptr, vdif, alignv,
+                                               AtomicOrdering::Monotonic,
+                                               SyncScope::System);
+          if (OptimizeCudaAtomicAdds)
+            setDerivativeAtomicMetadata(RMW, shadowIdx);
         }
       };
       applyChainRule(BuilderM, rule, dif, ptr);
     } else {
       auto rule = [&](Value *dif, Value *ptr) {
+        size_t shadowIdx = idx++;
         dif = SanitizeDerivatives(orig, dif, BuilderM);
         MaybeAlign alignv = align;
         if (alignv) {
@@ -1095,8 +1197,14 @@ void DiffeGradientUtils::addToInvertedPtrDiffe(Instruction *orig,
             }
           }
         }
-        BuilderM.CreateAtomicRMW(op, ptr, dif, alignv,
-                                 AtomicOrdering::Monotonic, SyncScope::System);
+        if (OptimizeCudaAtomicAdds)
+          dif = foldPreviousAtomicFAdd(BuilderM, op, ptr, dif, alignv,
+                                       AtomicOrdering::Monotonic,
+                                       SyncScope::System);
+        auto *RMW = BuilderM.CreateAtomicRMW(
+            op, ptr, dif, alignv, AtomicOrdering::Monotonic, SyncScope::System);
+        if (OptimizeCudaAtomicAdds)
+          setDerivativeAtomicMetadata(RMW, shadowIdx);
       };
       applyChainRule(BuilderM, rule, dif, ptr);
     }

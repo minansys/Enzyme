@@ -21,6 +21,8 @@
 // This file contains a GVN-like optimization pass that forwards loads from
 // noalias/nocapture arguments to their corresponding stores, with support
 // for offsets and type conversions.
+// It also performs conservative repeated-load forwarding for NVPTX global
+// memory loads when no intervening instruction can clobber the loaded address.
 //
 // This pass addresses the limitation of LLVM's built-in GVN pass which has
 // a small limit on the number of instructions/memory offsets it analyzes
@@ -54,8 +56,17 @@
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/PostOrderIterator.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+
+#include <algorithm>
+#if LLVM_VERSION_MAJOR >= 17
+#include "llvm/TargetParser/Triple.h"
+#else
+#include "llvm/ADT/Triple.h"
+#endif
 
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
@@ -69,6 +80,8 @@
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/IR/Value.h"
 
 #include "llvm/Analysis/AliasAnalysis.h"
@@ -92,6 +105,18 @@ using namespace llvm;
 #undef DEBUG_TYPE
 #endif
 #define DEBUG_TYPE "simple-gvn"
+
+llvm::cl::opt<bool> EnzymeEnableCudaRepeatedLoads(
+    "enzyme-enable-cuda-repeated-loads", cl::init(true), cl::Hidden,
+    cl::desc("Enable CUDA repeated global load forwarding and adjoint atomic "
+             "folding"));
+
+llvm::cl::opt<bool> EnzymeEnableCudaShadowAtomicCache(
+    "enzyme-enable-cuda-shadow-atomic-cache", cl::init(false), cl::Hidden,
+    cl::desc("Cache CUDA Enzyme shadow atomic fadds in per-thread local slots "
+             "before flushing to global memory"));
+
+static constexpr unsigned ShadowAtomicCacheSlots = 16;
 
 namespace {
 
@@ -245,6 +270,820 @@ static bool memoryRangesAlias(const APInt &Offset1, uint64_t Size1,
 
   // Otherwise, they may alias
   return true;
+}
+
+static bool isNVPTXModule(const Module *M) {
+  if (!M)
+    return false;
+  Triple::ArchType Arch = Triple(M->getTargetTriple()).getArch();
+  return Arch == Triple::nvptx || Arch == Triple::nvptx64;
+}
+
+static bool isRepeatedGlobalLoadCandidate(LoadInst *LI) {
+  if (!LI->isSimple())
+    return false;
+
+  // CUDA C++ device pointers commonly reach LLVM as generic addrspace(0)
+  // pointers even when they refer to global memory. The forwarding below is
+  // guarded by AA clobber checks, so it is also safe for generic pointers.
+  unsigned AS = LI->getPointerAddressSpace();
+  return AS == 0 || AS == 1;
+}
+
+static bool sameScalarExpression(Value *LHS, Value *RHS) {
+  if (LHS == RHS)
+    return true;
+
+  LHS = LHS->stripPointerCasts();
+  RHS = RHS->stripPointerCasts();
+  if (LHS == RHS)
+    return true;
+
+  auto *LHSI = dyn_cast<Instruction>(LHS);
+  auto *RHSI = dyn_cast<Instruction>(RHS);
+  return LHSI && RHSI && LHSI->isIdenticalToWhenDefined(RHSI);
+}
+
+static bool sameLoadPointer(Value *LHS, Value *RHS) {
+  if (LHS == RHS)
+    return true;
+
+  LHS = LHS->stripPointerCasts();
+  RHS = RHS->stripPointerCasts();
+  if (LHS == RHS)
+    return true;
+
+  auto *LHSGEP = dyn_cast<GetElementPtrInst>(LHS);
+  auto *RHSGEP = dyn_cast<GetElementPtrInst>(RHS);
+  if (!LHSGEP || !RHSGEP ||
+      LHSGEP->getSourceElementType() != RHSGEP->getSourceElementType() ||
+      LHSGEP->getNumOperands() != RHSGEP->getNumOperands())
+    return false;
+
+  if (!sameLoadPointer(LHSGEP->getPointerOperand(),
+                       RHSGEP->getPointerOperand()))
+    return false;
+
+  for (auto I = 1u; I < LHSGEP->getNumOperands(); ++I)
+    if (!sameScalarExpression(LHSGEP->getOperand(I), RHSGEP->getOperand(I)))
+      return false;
+
+  return true;
+}
+
+static bool canForwardRepeatedLoad(LoadInst *Prev, LoadInst *LI, AAResults &AA,
+                                   DominatorTree &DT) {
+  if (!DT.dominates(Prev, LI))
+    return false;
+  if (Prev->getType() != LI->getType() ||
+      Prev->getPointerAddressSpace() != LI->getPointerAddressSpace())
+    return false;
+  if (sameLoadPointer(Prev->getPointerOperand(), LI->getPointerOperand()))
+    return true;
+  return AA.isMustAlias(MemoryLocation::get(Prev), MemoryLocation::get(LI));
+}
+
+static bool sameRepeatedLoadLocation(LoadInst *Prev, LoadInst *LI,
+                                     AAResults &AA) {
+  if (Prev->getType() != LI->getType() ||
+      Prev->getPointerAddressSpace() != LI->getPointerAddressSpace())
+    return false;
+  if (sameLoadPointer(Prev->getPointerOperand(), LI->getPointerOperand()))
+    return true;
+  return AA.isMustAlias(MemoryLocation::get(Prev), MemoryLocation::get(LI));
+}
+
+static bool mayClobberLoad(Instruction *MaybeClobber, LoadInst *LI,
+                           AAResults &AA) {
+  if (!MaybeClobber->mayWriteToMemory())
+    return false;
+  return isModSet(AA.getModRefInfo(MaybeClobber, MemoryLocation::get(LI)));
+}
+
+static void invalidateAvailableLoads(Instruction *I,
+                                     SmallVectorImpl<LoadInst *> &Available,
+                                     AAResults &AA) {
+  if (Available.empty())
+    return;
+
+  if (I->mayWriteToMemory()) {
+    for (auto It = Available.begin(); It != Available.end();) {
+      if (mayClobberLoad(I, *It, AA))
+        It = Available.erase(It);
+      else
+        ++It;
+    }
+    return;
+  }
+
+  if (I->mayHaveSideEffects())
+    Available.clear();
+}
+
+static SmallVector<LoadInst *, 8> getLoadsAvailableFromAllPredecessors(
+    BasicBlock &BB, DenseMap<BasicBlock *, SmallVector<LoadInst *, 8>>
+                        &AvailableAtEnd) {
+  SmallVector<LoadInst *, 8> AvailableLoads;
+  SmallVector<BasicBlock *, 4> Preds(predecessors(&BB));
+  if (Preds.empty())
+    return AvailableLoads;
+
+  auto First = AvailableAtEnd.find(Preds.front());
+  if (First == AvailableAtEnd.end())
+    return AvailableLoads;
+
+  AvailableLoads = First->second;
+  for (BasicBlock *Pred : ArrayRef<BasicBlock *>(Preds).drop_front()) {
+    auto It = AvailableAtEnd.find(Pred);
+    if (It == AvailableAtEnd.end())
+      return {};
+
+    SmallPtrSet<LoadInst *, 8> PredLoads(It->second.begin(), It->second.end());
+    for (auto LoadIt = AvailableLoads.begin(); LoadIt != AvailableLoads.end();) {
+      if (!PredLoads.contains(*LoadIt))
+        LoadIt = AvailableLoads.erase(LoadIt);
+      else
+        ++LoadIt;
+    }
+    if (AvailableLoads.empty())
+      break;
+  }
+
+  return AvailableLoads;
+}
+
+static Value *createPhiForLoadAvailableFromAllPredecessors(
+    LoadInst *LI, BasicBlock &BB,
+    DenseMap<BasicBlock *, SmallVector<LoadInst *, 8>> &AvailableAtEnd,
+    AAResults &AA) {
+  SmallVector<BasicBlock *, 4> Preds(predecessors(&BB));
+  if (Preds.size() < 2)
+    return nullptr;
+
+  SmallVector<LoadInst *, 4> IncomingLoads;
+  for (BasicBlock *Pred : Preds) {
+    auto It = AvailableAtEnd.find(Pred);
+    if (It == AvailableAtEnd.end())
+      return nullptr;
+
+    LoadInst *Incoming = nullptr;
+    for (LoadInst *Prev : It->second) {
+      if (sameRepeatedLoadLocation(Prev, LI, AA)) {
+        Incoming = Prev;
+        break;
+      }
+    }
+    if (!Incoming)
+      return nullptr;
+    IncomingLoads.push_back(Incoming);
+  }
+
+  auto *InsertBefore = BB.getFirstNonPHI();
+  auto *Phi = PHINode::Create(LI->getType(), Preds.size(),
+                              LI->getName() + ".available", InsertBefore);
+  Phi->setDebugLoc(LI->getDebugLoc());
+  for (auto I = 0u; I < Preds.size(); ++I)
+    Phi->addIncoming(IncomingLoads[I], Preds[I]);
+  return Phi;
+}
+
+static bool simplifyRepeatedGlobalLoadsImpl(Function &F, AAResults &AA) {
+  if (!EnzymeEnableCudaRepeatedLoads || !isNVPTXModule(F.getParent()))
+    return false;
+
+  bool Changed = false;
+  DominatorTree DT(F);
+  DenseMap<BasicBlock *, SmallVector<LoadInst *, 8>> AvailableAtEnd;
+  for (BasicBlock *BBPtr : ReversePostOrderTraversal<Function *>(&F)) {
+    BasicBlock &BB = *BBPtr;
+    SmallVector<LoadInst *, 8> AvailableLoads =
+        getLoadsAvailableFromAllPredecessors(BB, AvailableAtEnd);
+
+    for (auto It = BB.begin(), End = BB.end(); It != End;) {
+      Instruction *I = &*It++;
+
+      if (auto *LI = dyn_cast<LoadInst>(I)) {
+        if (isRepeatedGlobalLoadCandidate(LI)) {
+          LoadInst *ForwardFrom = nullptr;
+          for (LoadInst *Prev : AvailableLoads) {
+            if (canForwardRepeatedLoad(Prev, LI, AA, DT)) {
+              ForwardFrom = Prev;
+              break;
+            }
+          }
+
+          if (ForwardFrom) {
+            LLVM_DEBUG(dbgs() << "SimpleGVN: Forwarding repeated global load\n"
+                              << "  Load: " << *ForwardFrom << "\n"
+                              << "  Redundant load: " << *LI << "\n");
+            LI->replaceAllUsesWith(ForwardFrom);
+            LI->eraseFromParent();
+            Changed = true;
+            continue;
+          }
+
+          if (Value *Phi = createPhiForLoadAvailableFromAllPredecessors(
+                  LI, BB, AvailableAtEnd, AA)) {
+            LLVM_DEBUG(dbgs() << "SimpleGVN: PHI-forwarding repeated global "
+                                 "load from predecessors\n"
+                              << "  Redundant load: " << *LI << "\n");
+            LI->replaceAllUsesWith(Phi);
+            LI->eraseFromParent();
+            Changed = true;
+            continue;
+          }
+
+          AvailableLoads.push_back(LI);
+          continue;
+        }
+      }
+
+      invalidateAvailableLoads(I, AvailableLoads, AA);
+    }
+    AvailableAtEnd[&BB] = AvailableLoads;
+  }
+
+  return Changed;
+}
+
+static bool sameAtomicUpdatePointer(Value *LHS, Value *RHS) {
+  if (LHS == RHS)
+    return true;
+
+  LHS = LHS->stripPointerCasts();
+  RHS = RHS->stripPointerCasts();
+  if (LHS == RHS)
+    return true;
+
+  auto *LHSI = dyn_cast<Instruction>(LHS);
+  auto *RHSI = dyn_cast<Instruction>(RHS);
+  return LHSI && RHSI && LHSI->isIdenticalToWhenDefined(RHSI);
+}
+
+static bool isCudaAtomicFAddCandidate(AtomicRMWInst *RMW) {
+  return RMW->getMetadata("enzyme_shadow_atomic") &&
+         RMW->getOperation() == AtomicRMWInst::FAdd && !RMW->isVolatile() &&
+         RMW->use_empty() && RMW->getOrdering() == AtomicOrdering::Monotonic &&
+         RMW->getValOperand()->getType()->isFloatingPointTy();
+}
+
+static bool isCudaAtomicFAddShape(AtomicRMWInst *RMW) {
+  return RMW->getOperation() == AtomicRMWInst::FAdd && !RMW->isVolatile() &&
+         RMW->use_empty() && RMW->getOrdering() == AtomicOrdering::Monotonic &&
+         RMW->getValOperand()->getType()->isFloatingPointTy();
+}
+
+static bool isEnzymeGeneratedReverseFunction(const Function &F) {
+  StringRef Name = F.getName();
+  return Name.starts_with("diffe_") || Name.contains("_cuda_reverse");
+}
+
+static bool isFreeCallForValue(CallBase *CB, Value *V) {
+  Function *Callee = CB->getCalledFunction();
+  return Callee && Callee->getName() == "free" && CB->arg_size() == 1 &&
+         CB->getArgOperand(0) == V;
+}
+
+static bool isAllowedCudaCacheUse(Value *V, User *U,
+                                  SmallPtrSetImpl<Value *> &Visited,
+                                  SmallVectorImpl<CallBase *> &Frees) {
+  auto *I = dyn_cast<Instruction>(U);
+  if (!I)
+    return false;
+
+  if (isa<GetElementPtrInst>(I) || isa<BitCastInst>(I) ||
+      isa<AddrSpaceCastInst>(I)) {
+    if (!Visited.insert(I).second)
+      return true;
+    for (User *DerivedUser : I->users())
+      if (!isAllowedCudaCacheUse(I, DerivedUser, Visited, Frees))
+        return false;
+    return true;
+  }
+
+  if (auto *PN = dyn_cast<PHINode>(I)) {
+    for (Value *Incoming : PN->incoming_values())
+      if (Incoming != V && !isa<UndefValue>(Incoming) &&
+          !isa<ConstantPointerNull>(Incoming))
+        return false;
+    if (!Visited.insert(I).second)
+      return true;
+    for (User *DerivedUser : I->users())
+      if (!isAllowedCudaCacheUse(I, DerivedUser, Visited, Frees))
+        return false;
+    return true;
+  }
+
+  if (auto *SI = dyn_cast<SelectInst>(I)) {
+    Value *TrueValue = SI->getTrueValue();
+    Value *FalseValue = SI->getFalseValue();
+    auto IsAllowedSelectValue = [&](Value *Operand) {
+      return Operand == V || isa<UndefValue>(Operand) ||
+             isa<ConstantPointerNull>(Operand);
+    };
+    if (!IsAllowedSelectValue(TrueValue) || !IsAllowedSelectValue(FalseValue))
+      return false;
+    if (!Visited.insert(I).second)
+      return true;
+    for (User *DerivedUser : I->users())
+      if (!isAllowedCudaCacheUse(I, DerivedUser, Visited, Frees))
+        return false;
+    return true;
+  }
+
+  if (auto *LI = dyn_cast<LoadInst>(I))
+    return LI->getPointerOperand() == V;
+
+  if (auto *Store = dyn_cast<StoreInst>(I))
+    return Store->getPointerOperand() == V && Store->getValueOperand() != V;
+
+  if (auto *CB = dyn_cast<CallBase>(I)) {
+    if (isFreeCallForValue(CB, V)) {
+      Frees.push_back(CB);
+      return true;
+    }
+
+    if (auto *II = dyn_cast<IntrinsicInst>(I)) {
+      switch (II->getIntrinsicID()) {
+      case Intrinsic::memset:
+      case Intrinsic::memcpy:
+      case Intrinsic::memmove:
+      case Intrinsic::lifetime_start:
+      case Intrinsic::lifetime_end:
+        return true;
+      default:
+        break;
+      }
+    }
+  }
+
+  return false;
+}
+
+static bool canDemoteCudaCacheMalloc(CallInst *CI,
+                                     SmallVectorImpl<CallBase *> &Frees) {
+  Function *Callee = CI->getCalledFunction();
+  if (!Callee || Callee->getName() != "malloc")
+    return false;
+  if (!CI->getMetadata("enzyme_cache_alloc") || CI->arg_size() != 1)
+    return false;
+  auto *Size = dyn_cast<ConstantInt>(CI->getArgOperand(0));
+  if (!Size || Size->isZero())
+    return false;
+
+  SmallPtrSet<Value *, 16> Visited;
+  Visited.insert(CI);
+  for (User *U : CI->users())
+    if (!isAllowedCudaCacheUse(CI, U, Visited, Frees))
+      return false;
+  return true;
+}
+
+static bool demoteCudaCacheMallocsImpl(Function &F) {
+  if (!isNVPTXModule(F.getParent()) || !isEnzymeGeneratedReverseFunction(F))
+    return false;
+
+  SmallVector<std::pair<CallInst *, SmallVector<CallBase *, 2>>, 4> Worklist;
+  for (BasicBlock &BB : F) {
+    for (Instruction &I : BB) {
+      auto *CI = dyn_cast<CallInst>(&I);
+      if (!CI)
+        continue;
+      SmallVector<CallBase *, 2> Frees;
+      if (canDemoteCudaCacheMalloc(CI, Frees))
+        Worklist.push_back({CI, std::move(Frees)});
+    }
+  }
+
+  bool Changed = false;
+  IRBuilder<> EntryBuilder(&*F.getEntryBlock().getFirstInsertionPt());
+  Type *Int8Ty = Type::getInt8Ty(F.getContext());
+  for (auto &Item : Worklist) {
+    CallInst *Malloc = Item.first;
+    if (!Malloc->getParent())
+      continue;
+    auto *Size = cast<ConstantInt>(Malloc->getArgOperand(0));
+    AllocaInst *StackCache =
+        EntryBuilder.CreateAlloca(Int8Ty, Size, Malloc->getName() + ".stack");
+    StackCache->setAlignment(Malloc->getRetAlign().valueOrOne());
+    StackCache->setMetadata("enzyme_cache_alloc",
+                            Malloc->getMetadata("enzyme_cache_alloc"));
+    Malloc->replaceAllUsesWith(StackCache);
+    for (CallBase *Free : Item.second)
+      if (Free->getParent())
+        Free->eraseFromParent();
+    Malloc->eraseFromParent();
+    Changed = true;
+  }
+
+  return Changed;
+}
+
+static bool isCudaAtomicFAddCacheCandidate(AtomicRMWInst *RMW) {
+  return isCudaAtomicFAddCandidate(RMW) ||
+         (isCudaAtomicFAddShape(RMW) &&
+          isEnzymeGeneratedReverseFunction(*RMW->getFunction()));
+}
+
+static bool sameAtomicLocation(AtomicRMWInst *Prev, AtomicRMWInst *RMW,
+                               AAResults &AA) {
+  if (sameAtomicUpdatePointer(Prev->getPointerOperand(),
+                              RMW->getPointerOperand()))
+    return true;
+  return AA.isMustAlias(MemoryLocation::get(Prev), MemoryLocation::get(RMW));
+}
+
+static bool canCoalesceAtomicFAdd(AtomicRMWInst *Prev, AtomicRMWInst *RMW,
+                                  AAResults &AA) {
+  if (!isCudaAtomicFAddCandidate(Prev) || !isCudaAtomicFAddCandidate(RMW))
+    return false;
+  if (Prev->getOrdering() != RMW->getOrdering() ||
+      Prev->getSyncScopeID() != RMW->getSyncScopeID() ||
+      Prev->getAlign() != RMW->getAlign())
+    return false;
+  return sameAtomicLocation(Prev, RMW, AA);
+}
+
+static bool instructionMayAccessLocation(Instruction *I,
+                                         const MemoryLocation &Loc,
+                                         AAResults &AA) {
+  if (!I->mayReadOrWriteMemory())
+    return false;
+  return !isNoModRef(AA.getModRefInfo(I, Loc));
+}
+
+static void invalidatePendingAtomicFAdds(
+    Instruction *I,
+    SmallVectorImpl<std::pair<AtomicRMWInst *, MemoryLocation>> &Pending,
+    AAResults &AA) {
+  if (Pending.empty())
+    return;
+
+  if (I->mayHaveSideEffects() && !isa<AtomicRMWInst>(I)) {
+    Pending.clear();
+    return;
+  }
+
+  if (!I->mayReadOrWriteMemory())
+    return;
+
+  for (auto It = Pending.begin(); It != Pending.end();) {
+    if (instructionMayAccessLocation(I, It->second, AA))
+      It = Pending.erase(It);
+    else
+      ++It;
+  }
+}
+
+static bool coalesceRepeatedCudaAtomicFAddsImpl(Function &F, AAResults &AA) {
+  if (!EnzymeEnableCudaRepeatedLoads || !isNVPTXModule(F.getParent()))
+    return false;
+
+  bool Changed = false;
+  for (BasicBlock &BB : F) {
+    SmallVector<std::pair<AtomicRMWInst *, MemoryLocation>, 8> Pending;
+    for (auto It = BB.begin(), End = BB.end(); It != End;) {
+      Instruction *I = &*It++;
+      auto *RMW = dyn_cast<AtomicRMWInst>(I);
+      if (!RMW || !isCudaAtomicFAddCandidate(RMW)) {
+        invalidatePendingAtomicFAdds(I, Pending, AA);
+        continue;
+      }
+
+      AtomicRMWInst *FoldWith = nullptr;
+      unsigned FoldIndex = 0;
+      for (auto I = 0u; I < Pending.size(); ++I) {
+        if (canCoalesceAtomicFAdd(Pending[I].first, RMW, AA)) {
+          FoldWith = Pending[I].first;
+          FoldIndex = I;
+          break;
+        }
+      }
+
+      if (!FoldWith) {
+        invalidatePendingAtomicFAdds(RMW, Pending, AA);
+        Pending.push_back({RMW, MemoryLocation::get(RMW)});
+        continue;
+      }
+
+      IRBuilder<> Builder(RMW);
+      Value *Folded =
+          Builder.CreateFAdd(FoldWith->getValOperand(), RMW->getValOperand());
+      auto *NewRMW = Builder.CreateAtomicRMW(
+          RMW->getOperation(), RMW->getPointerOperand(), Folded,
+          RMW->getAlign(), RMW->getOrdering(), RMW->getSyncScopeID());
+      NewRMW->copyMetadata(*RMW);
+      NewRMW->setDebugLoc(RMW->getDebugLoc());
+
+      FoldWith->eraseFromParent();
+      RMW->eraseFromParent();
+      Pending.erase(Pending.begin() + FoldIndex);
+
+      invalidatePendingAtomicFAdds(NewRMW, Pending, AA);
+      Pending.push_back({NewRMW, MemoryLocation::get(NewRMW)});
+      Changed = true;
+    }
+  }
+  return Changed;
+}
+
+struct ShadowAtomicCacheState {
+  AllocaInst *Valid = nullptr;
+  AllocaInst *Ptrs = nullptr;
+  AllocaInst *Vals = nullptr;
+  FunctionCallee AddFn;
+  FunctionCallee FlushFn;
+};
+
+static std::string getShadowAtomicCacheSuffix(Type *ValTy, Type *PtrTy,
+                                              unsigned Slots) {
+  std::string Name;
+  raw_string_ostream OS(Name);
+  OS << (ValTy->isFloatTy() ? "f32" : "f64") << "_as"
+     << cast<PointerType>(PtrTy)->getAddressSpace() << "_s" << Slots;
+  return OS.str();
+}
+
+static void addAlwaysInline(Function *F) {
+  F->addFnAttr(Attribute::AlwaysInline);
+  F->addFnAttr(Attribute::NoUnwind);
+}
+
+static FunctionCallee getOrCreateShadowAtomicCacheAdd(Module &M, Type *PtrTy,
+                                                      Type *ValTy,
+                                                      unsigned Slots) {
+  LLVMContext &Ctx = M.getContext();
+  Type *I1Ty = Type::getInt1Ty(Ctx);
+  Type *VoidTy = Type::getVoidTy(Ctx);
+  auto *ValidTy = PointerType::get(Ctx, 0);
+  auto *PtrArrayTy = PointerType::get(Ctx, 0);
+  auto *ValArrayTy = PointerType::get(Ctx, 0);
+
+  std::string Name = "__enzyme_cuda_shadow_atomic_cache_add_" +
+                     getShadowAtomicCacheSuffix(ValTy, PtrTy, Slots);
+  FunctionType *FTy =
+      FunctionType::get(VoidTy, {ValidTy, PtrArrayTy, ValArrayTy, PtrTy, ValTy},
+                        false);
+  if (Function *Existing = M.getFunction(Name))
+    return FunctionCallee(FTy, Existing);
+
+  Function *F =
+      Function::Create(FTy, GlobalValue::InternalLinkage, Name, M);
+  addAlwaysInline(F);
+  auto AI = F->arg_begin();
+  Value *ValidArg = &*AI++;
+  Value *PtrsArg = &*AI++;
+  Value *ValsArg = &*AI++;
+  Value *DstArg = &*AI++;
+  Value *ValArg = &*AI++;
+  ValidArg->setName("valid");
+  PtrsArg->setName("ptrs");
+  ValsArg->setName("vals");
+  DstArg->setName("dst");
+  ValArg->setName("val");
+
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
+  IRBuilder<> B(Entry);
+  BasicBlock *FullBB = BasicBlock::Create(Ctx, "full", F);
+  BasicBlock *RetBB = BasicBlock::Create(Ctx, "ret", F);
+  BasicBlock *Cur = Entry;
+
+  for (unsigned I = 0; I < Slots; ++I) {
+    B.SetInsertPoint(Cur);
+    Value *Idxs[] = {B.getInt64(0), B.getInt64(I)};
+    auto *ValidPtr = B.CreateInBoundsGEP(ArrayType::get(I1Ty, Slots), ValidArg,
+                                         Idxs, "valid.slot");
+    Value *IsValid = B.CreateLoad(I1Ty, ValidPtr, "is.valid");
+    BasicBlock *CheckPtrBB = BasicBlock::Create(Ctx, "check.ptr", F);
+    BasicBlock *EmptyBB = BasicBlock::Create(Ctx, "empty", F);
+    B.CreateCondBr(IsValid, CheckPtrBB, EmptyBB);
+
+    B.SetInsertPoint(CheckPtrBB);
+    auto *PtrSlot = B.CreateInBoundsGEP(ArrayType::get(PtrTy, Slots), PtrsArg,
+                                        Idxs, "ptr.slot");
+    Value *OldPtr = B.CreateLoad(PtrTy, PtrSlot, "old.ptr");
+    Value *SamePtr = B.CreateICmpEQ(OldPtr, DstArg, "same.ptr");
+    BasicBlock *AccumulateBB = BasicBlock::Create(Ctx, "accumulate", F);
+    BasicBlock *NextBB = I + 1 == Slots ? FullBB
+                                        : BasicBlock::Create(Ctx, "next", F);
+    B.CreateCondBr(SamePtr, AccumulateBB, NextBB);
+
+    B.SetInsertPoint(AccumulateBB);
+    auto *ValSlot = B.CreateInBoundsGEP(ArrayType::get(ValTy, Slots), ValsArg,
+                                        Idxs, "val.slot");
+    Value *OldVal = B.CreateLoad(ValTy, ValSlot, "old.val");
+    Value *NewVal = B.CreateFAdd(OldVal, ValArg, "new.val");
+    B.CreateStore(NewVal, ValSlot);
+    B.CreateBr(RetBB);
+
+    B.SetInsertPoint(EmptyBB);
+    auto *EmptyPtrSlot = B.CreateInBoundsGEP(ArrayType::get(PtrTy, Slots),
+                                            PtrsArg, Idxs, "ptr.empty.slot");
+    auto *EmptyValSlot = B.CreateInBoundsGEP(ArrayType::get(ValTy, Slots),
+                                            ValsArg, Idxs, "val.empty.slot");
+    B.CreateStore(DstArg, EmptyPtrSlot);
+    B.CreateStore(ValArg, EmptyValSlot);
+    B.CreateStore(ConstantInt::getTrue(Ctx), ValidPtr);
+    B.CreateBr(RetBB);
+
+    Cur = NextBB;
+  }
+
+  B.SetInsertPoint(FullBB);
+  Value *Idxs[] = {B.getInt64(0), B.getInt64(0)};
+  auto *PtrSlot =
+      B.CreateInBoundsGEP(ArrayType::get(PtrTy, Slots), PtrsArg, Idxs);
+  auto *ValSlot =
+      B.CreateInBoundsGEP(ArrayType::get(ValTy, Slots), ValsArg, Idxs);
+  Value *FlushPtr = B.CreateLoad(PtrTy, PtrSlot);
+  Value *FlushVal = B.CreateLoad(ValTy, ValSlot);
+  B.CreateAtomicRMW(AtomicRMWInst::FAdd, FlushPtr, FlushVal,
+                    M.getDataLayout().getABITypeAlign(ValTy),
+                    AtomicOrdering::Monotonic, SyncScope::System);
+  B.CreateStore(DstArg, PtrSlot);
+  B.CreateStore(ValArg, ValSlot);
+  B.CreateBr(RetBB);
+
+  B.SetInsertPoint(RetBB);
+  B.CreateRetVoid();
+  return FunctionCallee(FTy, F);
+}
+
+static FunctionCallee getOrCreateShadowAtomicCacheFlush(Module &M, Type *PtrTy,
+                                                        Type *ValTy,
+                                                        unsigned Slots) {
+  LLVMContext &Ctx = M.getContext();
+  Type *I1Ty = Type::getInt1Ty(Ctx);
+  Type *VoidTy = Type::getVoidTy(Ctx);
+  auto *ValidTy = PointerType::get(Ctx, 0);
+  auto *PtrArrayTy = PointerType::get(Ctx, 0);
+  auto *ValArrayTy = PointerType::get(Ctx, 0);
+
+  std::string Name = "__enzyme_cuda_shadow_atomic_cache_flush_" +
+                     getShadowAtomicCacheSuffix(ValTy, PtrTy, Slots);
+  FunctionType *FTy =
+      FunctionType::get(VoidTy, {ValidTy, PtrArrayTy, ValArrayTy}, false);
+  if (Function *Existing = M.getFunction(Name))
+    return FunctionCallee(FTy, Existing);
+
+  Function *F =
+      Function::Create(FTy, GlobalValue::InternalLinkage, Name, M);
+  addAlwaysInline(F);
+  auto AI = F->arg_begin();
+  Value *ValidArg = &*AI++;
+  Value *PtrsArg = &*AI++;
+  Value *ValsArg = &*AI++;
+
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
+  BasicBlock *RetBB = BasicBlock::Create(Ctx, "ret", F);
+  IRBuilder<> B(Entry);
+  BasicBlock *Cur = Entry;
+
+  for (unsigned I = 0; I < Slots; ++I) {
+    B.SetInsertPoint(Cur);
+    Value *Idxs[] = {B.getInt64(0), B.getInt64(I)};
+    auto *ValidPtr = B.CreateInBoundsGEP(ArrayType::get(I1Ty, Slots), ValidArg,
+                                         Idxs, "valid.slot");
+    Value *IsValid = B.CreateLoad(I1Ty, ValidPtr, "is.valid");
+    BasicBlock *FlushBB = BasicBlock::Create(Ctx, "flush.slot", F);
+    BasicBlock *NextBB = I + 1 == Slots ? RetBB
+                                        : BasicBlock::Create(Ctx, "next", F);
+    B.CreateCondBr(IsValid, FlushBB, NextBB);
+
+    B.SetInsertPoint(FlushBB);
+    auto *PtrSlot = B.CreateInBoundsGEP(ArrayType::get(PtrTy, Slots), PtrsArg,
+                                        Idxs, "ptr.slot");
+    auto *ValSlot = B.CreateInBoundsGEP(ArrayType::get(ValTy, Slots), ValsArg,
+                                        Idxs, "val.slot");
+    Value *FlushPtr = B.CreateLoad(PtrTy, PtrSlot);
+    Value *FlushVal = B.CreateLoad(ValTy, ValSlot);
+    B.CreateAtomicRMW(AtomicRMWInst::FAdd, FlushPtr, FlushVal,
+                      M.getDataLayout().getABITypeAlign(ValTy),
+                      AtomicOrdering::Monotonic, SyncScope::System);
+    B.CreateStore(ConstantInt::getFalse(Ctx), ValidPtr);
+    B.CreateBr(NextBB);
+    Cur = NextBB;
+  }
+
+  B.SetInsertPoint(RetBB);
+  B.CreateRetVoid();
+  return FunctionCallee(FTy, F);
+}
+
+static ShadowAtomicCacheState &
+getShadowAtomicCacheState(Function &F, Type *PtrTy, Type *ValTy,
+                          DenseMap<std::pair<Type *, Type *>,
+                                   ShadowAtomicCacheState> &Caches) {
+  auto Key = std::make_pair(PtrTy, ValTy);
+  auto It = Caches.find(Key);
+  if (It != Caches.end())
+    return It->second;
+
+  unsigned Slots = ShadowAtomicCacheSlots;
+  LLVMContext &Ctx = F.getContext();
+  IRBuilder<> AllocaB(&F.getEntryBlock(), F.getEntryBlock().begin());
+  IRBuilder<> InitB(&*F.getEntryBlock().getFirstInsertionPt());
+  auto *ValidTy = ArrayType::get(Type::getInt1Ty(Ctx), Slots);
+  auto *PtrArrayTy = ArrayType::get(PtrTy, Slots);
+  auto *ValArrayTy = ArrayType::get(ValTy, Slots);
+
+  ShadowAtomicCacheState State;
+  State.Valid = AllocaB.CreateAlloca(ValidTy, nullptr, "enzyme.atomic.valid");
+  State.Ptrs = AllocaB.CreateAlloca(PtrArrayTy, nullptr, "enzyme.atomic.ptrs");
+  State.Vals = AllocaB.CreateAlloca(ValArrayTy, nullptr, "enzyme.atomic.vals");
+  State.AddFn =
+      getOrCreateShadowAtomicCacheAdd(*F.getParent(), PtrTy, ValTy, Slots);
+  State.FlushFn =
+      getOrCreateShadowAtomicCacheFlush(*F.getParent(), PtrTy, ValTy, Slots);
+
+  for (unsigned I = 0; I < Slots; ++I) {
+    Value *Idxs[] = {InitB.getInt64(0), InitB.getInt64(I)};
+    auto *ValidPtr = InitB.CreateInBoundsGEP(ValidTy, State.Valid, Idxs);
+    InitB.CreateStore(ConstantInt::getFalse(Ctx), ValidPtr);
+  }
+
+  auto Inserted = Caches.insert({Key, State});
+  return Inserted.first->second;
+}
+
+static bool shouldFlushShadowAtomicCacheBefore(
+    Instruction *I, ArrayRef<MemoryLocation> Pending, AAResults &AA) {
+  if (Pending.empty())
+    return false;
+  if (isa<DbgInfoIntrinsic>(I))
+    return false;
+  if (isa<AtomicRMWInst>(I) || isa<AtomicCmpXchgInst>(I) || isa<FenceInst>(I))
+    return true;
+  if (auto *CB = dyn_cast<CallBase>(I)) {
+    if (Function *Callee = CB->getCalledFunction()) {
+      if (Callee->getName().starts_with("__enzyme_cuda_shadow_atomic_cache_"))
+        return false;
+    }
+  }
+  if (I->mayHaveSideEffects() && !I->mayReadOrWriteMemory())
+    return true;
+  if (!I->mayReadOrWriteMemory())
+    return false;
+  for (const MemoryLocation &Loc : Pending)
+    if (instructionMayAccessLocation(I, Loc, AA))
+      return true;
+  return false;
+}
+
+static void flushShadowAtomicCaches(
+    IRBuilder<> &Builder,
+    DenseMap<std::pair<Type *, Type *>, ShadowAtomicCacheState> &Caches,
+    SmallVectorImpl<MemoryLocation> &Pending) {
+  if (Pending.empty())
+    return;
+  for (auto &Pair : Caches) {
+    ShadowAtomicCacheState &State = Pair.second;
+    Builder.CreateCall(State.FlushFn, {State.Valid, State.Ptrs, State.Vals});
+  }
+  Pending.clear();
+}
+
+static bool cacheCudaShadowAtomicFAddsImpl(Function &F, AAResults &AA) {
+  if (!EnzymeEnableCudaShadowAtomicCache || !isNVPTXModule(F.getParent()))
+    return false;
+
+  bool Changed = false;
+  DenseMap<std::pair<Type *, Type *>, ShadowAtomicCacheState> Caches;
+  for (BasicBlock &BB : F) {
+    SmallVector<MemoryLocation, 16> Pending;
+    for (auto It = BB.begin(), End = BB.end(); It != End;) {
+      Instruction *I = &*It++;
+
+      auto *RMW = dyn_cast<AtomicRMWInst>(I);
+      if (RMW && isCudaAtomicFAddCacheCandidate(RMW)) {
+        Type *ValTy = RMW->getValOperand()->getType();
+        if (ValTy->isFloatTy() || ValTy->isDoubleTy()) {
+          ShadowAtomicCacheState &State = getShadowAtomicCacheState(
+              F, RMW->getPointerOperand()->getType(), ValTy, Caches);
+          IRBuilder<> Builder(RMW);
+          Builder.CreateCall(State.AddFn, {State.Valid, State.Ptrs, State.Vals,
+                                           RMW->getPointerOperand(),
+                                           RMW->getValOperand()});
+          Pending.push_back(MemoryLocation::get(RMW));
+          RMW->eraseFromParent();
+          Changed = true;
+          continue;
+        }
+      }
+
+      if (shouldFlushShadowAtomicCacheBefore(I, Pending, AA)) {
+        IRBuilder<> Builder(I);
+        flushShadowAtomicCaches(Builder, Caches, Pending);
+      }
+    }
+
+    if (!Pending.empty()) {
+      IRBuilder<> Builder(BB.getTerminator());
+      flushShadowAtomicCaches(Builder, Caches, Pending);
+    }
+  }
+
+  return Changed;
 }
 
 // Collect memory operations (loads, stores) and calls for a given pointer value
@@ -578,16 +1417,40 @@ public:
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.addRequired<DominatorTreeWrapperPass>();
+    if (EnzymeEnableCudaRepeatedLoads || EnzymeEnableCudaShadowAtomicCache)
+      AU.addRequired<AAResultsWrapperPass>();
   }
 
   bool runOnFunction(Function &F) override {
     auto &DT = getAnalysis<DominatorTreeWrapperPass>().getDomTree();
     const DataLayout &DL = F.getParent()->getDataLayout();
-    return simplifyGVN(F, DT, DL);
+    bool Changed = false;
+    if (EnzymeEnableCudaRepeatedLoads || EnzymeEnableCudaShadowAtomicCache) {
+      auto &AA = getAnalysis<AAResultsWrapperPass>().getAAResults();
+      if (EnzymeEnableCudaRepeatedLoads)
+        Changed |= simplifyRepeatedGlobalLoadsImpl(F, AA);
+      Changed |= coalesceRepeatedCudaAtomicFAddsImpl(F, AA);
+      Changed |= cacheCudaShadowAtomicFAddsImpl(F, AA);
+    }
+    Changed |= demoteCudaCacheMallocsImpl(F);
+    Changed |= simplifyGVN(F, DT, DL);
+    return Changed;
   }
 };
 
 } // namespace
+
+bool simplifyRepeatedGlobalLoads(Function &F, AAResults &AA) {
+  return simplifyRepeatedGlobalLoadsImpl(F, AA);
+}
+
+bool coalesceRepeatedCudaAtomicFAdds(Function &F, AAResults &AA) {
+  return coalesceRepeatedCudaAtomicFAddsImpl(F, AA);
+}
+
+bool cacheCudaShadowAtomicFAdds(Function &F, AAResults &AA) {
+  return cacheCudaShadowAtomicFAddsImpl(F, AA);
+}
 
 FunctionPass *createSimpleGVNPass() { return new SimpleGVN(); }
 
@@ -604,7 +1467,15 @@ SimpleGVNNewPM::Result SimpleGVNNewPM::run(Function &F,
                                            FunctionAnalysisManager &FAM) {
   bool Changed = false;
   const DataLayout &DL = F.getParent()->getDataLayout();
-  Changed = simplifyGVN(F, FAM.getResult<DominatorTreeAnalysis>(F), DL);
+  if (EnzymeEnableCudaRepeatedLoads || EnzymeEnableCudaShadowAtomicCache) {
+    auto &AA = FAM.getResult<AAManager>(F);
+    if (EnzymeEnableCudaRepeatedLoads)
+      Changed |= simplifyRepeatedGlobalLoadsImpl(F, AA);
+    Changed |= coalesceRepeatedCudaAtomicFAddsImpl(F, AA);
+    Changed |= cacheCudaShadowAtomicFAddsImpl(F, AA);
+  }
+  Changed |= demoteCudaCacheMallocsImpl(F);
+  Changed |= simplifyGVN(F, FAM.getResult<DominatorTreeAnalysis>(F), DL);
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
 
