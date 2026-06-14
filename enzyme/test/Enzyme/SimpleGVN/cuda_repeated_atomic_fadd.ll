@@ -1,5 +1,5 @@
-; RUN: if [ %llvmver -lt 17 ]; then %opt < %s %newLoadEnzyme -opaque-pointers -enzyme-enable-cuda-shadow-atomic-cache=0 -passes="simple-gvn" -S | FileCheck %s --check-prefix=OFF; fi
-; RUN: if [ %llvmver -ge 17 ]; then %opt < %s %newLoadEnzyme -enzyme-enable-cuda-shadow-atomic-cache=0 -passes="simple-gvn" -S | FileCheck %s --check-prefix=OFF; fi
+; RUN: if [ %llvmver -lt 17 ]; then %opt < %s %newLoadEnzyme -opaque-pointers -enzyme-enable-cuda-repeated-loads=0 -enzyme-enable-cuda-shadow-atomic-cache=0 -passes="simple-gvn" -S | FileCheck %s --check-prefix=OFF; fi
+; RUN: if [ %llvmver -ge 17 ]; then %opt < %s %newLoadEnzyme -enzyme-enable-cuda-repeated-loads=0 -enzyme-enable-cuda-shadow-atomic-cache=0 -passes="simple-gvn" -S | FileCheck %s --check-prefix=OFF; fi
 ; RUN: if [ %llvmver -lt 17 ]; then %opt < %s %newLoadEnzyme -opaque-pointers -enzyme-enable-cuda-repeated-loads=1 -enzyme-enable-cuda-shadow-atomic-cache=0 -passes="simple-gvn" -S | FileCheck %s --check-prefix=ON; fi
 ; RUN: if [ %llvmver -ge 17 ]; then %opt < %s %newLoadEnzyme -enzyme-enable-cuda-repeated-loads=1 -enzyme-enable-cuda-shadow-atomic-cache=0 -passes="simple-gvn" -S | FileCheck %s --check-prefix=ON; fi
 ; RUN: if [ %llvmver -lt 17 ]; then %opt < %s %newLoadEnzyme -opaque-pointers -enzyme-enable-cuda-repeated-loads=0 -enzyme-enable-cuda-shadow-atomic-cache=1 -passes="simple-gvn" -S | FileCheck %s --check-prefix=CACHE; fi

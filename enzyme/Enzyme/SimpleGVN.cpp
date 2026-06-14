@@ -80,6 +80,7 @@
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/IR/Value.h"
 
@@ -111,7 +112,7 @@ llvm::cl::opt<bool> EnzymeEnableCudaRepeatedLoads(
              "folding"));
 
 llvm::cl::opt<bool> EnzymeEnableCudaShadowAtomicCache(
-    "enzyme-enable-cuda-shadow-atomic-cache", cl::init(true), cl::Hidden,
+    "enzyme-enable-cuda-shadow-atomic-cache", cl::init(false), cl::Hidden,
     cl::desc("Cache CUDA Enzyme shadow atomic fadds in per-thread local slots "
              "before flushing to global memory"));
 
@@ -535,6 +536,147 @@ static bool isCudaAtomicFAddShape(AtomicRMWInst *RMW) {
 static bool isEnzymeGeneratedReverseFunction(const Function &F) {
   StringRef Name = F.getName();
   return Name.starts_with("diffe_") || Name.contains("_cuda_reverse");
+}
+
+static bool isFreeCallForValue(CallBase *CB, Value *V) {
+  Function *Callee = CB->getCalledFunction();
+  return Callee && Callee->getName() == "free" && CB->arg_size() == 1 &&
+         CB->getArgOperand(0) == V;
+}
+
+static bool isAllowedCudaCacheUse(Value *V, User *U,
+                                  SmallPtrSetImpl<Value *> &Visited,
+                                  SmallVectorImpl<CallBase *> &Frees) {
+  auto *I = dyn_cast<Instruction>(U);
+  if (!I)
+    return false;
+
+  if (isa<GetElementPtrInst>(I) || isa<BitCastInst>(I) ||
+      isa<AddrSpaceCastInst>(I)) {
+    if (!Visited.insert(I).second)
+      return true;
+    for (User *DerivedUser : I->users())
+      if (!isAllowedCudaCacheUse(I, DerivedUser, Visited, Frees))
+        return false;
+    return true;
+  }
+
+  if (auto *PN = dyn_cast<PHINode>(I)) {
+    for (Value *Incoming : PN->incoming_values())
+      if (Incoming != V && !isa<UndefValue>(Incoming) &&
+          !isa<ConstantPointerNull>(Incoming))
+        return false;
+    if (!Visited.insert(I).second)
+      return true;
+    for (User *DerivedUser : I->users())
+      if (!isAllowedCudaCacheUse(I, DerivedUser, Visited, Frees))
+        return false;
+    return true;
+  }
+
+  if (auto *SI = dyn_cast<SelectInst>(I)) {
+    Value *TrueValue = SI->getTrueValue();
+    Value *FalseValue = SI->getFalseValue();
+    auto IsAllowedSelectValue = [&](Value *Operand) {
+      return Operand == V || isa<UndefValue>(Operand) ||
+             isa<ConstantPointerNull>(Operand);
+    };
+    if (!IsAllowedSelectValue(TrueValue) || !IsAllowedSelectValue(FalseValue))
+      return false;
+    if (!Visited.insert(I).second)
+      return true;
+    for (User *DerivedUser : I->users())
+      if (!isAllowedCudaCacheUse(I, DerivedUser, Visited, Frees))
+        return false;
+    return true;
+  }
+
+  if (auto *LI = dyn_cast<LoadInst>(I))
+    return LI->getPointerOperand() == V;
+
+  if (auto *Store = dyn_cast<StoreInst>(I))
+    return Store->getPointerOperand() == V && Store->getValueOperand() != V;
+
+  if (auto *CB = dyn_cast<CallBase>(I)) {
+    if (isFreeCallForValue(CB, V)) {
+      Frees.push_back(CB);
+      return true;
+    }
+
+    if (auto *II = dyn_cast<IntrinsicInst>(I)) {
+      switch (II->getIntrinsicID()) {
+      case Intrinsic::memset:
+      case Intrinsic::memcpy:
+      case Intrinsic::memmove:
+      case Intrinsic::lifetime_start:
+      case Intrinsic::lifetime_end:
+        return true;
+      default:
+        break;
+      }
+    }
+  }
+
+  return false;
+}
+
+static bool canDemoteCudaCacheMalloc(CallInst *CI,
+                                     SmallVectorImpl<CallBase *> &Frees) {
+  Function *Callee = CI->getCalledFunction();
+  if (!Callee || Callee->getName() != "malloc")
+    return false;
+  if (!CI->getMetadata("enzyme_cache_alloc") || CI->arg_size() != 1)
+    return false;
+  auto *Size = dyn_cast<ConstantInt>(CI->getArgOperand(0));
+  if (!Size || Size->isZero())
+    return false;
+
+  SmallPtrSet<Value *, 16> Visited;
+  Visited.insert(CI);
+  for (User *U : CI->users())
+    if (!isAllowedCudaCacheUse(CI, U, Visited, Frees))
+      return false;
+  return true;
+}
+
+static bool demoteCudaCacheMallocsImpl(Function &F) {
+  if (!isNVPTXModule(F.getParent()) || !isEnzymeGeneratedReverseFunction(F))
+    return false;
+
+  SmallVector<std::pair<CallInst *, SmallVector<CallBase *, 2>>, 4> Worklist;
+  for (BasicBlock &BB : F) {
+    for (Instruction &I : BB) {
+      auto *CI = dyn_cast<CallInst>(&I);
+      if (!CI)
+        continue;
+      SmallVector<CallBase *, 2> Frees;
+      if (canDemoteCudaCacheMalloc(CI, Frees))
+        Worklist.push_back({CI, std::move(Frees)});
+    }
+  }
+
+  bool Changed = false;
+  IRBuilder<> EntryBuilder(&*F.getEntryBlock().getFirstInsertionPt());
+  Type *Int8Ty = Type::getInt8Ty(F.getContext());
+  for (auto &Item : Worklist) {
+    CallInst *Malloc = Item.first;
+    if (!Malloc->getParent())
+      continue;
+    auto *Size = cast<ConstantInt>(Malloc->getArgOperand(0));
+    AllocaInst *StackCache =
+        EntryBuilder.CreateAlloca(Int8Ty, Size, Malloc->getName() + ".stack");
+    StackCache->setAlignment(Malloc->getRetAlign().valueOrOne());
+    StackCache->setMetadata("enzyme_cache_alloc",
+                            Malloc->getMetadata("enzyme_cache_alloc"));
+    Malloc->replaceAllUsesWith(StackCache);
+    for (CallBase *Free : Item.second)
+      if (Free->getParent())
+        Free->eraseFromParent();
+    Malloc->eraseFromParent();
+    Changed = true;
+  }
+
+  return Changed;
 }
 
 static bool isCudaAtomicFAddCacheCandidate(AtomicRMWInst *RMW) {
@@ -1290,6 +1432,7 @@ public:
       Changed |= coalesceRepeatedCudaAtomicFAddsImpl(F, AA);
       Changed |= cacheCudaShadowAtomicFAddsImpl(F, AA);
     }
+    Changed |= demoteCudaCacheMallocsImpl(F);
     Changed |= simplifyGVN(F, DT, DL);
     return Changed;
   }
@@ -1331,6 +1474,7 @@ SimpleGVNNewPM::Result SimpleGVNNewPM::run(Function &F,
     Changed |= coalesceRepeatedCudaAtomicFAddsImpl(F, AA);
     Changed |= cacheCudaShadowAtomicFAddsImpl(F, AA);
   }
+  Changed |= demoteCudaCacheMallocsImpl(F);
   Changed |= simplifyGVN(F, FAM.getResult<DominatorTreeAnalysis>(F), DL);
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
