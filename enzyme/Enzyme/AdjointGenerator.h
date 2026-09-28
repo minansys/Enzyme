@@ -4392,8 +4392,16 @@ public:
   }
 
 // first one allows adding attributes to blas functions declared in the second
+#ifndef _MSC_VER
 #include "BlasAttributor.inc"
 #include "BlasDerivatives.inc"
+#else
+  template <typename BlasInfoT>
+  bool handleBLAS(llvm::CallInst &, llvm::Function *, const BlasInfoT &,
+                  const std::vector<bool> &) {
+    return false;
+  }
+#endif
 
   void visitOMPCall(llvm::CallInst &call) {
     using namespace llvm;
@@ -4797,7 +4805,7 @@ public:
 
         newcalled = gutils->Logic.CreatePrimalAndGradient(
             RequestContext(&call, &Builder2),
-            (ReverseCacheKey){
+            ReverseCacheKey{
                 .todiff = cast<Function>(called),
                 .retType = subretType,
                 .constant_args = argsInverted,
@@ -6251,7 +6259,7 @@ public:
 
       newcalled = gutils->Logic.CreatePrimalAndGradient(
           RequestContext(&call, &Builder2),
-          (ReverseCacheKey){
+          ReverseCacheKey{
               .todiff = cast<Function>(called),
               .retType = subretType,
               .constant_args = argsInverted,

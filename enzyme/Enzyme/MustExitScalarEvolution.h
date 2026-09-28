@@ -30,10 +30,14 @@
 #include <llvm/Config/llvm-config.h>
 
 #if LLVM_VERSION_MAJOR >= 16
+#if !defined(_MSC_VER)
 #define private public
+#endif
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
+#if !defined(_MSC_VER)
 #undef private
+#endif
 #else
 #include "SCEV/ScalarEvolution.h"
 #include "SCEV/ScalarEvolutionExpander.h"
@@ -52,6 +56,9 @@ public:
   ScalarEvolution::ExitLimit computeExitLimit(const llvm::Loop *L,
                                               llvm::BasicBlock *ExitingBlock,
                                               bool AllowPredicates);
+
+#if !defined(_MSC_VER) || LLVM_VERSION_MAJOR < 16
+  bool loopIsFiniteByAssumption(const llvm::Loop *L);
 
   ScalarEvolution::ExitLimit computeExitLimitFromCond(const llvm::Loop *L,
                                                       llvm::Value *ExitCond,
@@ -73,8 +80,6 @@ public:
                            bool ExitIfTrue, bool ControlsExit,
                            bool AllowPredicates = false);
 
-  bool loopIsFiniteByAssumption(const llvm::Loop *L);
-
   ScalarEvolution::ExitLimit howManyLessThans(const llvm::SCEV *LHS,
                                               const llvm::SCEV *RHS,
                                               const llvm::Loop *L,
@@ -84,6 +89,7 @@ public:
   ScalarEvolution::ExitLimit computeExitLimitFromSingleExitSwitch(
       const llvm::Loop *L, llvm::SwitchInst *Switch,
       llvm::BasicBlock *ExitingBB, bool IsSubExpr);
+#endif
 };
 
 #endif
