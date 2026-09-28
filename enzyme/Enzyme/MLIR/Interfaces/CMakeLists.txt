@@ -5,22 +5,27 @@ mlir_tablegen(AutoDiffTypeInterface.h.inc -gen-type-interface-decls)
 mlir_tablegen(AutoDiffTypeInterface.cpp.inc -gen-type-interface-defs)
 add_public_tablegen_target(MLIRAutoDiffTypeInterfaceIncGen)
 
-add_mlir_library(MLIREnzymeAutoDiffInterface
+add_mlir_library(
+  MLIREnzymeAutoDiffInterface
   AutoDiffOpInterface.cpp
   AutoDiffTypeInterface.cpp
   CloneFunction.cpp
   GradientUtils.cpp
   GradientUtilsReverse.cpp
-  ProbProgUtils.cpp
+  HMCUtils.cpp
+  ImpulseUtils.cpp
+  TransformUtils.cpp
   EnzymeLogic.cpp
   EnzymeLogicReverse.cpp
   Utils.cpp
-
   DEPENDS
   MLIRAutoDiffOpInterfaceIncGen
   MLIRAutoDiffTypeInterfaceIncGen
-
-  LINK_LIBS PUBLIC
+  MLIREnzymeEnumsIncGen
+  MLIRImpulseOpsIncGen
+  MLIRImpulseEnumsIncGen
+  LINK_LIBS
+  PUBLIC
   MLIRIR
   MLIREnzymeAnalysis
-)
+  MLIRImpulse)

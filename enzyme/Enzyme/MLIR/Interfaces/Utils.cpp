@@ -10,12 +10,15 @@
 #include "Interfaces/Utils.h"
 #include "Dialect/Ops.h"
 #include "Interfaces/AutoDiffTypeInterface.h"
+#include "Interfaces/GradientUtils.h"
+#include "Passes/Utils.h"
 #include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
+#include "mlir/Interfaces/ViewLikeInterface.h"
 #include <optional>
 
 using namespace mlir;
@@ -104,22 +107,41 @@ static bool isCaptured(Value v, Operation *potentialUser = nullptr,
   return false;
 }
 
-static Value getBase(Value v) {
-  while (true) {
-    if (auto s = v.getDefiningOp<LLVM::GEPOp>()) {
-      v = s.getBase();
+Value inactiveStoredValueShadow(Operation *orig, MGradientUtils &gutils,
+                                Value stored, OpBuilder &builder) {
+  auto iface = cast<AutoDiffTypeInterface>(stored.getType());
+  // An immutable value carries no aliasing structure into the shadow; its
+  // tangent is simply zero.
+  if (!iface.isMutable())
+    return cast<AutoDiffTypeInterface>(gutils.getShadowType(stored.getType()))
+        .createNullValue(builder, orig->getLoc());
+  orig->emitWarning()
+      << "storing an inactive value into differentiated memory; the shadow "
+         "holds the primal value, which runtime activity would be needed to "
+         "check";
+  Value primal = gutils.getNewFromOriginal(stored);
+  if (gutils.width == 1)
+    return primal;
+  SmallVector<Value> batched(gutils.width, primal);
+  return getConcatValue(builder, orig->getLoc(), batched);
+}
+
+Value getBaseObject(Value v) {
+  while (Operation *def = v.getDefiningOp()) {
+    if (auto view = dyn_cast<ViewLikeOpInterface>(def)) {
+      v = view.getViewSource();
       continue;
     }
-    if (auto s = v.getDefiningOp<LLVM::BitcastOp>()) {
-      v = s.getArg();
+    if (auto gep = dyn_cast<LLVM::GEPOp>(def)) {
+      v = gep.getBase();
       continue;
     }
-    if (auto s = v.getDefiningOp<LLVM::AddrSpaceCastOp>()) {
-      v = s.getArg();
+    if (auto bc = dyn_cast<LLVM::BitcastOp>(def)) {
+      v = bc.getArg();
       continue;
     }
-    if (auto s = v.getDefiningOp<memref::CastOp>()) {
-      v = s.getSource();
+    if (auto asc = dyn_cast<LLVM::AddrSpaceCastOp>(def)) {
+      v = asc.getArg();
       continue;
     }
     break;
@@ -134,8 +156,8 @@ static bool isStackAlloca(Value v) {
 }
 
 bool mayAlias(Value v1, Value v2) {
-  v1 = getBase(v1);
-  v2 = getBase(v2);
+  v1 = getBaseObject(v1);
+  v2 = getBaseObject(v2);
   if (v1 == v2)
     return true;
 
@@ -169,14 +191,33 @@ bool mayAlias(Value v1, Value v2) {
   if ((isAlloca[0] || isGlobal[0]) && (isAlloca[1] || isGlobal[1]))
     return false;
 
-  bool isArg[2];
-  isArg[0] = isa<BlockArgument>(v1) &&
-             isa<FunctionOpInterface>(
-                 cast<BlockArgument>(v1).getOwner()->getParentOp());
+  BlockArgument barg1 = dyn_cast<BlockArgument>(v1);
+  BlockArgument barg2 = dyn_cast<BlockArgument>(v2);
 
-  isArg[1] = isa<BlockArgument>(v1) &&
-             isa<FunctionOpInterface>(
-                 cast<BlockArgument>(v1).getOwner()->getParentOp());
+  FunctionOpInterface f1 =
+      barg1 ? dyn_cast<FunctionOpInterface>(barg1.getOwner()->getParentOp())
+            : nullptr;
+  FunctionOpInterface f2 =
+      barg2 ? dyn_cast<FunctionOpInterface>(barg2.getOwner()->getParentOp())
+            : nullptr;
+
+  bool isNoAlias1 =
+      f1 ? !!f1.getArgAttr(barg1.getArgNumber(),
+                           LLVM::LLVMDialect::getNoAliasAttrName())
+         : false;
+  bool isNoAlias2 =
+      f2 ? !!f2.getArgAttr(barg2.getArgNumber(),
+                           LLVM::LLVMDialect::getNoAliasAttrName())
+         : false;
+
+  if (!isCaptured(v1) && isNoAlias1)
+    return false;
+  if (!isCaptured(v2) && isNoAlias2)
+    return false;
+
+  bool isArg[2];
+  isArg[0] = f1;
+  isArg[1] = f2;
 
   // Stack allocations cannot have been passed as an argument.
   if ((isAlloca[0] && isArg[1]) || (isAlloca[1] && isArg[0]))
@@ -189,6 +230,13 @@ bool mayAlias(Value v1, Value v2) {
   if (isAlloca[1] && !isCaptured(v2))
     return false;
 
+  return true;
+}
+
+bool mayAlias(MemoryEffects::EffectInstance a, Value v2) {
+  if (Value v = a.getValue()) {
+    return mayAlias(v, v2);
+  }
   return true;
 }
 
@@ -215,7 +263,7 @@ bool isReadOnly(Operation *op) {
     // Check to see if this op either has no effects, or only reads from memory.
     SmallVector<MemoryEffects::EffectInstance, 1> effects;
     effectInterface.getEffects(effects);
-    if (!llvm::all_of(effects, [op](const MemoryEffects::EffectInstance &it) {
+    if (!llvm::all_of(effects, [](const MemoryEffects::EffectInstance &it) {
           return isa<MemoryEffects::Read>(it.getEffect());
         })) {
       return false;
@@ -235,6 +283,37 @@ bool isReadOnly(Operation *op) {
   }
 
   return true;
+}
+
+bool isReadNone(Operation *op) {
+  bool hasRecursiveEffects = op->hasTrait<OpTrait::HasRecursiveMemoryEffects>();
+  if (hasRecursiveEffects) {
+    for (Region &region : op->getRegions()) {
+      for (auto &block : region) {
+        for (auto &nestedOp : block)
+          if (!isReadNone(&nestedOp))
+            return false;
+      }
+    }
+    return true;
+  }
+
+  // If the op has memory effects, try to characterize them to see if the op
+  // is trivially dead here.
+  if (auto effectInterface = dyn_cast<MemoryEffectOpInterface>(op)) {
+    // Check to see if this op either has no effects, or only allocates/reads
+    // memory.
+    SmallVector<MemoryEffects::EffectInstance, 1> effects;
+    effectInterface.getEffects(effects);
+    if (llvm::any_of(effects, [](const MemoryEffects::EffectInstance &it) {
+          return isa<MemoryEffects::Read>(it.getEffect()) ||
+                 isa<MemoryEffects::Write>(it.getEffect());
+        })) {
+      return false;
+    }
+    return true;
+  }
+  return false;
 }
 
 bool collectOpEffects(Operation *rootOp,

@@ -39,7 +39,7 @@ struct BatchDiffCacheKey {
       return false;
 
     // Sizes are equal, so compare elements
-    for (auto i = 0; i < inputs.size(); ++i) {
+    for (size_t i = 0; i < inputs.size(); ++i) {
       auto lhs_ptr = inputs[i].getAsOpaquePointer();
       auto rhs_ptr = other.inputs[i].getAsOpaquePointer();
       if (lhs_ptr < rhs_ptr)
@@ -64,43 +64,15 @@ struct BatchDiffCacheKey {
 template <typename SourceOp>
 BatchDiffCacheKey createDiffCacheKey(SourceOp uop, FunctionOpInterface fn) {
   // extract in_activity, ret_activity, in_args
-  SmallVector<Activity> inActivity;
-  SmallVector<Activity> retActivity;
-  SmallVector<Value> in_args;
-
-  auto in_idx = 0;
-
-  for (auto [idx, act] : llvm::enumerate(uop.getActivity())) {
-    auto iattr = cast<ActivityAttr>(act);
-    auto val = iattr.getValue();
-    inActivity.push_back(val);
-
-    in_args.push_back(uop.getInputs()[in_idx]);
-    ++in_idx;
-
-    if (val == Activity::enzyme_dup || val == Activity::enzyme_dupnoneed) {
-      ++in_idx;
-    }
-  }
-
-  for (auto [idx, ract] : llvm::enumerate(uop.getRetActivity())) {
-    auto iattr = cast<ActivityAttr>(ract);
-    auto val = iattr.getValue();
-    retActivity.push_back(val);
-  }
-
+  SmallVector<Activity> inActivity(
+      uop.getActivity().template getAsValueRange<ActivityAttr>());
+  SmallVector<Activity> retActivity(
+      uop.getRetActivity().template getAsValueRange<ActivityAttr>());
+  SmallVector<Value> in_args = uop.getPrimalInputs();
   batchutils::BatchDiffCacheKey key{fn, in_args, inActivity, retActivity,
                                     uop->getBlock()};
   return key;
 }
-
-Type getConcatType(Value val, int64_t width);
-
-Value getConcatValue(OpBuilder &builder, Location &loc,
-                     SmallVector<Value> &argList);
-
-Value getExtractValue(OpBuilder &builder, Location &loc, Type &argTy,
-                      Value &val, int64_t index);
 
 template <typename SourceOp,
           std::enable_if_t<
@@ -120,7 +92,7 @@ SmallVector<MemoryEffects::EffectInstance> findCallerEffects(
     }
 
     // Find primal argument corresponding to effect value
-    auto primalArgPos = 0;
+    size_t primalArgPos = 0;
     bool foundPrimal = false;
     if (auto effBA = dyn_cast<BlockArgument>(effVal)) {
       if (llvm::is_contained(innerFnOp.getArguments(), effBA)) {
@@ -189,8 +161,8 @@ template <typename SourceOp,
           std::enable_if_t<
               llvm::is_one_of<SourceOp, ForwardDiffOp, AutoDiffOp>::value,
               bool> = true>
-llvm::SmallVector<SourceOp> pruneGradDefs(BatchDiffCacheKey &key,
-                                          SmallVector<SourceOp> &allDiffs) {
+llvm::SmallVector<SourceOp, 2> pruneGradDefs(BatchDiffCacheKey &key,
+                                             SmallVector<SourceOp> &allDiffs) {
   SmallVector<SourceOp, 2> prunedSources;
 
   // We first prune and check that all derivative arguments are defined before
@@ -250,7 +222,7 @@ llvm::SmallVector<SourceOp> pruneMemoryEffects(
     return prunedSources;
   }
 
-  SmallVector<SourceOp, 2> legalMerge;
+  SmallVector<SourceOp> legalMerge;
   auto lastOp = prunedSources[0];
 
   SmallVector<MemoryEffects::EffectInstance, 4> betweenEffects;

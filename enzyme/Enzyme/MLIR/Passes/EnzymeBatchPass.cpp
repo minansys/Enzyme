@@ -51,50 +51,124 @@ mlir::TensorType applyBatchSizes(mlir::Type Ty,
   return T2;
 }
 
-LogicalResult handleCallOp(
-    func::CallOp callOp, OpBuilder &builder, IRMapping &mapper,
-    llvm::ArrayRef<int64_t> batchSizes,
+LogicalResult handleCallLikeOp(
+    Operation *callLike, StringRef symbolAttrName, OpBuilder &builder,
+    IRMapping &mapper, llvm::ArrayRef<int64_t> batchSizes,
     std::map<BatchCacheKey, FunctionOpInterface> &batchedFunctionCache) {
-  // Get the called function
-  auto moduleOp = callOp->getParentOfType<ModuleOp>();
-  auto calledFunc =
-      dyn_cast<FunctionOpInterface>(moduleOp.lookupSymbol(callOp.getCallee()));
-  if (!calledFunc)
+  auto calledFunc = SymbolTable::lookupNearestSymbolFrom<FunctionOpInterface>(
+      callLike, callLike->getAttrOfType<SymbolRefAttr>(symbolAttrName));
+
+  if (!calledFunc) {
     return failure();
+  }
 
-  // Create cache key for this function and batch size combination
-  BatchCacheKey key{calledFunc,
-                    SmallVector<int64_t>(batchSizes.begin(), batchSizes.end())};
+  std::string fnName = "batched_" + calledFunc.getName().str();
+  FunctionOpInterface batchedFunc = batchCloneFunction(
+      builder, calledFunc, fnName, batchSizes, batchedFunctionCache);
 
-  // Look up or create batched version of the called function
-  FunctionOpInterface batchedFunc;
-  auto it = batchedFunctionCache.find(key);
-  if (it != batchedFunctionCache.end()) {
-    batchedFunc = it->second;
-  } else {
-    std::string fnName = "batched_" + calledFunc.getName().str();
-    batchedFunc = batchCloneFunction(builder, calledFunc, fnName, batchSizes,
-                                     batchedFunctionCache);
-    if (!batchedFunc)
-      return failure();
-    batchedFunctionCache[key] = batchedFunc;
+  if (!batchedFunc) {
+    return failure();
   }
 
   // Create new call operation to the batched function
   SmallVector<Value> newOperands;
-  for (auto operand : callOp->getOperands())
+  for (auto operand : callLike->getOperands())
     newOperands.push_back(mapper.lookup(operand));
 
-  auto newCall =
-      builder.create<func::CallOp>(callOp.getLoc(), batchedFunc.getName(),
-                                   batchedFunc.getResultTypes(), newOperands);
+  SmallVector<Type> resultTypes =
+      llvm::map_to_vector(callLike->getResultTypes(), [&](Type Ty) -> Type {
+        return applyBatchSizes(Ty, batchSizes);
+      });
 
-  // Map the results
-  for (auto [oldResult, newResult] :
-       llvm::zip(callOp.getResults(), newCall.getResults()))
-    mapper.map(oldResult, newResult);
+  Operation *newCallLike =
+      builder.create(callLike->getLoc(), callLike->getName().getIdentifier(),
+                     newOperands, resultTypes, callLike->getAttrs());
+
+  newCallLike->setAttr(symbolAttrName, SymbolRefAttr::get(batchedFunc));
+
+  for (auto [oldRes, newRes] :
+       llvm::zip_equal(callLike->getResults(), newCallLike->getResults())) {
+    mapper.map(oldRes, newRes);
+  }
 
   return success();
+}
+
+LogicalResult handleCallOp(
+    func::CallOp callOp, OpBuilder &builder, IRMapping &mapper,
+    llvm::ArrayRef<int64_t> batchSizes,
+    std::map<BatchCacheKey, FunctionOpInterface> &batchedFunctionCache) {
+  return handleCallLikeOp(callOp, "callee", builder, mapper, batchSizes,
+                          batchedFunctionCache);
+}
+
+void batchCloneBlock(
+    OpBuilder &builder, Block *blk, IRMapping &mapper,
+    llvm::ArrayRef<int64_t> batchSizes,
+    std::map<BatchCacheKey, FunctionOpInterface> &batchedFunctionCache,
+    bool withoutTerminator) {
+  for (auto &src : *blk) {
+    if (auto callOp = dyn_cast<func::CallOp>(&src)) {
+      if (succeeded(handleCallOp(callOp, builder, mapper, batchSizes,
+                                 batchedFunctionCache)))
+        continue;
+    }
+
+    if (isa<enzyme::ForwardDiffOp, enzyme::AutoDiffOp>(&src)) {
+      if (succeeded(handleCallLikeOp(&src, "fn", builder, mapper, batchSizes,
+                                     batchedFunctionCache)))
+        continue;
+    }
+
+    if (auto ifaceOp = dyn_cast<BatchOpInterface>(&src)) {
+      auto res = ifaceOp.createBatch(builder, mapper, batchSizes);
+      if (res.succeeded())
+        continue;
+    }
+
+    SmallVector<Value, 8> operands;
+    SmallVector<Block *, 2> successors;
+
+    // Remap the operands.
+    operands.reserve(src.getNumOperands());
+    for (auto opValue : src.getOperands())
+      operands.push_back(mapper.lookup(opValue));
+
+    if (withoutTerminator && src.hasTrait<OpTrait::IsTerminator>()) {
+      // map the operands and the results
+      for (unsigned i = 0, e = src.getNumResults(); i != e; ++i)
+        mapper.map(src.getResult(i), operands[i]);
+      continue;
+    }
+
+    // Remap the successors.
+    successors.reserve(src.getNumSuccessors());
+    for (Block *successor : src.getSuccessors())
+      successors.push_back(mapper.lookup(successor));
+
+    SmallVector<Type> resultTypes(src.getResultTypes().begin(),
+                                  src.getResultTypes().end());
+    for (auto &Ty : resultTypes) {
+      Ty = applyBatchSizes(Ty, batchSizes);
+    }
+
+    Operation *newOp = Operation::create(
+        src.getLoc(), src.getName(), resultTypes, operands, src.getAttrs(),
+        mlir::PropertyRef(), successors, src.getNumRegions());
+
+    // Clone the regions.
+    for (auto &&[oldReg, newReg] :
+         llvm::zip(src.getRegions(), newOp->getRegions())) {
+      batchCloneRegion(builder, &oldReg, &newReg, mapper, batchSizes,
+                       batchedFunctionCache);
+    }
+
+    // Remember the mapping of any results.
+    for (unsigned i = 0, e = src.getNumResults(); i != e; ++i)
+      mapper.map(src.getResult(i), newOp->getResult(i));
+
+    builder.insert(newOp);
+  }
 }
 
 void batchCloneRegion(
@@ -118,55 +192,8 @@ void batchCloneRegion(
   for (auto &&[blk, newBlk] : llvm::zip(*src, *dest)) {
     IRRewriter::InsertionGuard insertGuard(builder);
     builder.setInsertionPointToEnd(&newBlk);
-    for (auto &src : blk) {
-      if (auto callOp = dyn_cast<func::CallOp>(&src)) {
-        if (succeeded(handleCallOp(callOp, builder, mapper, batchSizes,
-                                   batchedFunctionCache)))
-          continue;
-      }
-
-      if (auto ifaceOp = dyn_cast<BatchOpInterface>(&src)) {
-        auto res = ifaceOp.createBatch(builder, mapper, batchSizes);
-        if (res.succeeded())
-          continue;
-      }
-
-      SmallVector<Value, 8> operands;
-      SmallVector<Block *, 2> successors;
-
-      // Remap the operands.
-      operands.reserve(src.getNumOperands());
-      for (auto opValue : src.getOperands())
-        operands.push_back(mapper.lookup(opValue));
-
-      // Remap the successors.
-      successors.reserve(src.getNumSuccessors());
-      for (Block *successor : src.getSuccessors())
-        successors.push_back(mapper.lookup(successor));
-
-      SmallVector<Type> resultTypes(src.getResultTypes().begin(),
-                                    src.getResultTypes().end());
-      for (auto &Ty : resultTypes) {
-        Ty = applyBatchSizes(Ty, batchSizes);
-      }
-
-      Operation *newOp = Operation::create(
-          src.getLoc(), src.getName(), resultTypes, operands, src.getAttrs(),
-          OpaqueProperties(nullptr), successors, src.getNumRegions());
-
-      // Clone the regions.
-      for (auto &&[oldReg, newReg] :
-           llvm::zip(src.getRegions(), newOp->getRegions())) {
-        batchCloneRegion(builder, &oldReg, &newReg, mapper, batchSizes,
-                         batchedFunctionCache);
-      }
-
-      // Remember the mapping of any results.
-      for (unsigned i = 0, e = src.getNumResults(); i != e; ++i)
-        mapper.map(src.getResult(i), newOp->getResult(i));
-
-      builder.insert(newOp);
-    }
+    batchCloneBlock(builder, &blk, mapper, batchSizes, batchedFunctionCache,
+                    false);
   }
 }
 
@@ -175,6 +202,15 @@ FunctionOpInterface batchCloneFunction(
     llvm::ArrayRef<int64_t> batchSizes,
     std::map<BatchCacheKey, FunctionOpInterface> &batchedFunctionCache) {
   assert(!F.getFunctionBody().empty());
+
+  // Add the function to the cache BEFORE processing its body to support
+  // recursion.
+  BatchCacheKey key{F,
+                    SmallVector<int64_t>(batchSizes.begin(), batchSizes.end())};
+
+  auto it = batchedFunctionCache.find(key);
+  if (it != batchedFunctionCache.end())
+    return it->second;
 
   auto FTy = cast<FunctionType>(F.getFunctionType());
 
@@ -203,10 +239,6 @@ FunctionOpInterface batchCloneFunction(
   table.insert(NewF);
   SymbolTable::setSymbolVisibility(NewF, SymbolTable::Visibility::Private);
 
-  // Add the function to the cache BEFORE processing its body to support
-  // recursion.
-  BatchCacheKey key{F,
-                    SmallVector<int64_t>(batchSizes.begin(), batchSizes.end())};
   batchedFunctionCache[key] = NewF;
 
   auto &origReg = F.getFunctionBody();
@@ -259,14 +291,7 @@ struct BatchPass : public enzyme::impl::BatchPassBase<BatchPass> {
                              FunctionOpInterface op) {
     {
       SmallVector<Operation *> toLower;
-      op->walk([&](enzyme::BatchOp dop) {
-        auto *symbolOp =
-            symbolTable.lookupNearestSymbolFrom(dop, dop.getFnAttr());
-        auto callableOp = cast<FunctionOpInterface>(symbolOp);
-
-        lowerEnzymeBatchCalls(symbolTable, callableOp);
-        toLower.push_back(dop);
-      });
+      op->walk([&](enzyme::BatchOp dop) { toLower.push_back(dop); });
 
       OpBuilder builder(op);
 

@@ -18,13 +18,22 @@ struct BatchCacheKey {
   FunctionOpInterface function;
   SmallVector<int64_t> batchSizes;
 
-  // for use in std::map:
   bool operator<(const BatchCacheKey &other) const {
-    if (const_cast<FunctionOpInterface &>(function).getName() !=
-        const_cast<FunctionOpInterface &>(other.function).getName())
-      return const_cast<FunctionOpInterface &>(function).getName() <
+    Operation *thisSymbolTable = SymbolTable::getNearestSymbolTable(function),
+              *otherSymbolTable =
+                  SymbolTable::getNearestSymbolTable(other.function);
+    if (thisSymbolTable != otherSymbolTable)
+      return std::less<Operation *>()(thisSymbolTable, otherSymbolTable);
+
+    auto thisName = const_cast<FunctionOpInterface &>(function).getName(),
+         otherName =
              const_cast<FunctionOpInterface &>(other.function).getName();
-    return batchSizes < other.batchSizes;
+    if (thisName != otherName)
+      return thisName < otherName;
+
+    return std::lexicographical_compare(batchSizes.begin(), batchSizes.end(),
+                                        other.batchSizes.begin(),
+                                        other.batchSizes.end());
   }
 };
 
@@ -35,6 +44,12 @@ FunctionOpInterface batchCloneFunction(
     OpBuilder &builder, FunctionOpInterface F, Twine name,
     llvm::ArrayRef<int64_t> batchSizes,
     std::map<BatchCacheKey, FunctionOpInterface> &batchedFunctionCache);
+
+void batchCloneBlock(
+    OpBuilder &builder, Block *blk, IRMapping &mapper,
+    llvm::ArrayRef<int64_t> batchSizes,
+    std::map<BatchCacheKey, FunctionOpInterface> &batchedFunctionCache,
+    bool withoutTerminator);
 
 void batchCloneRegion(
     OpBuilder &builder, Region *src, Region *dest, IRMapping &mapper,
@@ -83,9 +98,8 @@ LogicalResult batchOperation(
   {
     IRRewriter::InsertionGuard insertGuard(builder);
     builder.setInsertionPoint(CI);
-    auto dCI =
-        builder.create<func::CallOp>(CI.getLoc(), newFunc.getName(),
-                                     newFunc.getResultTypes(), CI.getInputs());
+    auto dCI = func::CallOp::create(builder, CI.getLoc(), newFunc.getName(),
+                                    newFunc.getResultTypes(), CI.getInputs());
     CI.replaceAllUsesWith(dCI);
     CI->erase();
   }
@@ -109,6 +123,33 @@ LogicalResult batchOperation(
         CI, newFunc.getName(), newFunc.getResultTypes(), CI.getInputs());
   }
   return success();
+}
+
+// instead of inserting a call op, we will inline each operation directly
+// into the caller
+inline void batchOperationInline(PatternRewriter &rewriter,
+                                 enzyme::BatchOp batchOp,
+                                 FunctionOpInterface func) {
+  auto &origRegion = func.getFunctionBody();
+  auto &origBlock = origRegion.front();
+
+  IRMapping mapper;
+  for (int i = 0; i < batchOp->getNumOperands(); i++) {
+    mapper.map(origBlock.getArguments()[i], batchOp->getOperand(i));
+  }
+
+  rewriter.setInsertionPoint(batchOp);
+  std::map<BatchCacheKey, FunctionOpInterface> batchedFunctionCache;
+  batchCloneBlock(rewriter, &origBlock, mapper, batchOp.getBatchShape(),
+                  batchedFunctionCache, true);
+
+  auto origTerm = origBlock.getTerminator();
+  for (auto [i, operand] : llvm::enumerate(origTerm->getOperands())) {
+    auto mappedOperand = mapper.lookup(operand);
+    rewriter.replaceAllUsesWith(batchOp->getResult(i), mappedOperand);
+  }
+  rewriter.eraseOp(batchOp);
+  rewriter.eraseOp(func);
 }
 
 } // namespace batchutils

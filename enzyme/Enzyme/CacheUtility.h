@@ -377,10 +377,12 @@ public:
   /// chose how and where to free it. It is by default not implemented, falling
   /// back to an error. Subclasses who want to free memory should implement this
   /// function.
-  virtual llvm::CallInst *
-  freeCache(llvm::BasicBlock *forwardPreheader, const SubLimitType &antimap,
-            int i, llvm::AllocaInst *alloc, llvm::ConstantInt *byteSizeOfType,
-            llvm::Value *storeInto, llvm::MDNode *InvariantMD) {
+  virtual llvm::CallInst *freeCache(llvm::BasicBlock *forwardPreheader,
+                                    const SubLimitType &antimap, int i,
+                                    llvm::AllocaInst *alloc, llvm::Type *myType,
+                                    llvm::ConstantInt *byteSizeOfType,
+                                    llvm::Value *storeInto,
+                                    llvm::MDNode *InvariantMD) {
     assert(0 && "freeing cache not handled in this scenario");
     llvm_unreachable("freeing cache not handled in this scenario");
   }
@@ -431,8 +433,8 @@ InsertNewCanonicalIV(llvm::Loop *L, llvm::Type *Ty,
 // Attempt to rewrite all phinode's in the loop in terms of the
 // induction variable
 void RemoveRedundantIVs(
-    llvm::BasicBlock *Header, llvm::PHINode *CanonicalIV,
-    llvm::Instruction *Increment, MustExitScalarEvolution &SE,
+    llvm::Loop *L, llvm::PHINode *CanonicalIV, llvm::Instruction *Increment,
+    MustExitScalarEvolution &SE,
     llvm::function_ref<void(llvm::Instruction *, llvm::Value *)> replacer,
     llvm::function_ref<void(llvm::Instruction *)> eraser);
 #endif

@@ -11,10 +11,13 @@
 //
 //===----------------------------------------------------------------------===//
 #include "Dialect/Ops.h"
+#include "Interfaces/AutoDiffOpInterface.h"
 #include "Passes/Passes.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/RegionUtils.h"
@@ -34,27 +37,18 @@ namespace {
 constexpr static llvm::StringLiteral kFnAttrsName = "fn_attrs";
 
 static StringRef getFunctionTypeAttrName(Operation *operation) {
-  return llvm::TypeSwitch<Operation *, StringRef>(operation)
-      .Case<func::FuncOp, LLVM::LLVMFuncOp>(
-          [](auto op) { return op.getFunctionTypeAttrName(); })
-      .Default([](Operation *) {
-        llvm_unreachable("expected op with a function type");
-        return "";
-      });
+  if (auto iface = dyn_cast<mlir::enzyme::AutoDiffFunctionInterface>(operation))
+    return iface.getFunctionTypeAttrName();
+  return "";
 }
 
 static StringRef getArgAttrsAttrName(Operation *operation) {
-  return llvm::TypeSwitch<Operation *, StringRef>(operation)
-      .Case<func::FuncOp, LLVM::LLVMFuncOp>(
-          [](auto op) { return op.getArgAttrsAttrName(); })
-      .Default([](Operation *) {
-        llvm_unreachable("expected op with arg attrs");
-        return "";
-      });
+  if (auto iface = dyn_cast<mlir::enzyme::AutoDiffFunctionInterface>(operation))
+    return iface.getArgAttrsAttrName();
+  return "";
 }
 
-static void serializeFunctionAttributes(Operation *fn,
-                                        enzyme::AutoDiffRegionOp regionOp) {
+static void serializeFunctionAttributes(Operation *fn, Operation *regionOp) {
   SmallVector<NamedAttribute> fnAttrs;
   fnAttrs.reserve(fn->getAttrDictionary().size());
   for (auto attr : fn->getAttrs()) {
@@ -70,21 +64,23 @@ static void serializeFunctionAttributes(Operation *fn,
                     DictionaryAttr::getWithSorted(fn->getContext(), fnAttrs));
 }
 
-static void deserializeFunctionAttributes(enzyme::AutoDiffRegionOp op,
+template <typename DiffRegionOp>
+static void deserializeFunctionAttributes(DiffRegionOp op,
                                           Operation *outlinedFunc,
                                           unsigned addedArgCount) {
-  if (!op->hasAttrOfType<DictionaryAttr>(kFnAttrsName))
+  if (!op->template hasAttrOfType<DictionaryAttr>(kFnAttrsName))
     return;
 
   MLIRContext *ctx = op->getContext();
   SmallVector<NamedAttribute> fnAttrs;
-  for (auto attr : op->getAttrOfType<DictionaryAttr>(kFnAttrsName)) {
+  for (auto attr : op->template getAttrOfType<DictionaryAttr>(kFnAttrsName)) {
     // New arguments are potentially added when outlining due to references to
     // values outside the region. Insert an empty arg attr for each newly
     // added argument.
     if (attr.getName() == getArgAttrsAttrName(outlinedFunc)) {
       SmallVector<Attribute> argAttrs(
-          cast<ArrayAttr>(attr.getValue()).getAsRange<DictionaryAttr>());
+          cast<ArrayAttr>(attr.getValue())
+              .template getAsRange<DictionaryAttr>());
       for (unsigned i = 0; i < addedArgCount; ++i)
         argAttrs.push_back(DictionaryAttr::getWithSorted(ctx, {}));
       fnAttrs.push_back(
@@ -107,14 +103,145 @@ struct InlineEnzymeAutoDiff : public OpRewritePattern<enzyme::AutoDiffOp> {
   }
 };
 
+struct InlineEnzymeForwardDiff
+    : public OpRewritePattern<enzyme::ForwardDiffOp> {
+  using OpRewritePattern<enzyme::ForwardDiffOp>::OpRewritePattern;
+  LogicalResult matchAndRewrite(enzyme::ForwardDiffOp op,
+                                PatternRewriter &rewriter) const override {
+    SymbolTableCollection symbolTable;
+    FunctionOpInterface fn = dyn_cast_or_null<FunctionOpInterface>(
+        symbolTable.lookupNearestSymbolFrom(op, op.getFnAttr()));
+
+    if (!fn)
+      return failure();
+
+    Region &targetRegion = fn.getFunctionBody();
+
+    if (targetRegion.empty())
+      return failure();
+
+    // Use a StringAttr rather than a SymbolRefAttr so the function can get
+    // symbol-DCE'd
+    auto fnAttr = StringAttr::get(op.getContext(), op.getFn());
+    auto regionOp = rewriter.replaceOpWithNewOp<enzyme::ForwardDiffRegionOp>(
+        op, op.getResultTypes(), op.getInputs(), op.getActivity(),
+        op.getRetActivity(), op.getWidth(), op.getStrongZero(), fnAttr);
+
+    serializeFunctionAttributes(fn, regionOp);
+    rewriter.cloneRegionBefore(targetRegion, regionOp.getBody(),
+                               regionOp.getBody().begin());
+
+    SmallVector<Operation *> toErase;
+    for (Operation &bodyOp : regionOp.getBody().getOps()) {
+      if (bodyOp.hasTrait<OpTrait::ReturnLike>()) {
+        PatternRewriter::InsertionGuard insertionGuard(rewriter);
+        rewriter.setInsertionPoint(&bodyOp);
+        enzyme::YieldOp::create(rewriter, bodyOp.getLoc(),
+                                bodyOp.getOperands());
+        toErase.push_back(&bodyOp);
+      }
+    }
+
+    for (Operation *opToErase : toErase)
+      rewriter.eraseOp(opToErase);
+    return success();
+  }
+};
+
 // Based on
 // https://github.com/llvm/llvm-project/blob/665da0a1649814471739c41a702e0e9447316b20/mlir/lib/Dialect/GPU/Transforms/KernelOutlining.cpp
-static FailureOr<func::FuncOp>
-outlineAutoDiffFunc(enzyme::AutoDiffRegionOp op, StringRef funcName,
-                    SmallVectorImpl<Value> &inputs,
-                    SmallVectorImpl<enzyme::Activity> &argActivities,
-                    OpBuilder &builder) {
+
+/// Identifies operations that are beneficial to sink into kernels. These
+/// operations may not have side-effects, as otherwise sinking (and hence
+/// duplicating them) is not legal.
+static bool isLikelyAnIndexComputation(Operation *op) {
+  return matchPattern(op, m_Constant()) ||
+         isa<memref::DimOp, arith::SelectOp, arith::CmpIOp>(op);
+}
+
+/// For a given operation `op`, computes whether it is beneficial to sink the
+/// operation into the kernel. An operation can be sunk if doing so does not
+/// introduce new kernel arguments. Whether a value is already available in the
+/// kernel (and hence does not introduce new arguments) is checked by
+/// querying `existingDependencies` and `availableValues`.
+/// If an operand is not yet available, we recursively check whether it can be
+/// made available by siking its defining op.
+/// Operations that are indentified for sinking are added to `beneficiaryOps` in
+/// the order they should appear in the kernel. Furthermore, `availableValues`
+/// is updated with results that will be available after sinking the identified
+/// ops.
+static bool extractBeneficiaryOps(
+    Operation *op, const SetVector<Value> &existingDependencies,
+    SetVector<Operation *> &beneficiaryOps,
+    llvm::SmallPtrSetImpl<Value> &availableValues,
+    llvm::function_ref<bool(Operation *)> isSinkingBeneficiary) {
+  if (beneficiaryOps.count(op))
+    return true;
+
+  if (!isSinkingBeneficiary(op))
+    return false;
+
+  for (Value operand : op->getOperands()) {
+    // It is already visible in the kernel, keep going.
+    if (availableValues.count(operand))
+      continue;
+    // Else check whether it can be made available via sinking or already is a
+    // dependency.
+    Operation *definingOp = operand.getDefiningOp();
+    if ((!definingOp || !extractBeneficiaryOps(definingOp, existingDependencies,
+                                               beneficiaryOps, availableValues,
+                                               isSinkingBeneficiary)) &&
+        !existingDependencies.count(operand))
+      return false;
+  }
+  // We will sink the operation, mark its results as now available.
+  beneficiaryOps.insert(op);
+  for (Value result : op->getResults())
+    availableValues.insert(result);
+  return true;
+}
+
+template <typename DiffRegionOp>
+static LogicalResult sinkOperationsIntoRegionOp(
+    DiffRegionOp regionOp,
+    function_ref<bool(Operation *)> isSinkingBeneficiary) {
+  assert(isSinkingBeneficiary);
+  Region &body = regionOp.getBody();
+
+  SetVector<Value> sinkCandidates;
+  getUsedValuesDefinedAbove(body, sinkCandidates);
+
+  SetVector<Operation *> toBeSunk;
+  llvm::SmallPtrSet<Value, 4> availableValues;
+  for (Value operand : sinkCandidates) {
+    Operation *operandOp = operand.getDefiningOp();
+    if (!operandOp)
+      continue;
+    extractBeneficiaryOps(operandOp, sinkCandidates, toBeSunk, availableValues,
+                          isSinkingBeneficiary);
+  }
+
+  // Insert operations so that the defs get cloned before uses.
+  IRMapping map;
+  OpBuilder builder(body);
+  for (Operation *op : toBeSunk) {
+    Operation *clonedOp = builder.clone(*op, map);
+    // Only replace uses within the launch op.
+    for (auto pair : llvm::zip(op->getResults(), clonedOp->getResults()))
+      replaceAllUsesInRegionWith(std::get<0>(pair), std::get<1>(pair), body);
+  }
+  return success();
+}
+
+template <typename DiffRegionOp>
+static FailureOr<func::FuncOp> outlineAutoDiffFunc(
+    DiffRegionOp op, StringRef funcName, SmallVectorImpl<Value> &inputs,
+    SmallVectorImpl<enzyme::Activity> &argActivities, OpBuilder &builder) {
   Region &autodiffRegion = op.getBody();
+  if (failed(sinkOperationsIntoRegionOp(op, isLikelyAnIndexComputation))) {
+    return failure();
+  }
+
   SmallVector<Type> argTypes(autodiffRegion.getArgumentTypes()), resultTypes;
   SmallVector<Location> argLocs(autodiffRegion.getNumArguments(), op.getLoc());
   // Infer the result types from an enzyme.yield op
@@ -131,11 +258,27 @@ outlineAutoDiffFunc(enzyme::AutoDiffRegionOp op, StringRef funcName,
   llvm::SetVector<Value> freeValues;
   getUsedValuesDefinedAbove(autodiffRegion, freeValues);
 
-  for (Value value : freeValues) {
-    inputs.push_back(value);
-    argTypes.push_back(value.getType());
-    argLocs.push_back(value.getLoc());
-    argActivities.push_back(enzyme::Activity::enzyme_const);
+  llvm::SmallVector<Value> primalValuesAbove = op.getPrimalInputs();
+  llvm::SmallVector<Value> blockArgs(autodiffRegion.getArguments());
+  for (Value value : llvm::make_early_inc_range(freeValues)) {
+    bool isPrimal = false;
+    for (auto [pval, bval] : llvm::zip(primalValuesAbove, blockArgs)) {
+      if (value == pval) {
+        isPrimal = true;
+        for (OpOperand &use : llvm::make_early_inc_range(value.getUses())) {
+          if (op->isProperAncestor(use.getOwner()))
+            use.assign(bval);
+        }
+        freeValues.remove(value);
+      }
+    }
+
+    if (!isPrimal) {
+      inputs.push_back(value);
+      argTypes.push_back(value.getType());
+      argLocs.push_back(value.getLoc());
+      argActivities.push_back(enzyme::Activity::enzyme_const);
+    }
   }
   auto fnType = builder.getFunctionType(argTypes, resultTypes);
 
@@ -144,6 +287,7 @@ outlineAutoDiffFunc(enzyme::AutoDiffRegionOp op, StringRef funcName,
   // to some issue with the dbg info.
   Location loc = UnknownLoc::get(op.getContext());
   auto outlinedFunc = func::FuncOp::create(builder, loc, funcName, fnType);
+  outlinedFunc.setPrivate();
   Region &outlinedBody = outlinedFunc.getBody();
   deserializeFunctionAttributes(op, outlinedFunc, freeValues.size());
 
@@ -228,6 +372,43 @@ LogicalResult outlineEnzymeAutoDiffRegion(enzyme::AutoDiffRegionOp op,
   auto newOp = enzyme::AutoDiffOp::create(
       builder, op.getLoc(), op.getResultTypes(), outlinedFunc->getName(),
       allInputs, argActivityAttr, op.getRetActivity(), op.getWidth(),
+      op.getStrongZero(), op.getAtomicAdd());
+  op.replaceAllUsesWith(newOp.getResults());
+  op.erase();
+  return success();
+}
+
+LogicalResult outlineEnzymeForwardDiffRegion(enzyme::ForwardDiffRegionOp op,
+                                             StringRef funcName,
+                                             OpBuilder &builder) {
+  OpBuilder::InsertionGuard insertionGuard(builder);
+  builder.setInsertionPointAfter(op->getParentOfType<SymbolOpInterface>());
+
+  SmallVector<enzyme::Activity> argActivities =
+      llvm::map_to_vector(op.getActivity().getAsRange<enzyme::ActivityAttr>(),
+                          [](auto attr) { return attr.getValue(); });
+  SmallVector<Value> primalsAndShadows(op.getInputs());
+
+  // Free variables are appended to primalInputs.
+  // The final input ordering should be:
+  // 1. primals and duplicated argument shadows
+  // 2. free variables
+  FailureOr<func::FuncOp> outlinedFunc = outlineAutoDiffFunc(
+      op, funcName, primalsAndShadows, argActivities, builder);
+  if (failed(outlinedFunc))
+    return failure();
+
+  SmallVector<Value> allInputs;
+  allInputs.append(primalsAndShadows);
+
+  builder.setInsertionPoint(op);
+  ArrayAttr argActivityAttr = builder.getArrayAttr(llvm::map_to_vector(
+      argActivities, [&op](enzyme::Activity actv) -> Attribute {
+        return enzyme::ActivityAttr::get(op.getContext(), actv);
+      }));
+  auto newOp = enzyme::ForwardDiffOp::create(
+      builder, op.getLoc(), op.getResultTypes(), outlinedFunc->getName(),
+      primalsAndShadows, argActivityAttr, op.getRetActivity(), op.getWidth(),
       op.getStrongZero());
   op.replaceAllUsesWith(newOp.getResults());
   op.erase();
@@ -239,9 +420,11 @@ struct InlineEnzymeIntoRegion
           InlineEnzymeIntoRegion> {
   void runOnOperation() override {
     RewritePatternSet patterns(&getContext());
-    patterns.insert<InlineEnzymeAutoDiff>(&getContext());
+    patterns.insert<InlineEnzymeAutoDiff, InlineEnzymeForwardDiff>(
+        &getContext());
 
     GreedyRewriteConfig config;
+    config.setRegionSimplificationLevel(GreedySimplifyRegionLevel::Normal);
     (void)applyPatternsGreedily(getOperation(), std::move(patterns), config);
   }
 };
@@ -250,17 +433,32 @@ struct OutlineEnzymeFromRegion
     : public enzyme::impl::OutlineEnzymeFromRegionPassBase<
           OutlineEnzymeFromRegion> {
   void runOnOperation() override {
-    SmallVector<enzyme::AutoDiffRegionOp> toOutline;
+    SmallVector<enzyme::AutoDiffRegionOp> toOutlineRev;
     getOperation()->walk(
-        [&](enzyme::AutoDiffRegionOp op) { toOutline.push_back(op); });
+        [&](enzyme::AutoDiffRegionOp op) { toOutlineRev.push_back(op); });
+
+    SmallVector<enzyme::ForwardDiffRegionOp> toOutlineFwd;
+    getOperation()->walk(
+        [&](enzyme::ForwardDiffRegionOp op) { toOutlineFwd.push_back(op); });
 
     OpBuilder builder(getOperation());
     unsigned increment = 0;
-    for (auto regionOp : toOutline) {
+    for (auto regionOp : toOutlineRev) {
       auto symbol = regionOp->getParentOfType<SymbolOpInterface>();
       std::string defaultName =
           (Twine(symbol.getName(), "_to_diff") + Twine(increment)).str();
       if (failed(outlineEnzymeAutoDiffRegion(regionOp, defaultName, builder)))
+        return signalPassFailure();
+
+      ++increment;
+    }
+
+    for (auto regionOp : toOutlineFwd) {
+      auto symbol = regionOp->getParentOfType<SymbolOpInterface>();
+      std::string defaultName =
+          (Twine(symbol.getName(), "_to_fwddiff") + Twine(increment)).str();
+      if (failed(
+              outlineEnzymeForwardDiffRegion(regionOp, defaultName, builder)))
         return signalPassFailure();
 
       ++increment;
@@ -286,7 +484,8 @@ bool mlir::enzyme::inlineAutodiffOp(enzyme::AutoDiffOp &op,
   auto fnAttr = StringAttr::get(op.getContext(), op.getFn());
   auto regionOp = rewriter.replaceOpWithNewOp<enzyme::AutoDiffRegionOp>(
       op, op.getResultTypes(), op.getInputs(), op.getActivity(),
-      op.getRetActivity(), op.getWidth(), op.getStrongZero(), fnAttr);
+      op.getRetActivity(), op.getWidth(), op.getStrongZero(), op.getAtomicAdd(),
+      fnAttr);
   serializeFunctionAttributes(fn, regionOp);
   rewriter.cloneRegionBefore(targetRegion, regionOp.getBody(),
                              regionOp.getBody().begin());

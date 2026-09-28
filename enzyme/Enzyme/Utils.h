@@ -48,6 +48,73 @@
 
 #include "llvm/Support/CommandLine.h"
 
+#include "llvm/IR/Instructions.h"
+
+// LLVM 24 split BranchInst into CondBrInst and UncondBrInst. These helpers
+// ask the questions Enzyme asks of a branch in one spelling for every
+// supported LLVM; successors need no helper, Instruction::getSuccessor and
+// getNumSuccessors say them generically on both sides of the split.
+static inline bool isAnyBranch(const llvm::Value *V) {
+#if LLVM_VERSION_MAJOR >= 24
+  return llvm::isa<llvm::CondBrInst, llvm::UncondBrInst>(V);
+#else
+  return llvm::isa<llvm::BranchInst>(V);
+#endif
+}
+
+static inline bool isConditionalBranch(const llvm::Value *V) {
+#if LLVM_VERSION_MAJOR >= 24
+  return llvm::isa<llvm::CondBrInst>(V);
+#else
+  if (auto *BI = llvm::dyn_cast<llvm::BranchInst>(V))
+    return BI->isConditional();
+  return false;
+#endif
+}
+
+static inline bool isUnconditionalBranch(const llvm::Value *V) {
+#if LLVM_VERSION_MAJOR >= 24
+  return llvm::isa<llvm::UncondBrInst>(V);
+#else
+  if (auto *BI = llvm::dyn_cast<llvm::BranchInst>(V))
+    return BI->isUnconditional();
+  return false;
+#endif
+}
+
+/// The condition of a branch isConditionalBranch says yes to.
+static inline llvm::Value *getBranchCondition(llvm::Value *V) {
+#if LLVM_VERSION_MAJOR >= 24
+  return llvm::cast<llvm::CondBrInst>(V)->getCondition();
+#else
+  return llvm::cast<llvm::BranchInst>(V)->getCondition();
+#endif
+}
+
+static inline void setBranchCondition(llvm::Value *V, llvm::Value *Cond) {
+#if LLVM_VERSION_MAJOR >= 24
+  llvm::cast<llvm::CondBrInst>(V)->setCondition(Cond);
+#else
+  llvm::cast<llvm::BranchInst>(V)->setCondition(Cond);
+#endif
+}
+
+#if LLVM_VERSION_MAJOR >= 24
+static inline llvm::Instruction *
+createUnconditionalBranch(llvm::BasicBlock *Target,
+                          llvm::InsertPosition InsertBefore) {
+  return llvm::UncondBrInst::Create(Target, InsertBefore);
+}
+#else
+// llvm::InsertPosition arrives later than some supported majors; accept
+// whatever this LLVM's BranchInst::Create does.
+template <typename PosT>
+static inline llvm::Instruction *
+createUnconditionalBranch(llvm::BasicBlock *Target, PosT InsertBefore) {
+  return llvm::BranchInst::Create(Target, InsertBefore);
+}
+#endif
+
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/StringMap.h"
 
@@ -62,6 +129,35 @@
 #include <optional>
 #endif
 
+#if LLVM_VERSION_MAJOR >= 23
+#define amd_target amdgpu
+#else
+#define amd_target amdgcn
+#endif
+
+#if LLVM_VERSION_MAJOR >= 16
+#include "llvm/TargetParser/Triple.h"
+#else
+#include "llvm/ADT/Triple.h"
+#endif
+
+#include "llvm/Support/AMDGPUMetadata.h"
+
+// Returns true if the given target triple is a GPU kernel architecture
+// (NVPTX, AMDGPU, or Apple Metal AIR).
+static inline bool isGPUArch(const llvm::Triple &TT) {
+  auto Arch = TT.getArch();
+  return Arch == llvm::Triple::nvptx || Arch == llvm::Triple::nvptx64 ||
+         Arch == llvm::Triple::amd_target || TT.getArchName() == "air64";
+}
+
+// Returns the address space used for GPU shared/threadgroup memory.
+static inline unsigned getGPUSharedAddrSpace(const llvm::Triple &TT) {
+  return TT.getArch() == llvm::Triple::amd_target
+             ? (unsigned)llvm::AMDGPU::HSAMD::AddressSpaceQualifier::Local
+             : 3;
+}
+
 #include "llvm/IR/DiagnosticInfo.h"
 
 #include "llvm/Analysis/OptimizationRemarkEmitter.h"
@@ -72,7 +168,9 @@ class TypeResults;
 
 namespace llvm {
 class ScalarEvolution;
-}
+class SCEV;
+class SCEVAddRecExpr;
+} // namespace llvm
 
 enum class ErrorType {
   NoDerivative = 0,
@@ -86,6 +184,10 @@ enum class ErrorType {
   IllegalReplaceFicticiousPHIs = 8,
   GetIndexError = 9,
   NoTruncate = 10,
+  GCRewrite = 11,
+  NaNError = 12,
+  ShowInternalError = 12,
+  NoAccumulate = 13,
 };
 
 extern "C" {
@@ -127,6 +229,11 @@ extern llvm::StringMap<std::function<llvm::Value *(
     GradientUtils *)>>
     shadowHandlers;
 
+static inline bool EmitWarningEnabled(const llvm::LLVMContext &Ctx) {
+  return EnzymePrintPerf ||
+         Ctx.getDiagHandlerPtr()->isPassedOptRemarkEnabled("enzyme");
+}
+
 template <typename... Args>
 void EmitWarning(llvm::StringRef RemarkName,
                  const llvm::DiagnosticLocation &Loc,
@@ -160,16 +267,41 @@ public:
                 const llvm::Function *CodeRegion);
 };
 
+/// Emit a diagnostic which is always shown, unlike EmitWarning which requires
+/// the user to opt in with -Rpass=enzyme. Use this for messages which describe
+/// a potential correctness problem (e.g. mismatched activity) as opposed to a
+/// performance note.
+template <typename... Args>
+void EmitWarningAlways(llvm::StringRef RemarkName,
+                       const llvm::DiagnosticLocation &Loc,
+                       const llvm::Function &F, const Args &...args) {
+  // DiagnosticInfoUnsupported does not copy its message, so keep the backing
+  // storage alive until diagnose() returns.
+  std::string str = "Enzyme: ";
+  llvm::raw_string_ostream ss(str);
+  (ss << ... << args);
+  F.getContext().diagnose(EnzymeWarning(str, Loc, &F));
+}
+
+template <typename... Args>
+void EmitWarningAlways(llvm::StringRef RemarkName, const llvm::Instruction &I,
+                       const Args &...args) {
+  EmitWarningAlways(RemarkName, I.getDebugLoc(), *I.getParent()->getParent(),
+                    args...);
+}
+
 template <typename... Args>
 void EmitWarningAlways(llvm::StringRef RemarkName, const llvm::Function &F,
                        const Args &...args) {
-  llvm::LLVMContext &Ctx = F.getContext();
-  std::string str;
-  llvm::raw_string_ostream ss(str);
-  (ss << ... << args);
-  auto R = llvm::OptimizationRemark("enzyme", RemarkName, &F) << ss.str();
-  Ctx.diagnose((EnzymeWarning(ss.str(), F.getSubprogram(), &F)));
+  EmitWarningAlways(RemarkName, F.getSubprogram(), F, args...);
 }
+
+/// Remedy appended to mismatched-activity warnings, which are emitted when a
+/// value Enzyme proved inactive is used where an active value may be required.
+static constexpr const char *MixedActivityHint =
+    ". If this value may be active at runtime, enable runtime activity "
+    "analysis (pass \"enzyme_runtime_activity\" to __enzyme_autodiff); "
+    "otherwise its derivative will be assumed zero.";
 
 template <typename... Args>
 void EmitWarning(llvm::StringRef RemarkName, const llvm::Function &F,
@@ -194,6 +326,9 @@ public:
                 const llvm::Function *CodeRegion);
 };
 
+// Forward declaration needed for EmitFailure template
+llvm::Function *getFirstFunctionDefinition(llvm::Module &M);
+
 template <typename... Args>
 void EmitFailure(llvm::StringRef RemarkName,
                  const llvm::DiagnosticLocation &Loc,
@@ -214,6 +349,21 @@ void EmitFailure(llvm::StringRef RemarkName,
   (ss << ... << args);
   CodeRegion->getContext().diagnose(
       (EnzymeFailure("Enzyme: " + ss.str(), Loc, CodeRegion)));
+}
+
+template <typename... Args>
+void EmitFailure(llvm::StringRef RemarkName, llvm::Module &M, Args &...args) {
+  // Use the first function definition in the module as context for the
+  // diagnostic
+  if (llvm::Function *FirstFunc = getFirstFunctionDefinition(M)) {
+    EmitFailure(RemarkName, FirstFunc->getSubprogram(), FirstFunc, args...);
+  } else {
+    // Fallback if no functions in module
+    std::string *str = new std::string();
+    llvm::raw_string_ostream ss(*str);
+    (ss << ... << args);
+    llvm::report_fatal_error(llvm::StringRef(*str));
+  }
 }
 
 static inline llvm::Function *isCalledFunction(llvm::Value *val) {
@@ -350,17 +500,7 @@ enum class ReturnType {
   Void,
 };
 
-/// Potential differentiable argument classifications
-enum class DIFFE_TYPE {
-  OUT_DIFF = 0, // add differential to an output struct. Only for scalar values
-                // in ReverseMode variants.
-  DUP_ARG = 1,  // duplicate the argument and store differential inside.
-               // For references, pointers, or integers in ReverseMode variants.
-               // For all types in ForwardMode variants.
-  CONSTANT = 2,  // no differential. Usable everywhere.
-  DUP_NONEED = 3 // duplicate this argument and store differential inside, but
-                 // don't need the forward. Same as DUP_ARG otherwise.
-};
+#include "EnzymeCallMarkers.h"
 
 enum class BATCH_TYPE {
   SCALAR = 0,
@@ -380,12 +520,6 @@ enum class ProbProgMode {
   Likelihood = 0,
   Trace = 1,
   Condition = 2,
-};
-
-enum class MProbProgMode {
-  Call = 0,
-  Simulate = 1,
-  Generate = 2,
 };
 
 /// Classification of value as an original program
@@ -418,6 +552,11 @@ static inline std::string to_string(ValueType mode) {
   llvm_unreachable("illegal valuetype");
 }
 
+static inline llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
+                                            ValueType mode) {
+  return os << to_string(mode);
+}
+
 static inline std::string to_string(DerivativeMode mode) {
   switch (mode) {
   case DerivativeMode::ForwardMode:
@@ -436,6 +575,11 @@ static inline std::string to_string(DerivativeMode mode) {
   llvm_unreachable("illegal derivative mode");
 }
 
+static inline llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
+                                            DerivativeMode mode) {
+  return os << to_string(mode);
+}
+
 /// Convert DIFFE_TYPE to a string
 static inline std::string to_string(DIFFE_TYPE t) {
   switch (t) {
@@ -451,6 +595,11 @@ static inline std::string to_string(DIFFE_TYPE t) {
     assert(0 && "illegal diffetype");
     return "";
   }
+}
+
+static inline llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
+                                            DIFFE_TYPE mode) {
+  return os << to_string(mode);
 }
 
 /// Convert ReturnType to a string
@@ -476,6 +625,11 @@ static inline std::string to_string(ReturnType t) {
     return "Void";
   }
   llvm_unreachable("illegal ReturnType");
+}
+
+static inline llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
+                                            ReturnType mode) {
+  return os << to_string(mode);
 }
 
 #include <set>
@@ -727,11 +881,14 @@ llvm::Optional<BlasInfo> extractBLAS(llvm::StringRef in);
 std::vector<std::tuple<llvm::Type *, size_t, size_t>>
 parseTrueType(const llvm::MDNode *, DerivativeMode, bool const_src);
 
+bool isAtomic(llvm::Value *origptr, bool AtomicAdd, llvm::Function *newFunc);
+
 /// Create function for type that performs the derivative memcpy on floating
 /// point memory
 llvm::Function *getOrInsertDifferentialFloatMemcpy(
     llvm::Module &M, llvm::Type *T, unsigned dstalign, unsigned srcalign,
-    unsigned dstaddr, unsigned srcaddr, unsigned bitwidth);
+    unsigned dstaddr, unsigned srcaddr, unsigned bitwidth, bool runtimeActivity,
+    bool atomic);
 
 /// Create function for type that performs memcpy with a stride using blas copy
 void callMemcpyStridedBlas(llvm::IRBuilder<> &B, llvm::Module &M, BlasInfo blas,
@@ -772,11 +929,17 @@ llvm::Function *getOrInsertMemcpyMat(llvm::Module &M, llvm::Type *elementType,
                                      llvm::IntegerType *IT, unsigned dstalign,
                                      unsigned srcalign);
 
+llvm::Function *getOrInsertDifferentialFloatMemcpyMat(
+    llvm::Module &M, llvm::Type *elementType, llvm::PointerType *PT,
+    llvm::IntegerType *IT, llvm::IntegerType *CT, unsigned dstalign,
+    unsigned srcalign, bool zeroSrc);
+
 /// Create function for type that performs the derivative memmove on floating
 /// point memory
 llvm::Function *getOrInsertDifferentialFloatMemmove(
     llvm::Module &M, llvm::Type *T, unsigned dstalign, unsigned srcalign,
-    unsigned dstaddr, unsigned srcaddr, unsigned bitwidth);
+    unsigned dstaddr, unsigned srcaddr, unsigned bitwidth, bool runtimeActivity,
+    bool atomic);
 
 llvm::Function *getOrInsertCheckedFree(llvm::Module &M, llvm::CallInst *call,
                                        llvm::Type *Type, unsigned width);
@@ -784,7 +947,8 @@ llvm::Function *getOrInsertCheckedFree(llvm::Module &M, llvm::CallInst *call,
 /// Create function for type that performs the derivative MPI_Wait
 llvm::Function *getOrInsertDifferentialMPI_Wait(llvm::Module &M,
                                                 llvm::ArrayRef<llvm::Type *> T,
-                                                llvm::Type *reqType);
+                                                llvm::Type *reqType,
+                                                llvm::StringRef caller);
 
 /// Create function to computer nearest power of two
 llvm::Value *nextPowerOfTwo(llvm::IRBuilder<> &B, llvm::Value *V);
@@ -1026,7 +1190,7 @@ static inline llvm::Loop *getAncestor(llvm::Loop *R1, llvm::Loop *R2) {
 // into the resutls vector.
 void mayExecuteAfter(llvm::SmallVectorImpl<llvm::Instruction *> &results,
                      llvm::Instruction *inst,
-                     const llvm::SmallPtrSetImpl<llvm::Instruction *> &stores,
+                     const llvm::SetVector<llvm::Instruction *> &stores,
                      const llvm::Loop *region);
 
 /// Return whether maybeReader can read from memory written to by maybeWriter
@@ -1122,13 +1286,76 @@ enum class MPI_Elem {
   Old = 7
 };
 
+/// Pointer into the given address space. From LLVM 17 on, and on LLVM 15/16
+/// whenever the context has opaque pointers enabled, the element type is
+/// ignored -- so callers with no element type to hand may pass any type
+/// belonging to the right context (see getInt8PtrTy).
+static inline llvm::PointerType *getPointerType(llvm::Type *T,
+                                                unsigned AddressSpace = 0) {
+#if LLVM_VERSION_MAJOR >= 17
+  // NOLINTNEXTLINE(enzyme-pointer-type): this is the wrapper
+  return llvm::PointerType::get(T->getContext(), AddressSpace);
+#else
+  // NOLINTNEXTLINE(enzyme-pointer-type): this is the wrapper
+  return llvm::PointerType::get(T, AddressSpace);
+#endif
+}
+
 static inline llvm::PointerType *getInt8PtrTy(llvm::LLVMContext &Context,
                                               unsigned AddressSpace = 0) {
-#if LLVM_VERSION_MAJOR >= 21
-  return llvm::PointerType::get(Context, AddressSpace);
-#else
-  return llvm::PointerType::get(llvm::Type::getInt8Ty(Context), AddressSpace);
+  return getPointerType(llvm::Type::getInt8Ty(Context), AddressSpace);
+}
+
+static inline llvm::PointerType *getUnqual(llvm::Type *T) {
+  return getPointerType(T);
+}
+
+/// The same pointer type, in a different address space. On a typed-pointer
+/// build the pointee type is carried over; an opaque pointer has none to carry.
+/// Prefer this to rebuilding a pointer type by hand: it says that only the
+/// address space changes, rather than leaving it to the reader to check that
+/// dropping the pointee was deliberate.
+static inline llvm::PointerType *changePointerAddrSpace(llvm::PointerType *PT,
+                                                        unsigned AddressSpace) {
+#if LLVM_VERSION_MAJOR < 17
+  if (PT->getContext().supportsTypedPointers())
+    return getPointerType(PT->getPointerElementType(), AddressSpace);
 #endif
+  // NOLINTNEXTLINE(enzyme-pointer-type): this is the wrapper
+  return llvm::PointerType::get(PT->getContext(), AddressSpace);
+}
+
+/// The byte offset of the aggregate element addressed by `Idxs` within `T`,
+/// that is, what `gep T, ptr, 0, Idxs...` would compute. The data layout
+/// already records this, so read it off directly rather than materializing a
+/// throwaway GEP and folding it: callers run this once per field of every
+/// aggregate they walk.
+static inline uint64_t
+getAggregateElementOffset(const llvm::DataLayout &DL, llvm::Type *T,
+                          llvm::ArrayRef<unsigned> Idxs) {
+  uint64_t Offset = 0;
+  for (unsigned Idx : Idxs) {
+    llvm::Type *ElTy =
+        llvm::GetElementPtrInst::getTypeAtIndex(T, (uint64_t)Idx);
+    assert(ElTy && "index out of range of aggregate type");
+    if (auto ST = llvm::dyn_cast<llvm::StructType>(T)) {
+      Offset += DL.getStructLayout(ST)->getElementOffset(Idx);
+    } else {
+      // Array and vector elements sit at successive multiples of the element's
+      // alloc size, which is the stride a gep applies to a sequential index.
+      uint64_t Stride = DL.getTypeAllocSize(ElTy);
+      Offset += Idx * Stride;
+    }
+    T = ElTy;
+  }
+  return Offset;
+}
+
+/// The byte offset of element `Idx` of the aggregate type `T`.
+static inline uint64_t getAggregateElementOffset(const llvm::DataLayout &DL,
+                                                 llvm::Type *T, uint64_t Idx) {
+  unsigned Idxs[1] = {(unsigned)Idx};
+  return getAggregateElementOffset(DL, T, Idxs);
 }
 
 static inline llvm::StructType *getMPIHelper(llvm::LLVMContext &Context) {
@@ -1163,9 +1390,12 @@ static inline llvm::Value *getMPIMemberPtr(llvm::IRBuilder<> &B, llvm::Value *V,
   }
 }
 
-llvm::Value *getOrInsertOpFloatSum(llvm::Module &M, llvm::Type *OpPtr,
-                                   llvm::Type *OpType, ConcreteType CT,
-                                   llvm::Type *intType, llvm::IRBuilder<> &B2);
+/// `templateFn` is the MPI entry point this reduction is being built for; the
+/// MPI_Op_create it needs is named to match.
+llvm::Value *getOrInsertOpFloatSum(llvm::Module &M, llvm::Function *templateFn,
+                                   llvm::Type *OpPtr, llvm::Type *OpType,
+                                   ConcreteType CT, llvm::Type *intType,
+                                   llvm::IRBuilder<> &B2);
 
 class AssertingReplacingVH final : public llvm::CallbackVH {
 public:
@@ -1237,6 +1467,9 @@ static inline bool hasNoCache(llvm::Value *op) {
     if (auto called = getFunctionFromCall(CB)) {
       if (called->hasFnAttribute("enzyme_nocache"))
         return true;
+    }
+    if (EnzymeJuliaAddrLoad && getFuncNameFromCall(CB) == "julia.gc_loaded") {
+      return true;
     }
   }
   if (auto I = dyn_cast<Instruction>(op))
@@ -1362,6 +1595,8 @@ void ErrorIfRuntimeInactive(llvm::IRBuilder<> &B, llvm::Value *primal,
                             llvm::DebugLoc &&loc, llvm::Instruction *orig);
 
 llvm::Function *GetFunctionFromValue(llvm::Value *fn);
+
+llvm::Function *getFirstFunctionDefinition(llvm::Module &M);
 
 llvm::Value *simplifyLoad(llvm::Value *LI, size_t valSz = 0,
                           size_t preOffset = 0);
@@ -1627,6 +1862,20 @@ static inline bool isReadOnly(const llvm::Function *F, ssize_t arg = -1) {
     if (F->hasParamAttribute(arg, llvm::Attribute::ReadOnly) ||
         F->hasParamAttribute(arg, llvm::Attribute::ReadNone))
       return true;
+#if LLVM_VERSION_MAJOR >= 16
+    // Later LLVM folds readonly/readnone into the memory(...) attribute. The
+    // argument's bytes must not be written through the argument pointers
+    // (ArgMem) nor through anything else that could alias them (Other);
+    // inaccessible memory cannot alias an argument, so it alone may be
+    // written.
+    {
+      auto ME = F->getMemoryEffects();
+      if (!llvm::isModSet(
+              ME.getModRef(llvm::MemoryEffects::Location::ArgMem)) &&
+          !llvm::isModSet(ME.getModRef(llvm::MemoryEffects::Location::Other)))
+        return true;
+    }
+#endif
     // if (F->getAttributes().hasParamAttribute(arg, "enzyme_ReadOnly") ||
     //     F->getAttributes().hasParamAttribute(arg, "enzyme_ReadNone"))
     //   return true;
@@ -1639,6 +1888,21 @@ static inline bool isReadOnly(const llvm::CallBase *call, ssize_t arg = -1) {
     return true;
   if (arg != -1 && call->onlyReadsMemory(arg))
     return true;
+#if LLVM_VERSION_MAJOR >= 16
+  if (arg != -1) {
+    // Use the callee's effects only under a matching calling convention,
+    // for the same reason as the attribute path below. As above, both the
+    // argument-memory and aliasable-other locations must be write-free.
+    auto F2 = getFunctionFromCall(call);
+    if (!F2 || F2->getCallingConv() == call->getCallingConv()) {
+      auto ME = call->getMemoryEffects();
+      if (!llvm::isModSet(
+              ME.getModRef(llvm::MemoryEffects::Location::ArgMem)) &&
+          !llvm::isModSet(ME.getModRef(llvm::MemoryEffects::Location::Other)))
+        return true;
+    }
+  }
+#endif
 
   if (auto F = getFunctionFromCall(call)) {
     // Do not use function attrs for if different calling conv, such as a julia
@@ -1743,6 +2007,18 @@ static inline bool isWriteOnly(const llvm::Function *F, ssize_t arg = -1) {
     if (F->hasParamAttribute(arg, llvm::Attribute::WriteOnly) ||
         F->hasParamAttribute(arg, llvm::Attribute::ReadNone))
       return true;
+#if LLVM_VERSION_MAJOR >= 16
+    // As in isReadOnly: the argument's bytes must be unread both through the
+    // argument pointers and through anything that could alias them; only
+    // inaccessible memory may be read.
+    {
+      auto ME = F->getMemoryEffects();
+      if (!llvm::isRefSet(
+              ME.getModRef(llvm::MemoryEffects::Location::ArgMem)) &&
+          !llvm::isRefSet(ME.getModRef(llvm::MemoryEffects::Location::Other)))
+        return true;
+    }
+#endif
   }
   return false;
 }
@@ -1753,6 +2029,18 @@ static inline bool isWriteOnly(const llvm::CallBase *call, ssize_t arg = -1) {
     return true;
   if (arg != -1 && call->onlyWritesMemory(arg))
     return true;
+#if LLVM_VERSION_MAJOR >= 16
+  if (arg != -1) {
+    auto F2 = getFunctionFromCall(call);
+    if (!F2 || F2->getCallingConv() == call->getCallingConv()) {
+      auto ME = call->getMemoryEffects();
+      if (!llvm::isRefSet(
+              ME.getModRef(llvm::MemoryEffects::Location::ArgMem)) &&
+          !llvm::isRefSet(ME.getModRef(llvm::MemoryEffects::Location::Other)))
+        return true;
+    }
+  }
+#endif
 #else
   if (call->hasFnAttr(llvm::Attribute::WriteOnly) ||
       call->hasFnAttr(llvm::Attribute::ReadNone))
@@ -1818,6 +2106,8 @@ static inline bool isNoAlias(const llvm::Value *val) {
   if (auto arg = llvm::dyn_cast<llvm::Argument>(val)) {
     arg->hasNoAliasAttr();
   }
+  if (llvm::isa<llvm::AllocaInst>(val))
+    return true;
   return false;
 }
 
@@ -1852,10 +2142,20 @@ static inline bool isNoEscapingAllocation(const llvm::Function *F) {
   case Intrinsic::nvvm_barrier0:
 #else
   case Intrinsic::nvvm_barrier_cta_sync_aligned_all:
+  case Intrinsic::nvvm_barrier_cta_sync_aligned_count:
 #endif
+#if LLVM_VERSION_MAJOR < 22
   case Intrinsic::nvvm_barrier0_popc:
   case Intrinsic::nvvm_barrier0_and:
   case Intrinsic::nvvm_barrier0_or:
+#else
+  case Intrinsic::nvvm_barrier_cta_red_and_aligned_all:
+  case Intrinsic::nvvm_barrier_cta_red_and_aligned_count:
+  case Intrinsic::nvvm_barrier_cta_red_or_aligned_all:
+  case Intrinsic::nvvm_barrier_cta_red_or_aligned_count:
+  case Intrinsic::nvvm_barrier_cta_red_popc_aligned_all:
+  case Intrinsic::nvvm_barrier_cta_red_popc_aligned_count:
+#endif
   case Intrinsic::nvvm_membar_cta:
   case Intrinsic::nvvm_membar_gl:
   case Intrinsic::nvvm_membar_sys:
@@ -2205,10 +2505,42 @@ getIntrinsicDeclaration(llvm::Module *M, llvm::Intrinsic::ID id,
 #endif
 }
 
+static inline llvm::Instruction *getFirstNonPHI(llvm::BasicBlock *B) {
+#if LLVM_VERSION_MAJOR >= 18
+  // NOLINTNEXTLINE(enzyme-first-non-phi): this is the wrapper
+  return &*B->getFirstNonPHIIt();
+#else
+  // NOLINTNEXTLINE(enzyme-first-non-phi): this is the wrapper
+  return B->getFirstNonPHI();
+#endif
+}
+
+// LLVM 24 dropped the llvm::Instruction* overloads of insertBefore and
+// moveBefore in favour of ones taking a position in the instruction list.
+static inline void insertBeforeInst(llvm::Instruction *I,
+                                    llvm::Instruction *Before) {
+#if LLVM_VERSION_MAJOR >= 24
+  I->insertBefore(Before->getIterator());
+#else
+  I->insertBefore(Before);
+#endif
+}
+
+static inline void moveBeforeInst(llvm::Instruction *I,
+                                  llvm::Instruction *Before) {
+#if LLVM_VERSION_MAJOR >= 24
+  I->moveBefore(Before->getIterator());
+#else
+  I->moveBefore(Before);
+#endif
+}
+
 static inline llvm::Instruction *getFirstNonPHIOrDbg(llvm::BasicBlock *B) {
 #if LLVM_VERSION_MAJOR >= 20
+  // NOLINTNEXTLINE(enzyme-first-non-phi): this is the wrapper
   return &*B->getFirstNonPHIOrDbg();
 #else
+  // NOLINTNEXTLINE(enzyme-first-non-phi): this is the wrapper
   return B->getFirstNonPHIOrDbg();
 #endif
 }
@@ -2319,7 +2651,8 @@ bool isNVLoad(const llvm::Value *V);
 //! If checkLoadCaptured != 0, also consider catpures of any loads of the value
 //! as a capture (for the number of loads set).
 bool notCapturedBefore(llvm::Value *V, llvm::Instruction *inst,
-                       size_t checkLoadCaptured);
+                       size_t checkLoadCaptured,
+                       llvm::Instruction *startinst = nullptr);
 
 //! Check if value if b captured
 bool notCaptured(llvm::Value *V);
@@ -2333,11 +2666,293 @@ std::optional<bool>
 llvm::Optional<bool>
 #endif
 arePointersGuaranteedNoAlias(llvm::TargetLibraryInfo &TLI, llvm::AAResults &AA,
-                             llvm::LoopInfo &LI, llvm::Value *op0,
-                             llvm::Value *op1, bool offsetAllowed = false);
+                             llvm::DominatorTree &DT, llvm::LoopInfo &LI,
+                             llvm::Value *op0, llvm::Value *op1,
+                             bool offsetAllowed = false);
 
-// Return true if the module has a triple indicating an nvptx target, false
-// otherwise.
-bool isTargetNVPTX(llvm::Module &M);
+/// MPI routines recognized by Enzyme, keyed by their lowercase,
+/// underscore-free base name and mapped to the canonical C name (without the
+/// profiling "P" prefix).
+static const std::pair<const char *, const char *> KnownMPIFunctions[] = {
+    {"abort", "MPI_Abort"},
+    {"allgather", "MPI_Allgather"},
+    {"allreduce", "MPI_Allreduce"},
+    {"barrier", "MPI_Barrier"},
+    {"bcast", "MPI_Bcast"},
+    {"brecv", "MPI_Brecv"},
+    {"bsend", "MPI_Bsend"},
+    {"comm_accept", "MPI_Comm_accept"},
+    {"comm_call_errhandler", "MPI_Comm_call_errhandler"},
+    {"comm_compare", "MPI_Comm_compare"},
+    {"comm_connect", "MPI_Comm_connect"},
+    {"comm_create", "MPI_Comm_create"},
+    {"comm_create_errhandler", "MPI_Comm_create_errhandler"},
+    {"comm_create_group", "MPI_Comm_create_group"},
+    {"comm_disconnect", "MPI_Comm_disconnect"},
+    {"comm_dup", "MPI_Comm_dup"},
+    {"comm_free", "MPI_Comm_free"},
+    {"comm_get_info", "MPI_Comm_get_info"},
+    {"comm_get_name", "MPI_Comm_get_name"},
+    {"comm_get_parent", "MPI_Comm_get_parent"},
+    {"comm_idup", "MPI_Comm_idup"},
+    {"comm_join", "MPI_Comm_join"},
+    {"comm_rank", "MPI_Comm_rank"},
+    {"comm_remote_size", "MPI_Comm_remote_size"},
+    {"comm_set_info", "MPI_Comm_set_info"},
+    {"comm_set_name", "MPI_Comm_set_name"},
+    {"comm_size", "MPI_Comm_size"},
+    {"comm_spawn", "MPI_Comm_spawn"},
+    {"comm_spawn_multiple", "MPI_Comm_spawn_multiple"},
+    {"comm_split", "MPI_Comm_split"},
+    {"finalize", "MPI_Finalize"},
+    {"gather", "MPI_Gather"},
+    {"get_count", "MPI_Get_count"},
+    {"get_processor_name", "MPI_Get_processor_name"},
+    {"graph_create", "MPI_Graph_create"},
+    {"init", "MPI_Init"},
+    {"intercomm_create", "MPI_Intercomm_create"},
+    {"irecv", "MPI_Irecv"},
+    {"isend", "MPI_Isend"},
+    {"op_create", "MPI_Op_create"},
+    {"probe", "MPI_Probe"},
+    {"recv", "MPI_Recv"},
+    {"reduce", "MPI_Reduce"},
+    {"reduce_scatter_block", "MPI_Reduce_scatter_block"},
+    {"scatter", "MPI_Scatter"},
+    {"send", "MPI_Send"},
+    {"ssend", "MPI_Ssend"},
+    {"test", "MPI_Test"},
+    {"type_size", "MPI_Type_size"},
+    {"wait", "MPI_Wait"},
+    {"waitall", "MPI_Waitall"},
+    {"wtime", "MPI_Wtime"},
+};
+
+/// Canonicalize the name of an MPI routine across calling conventions: both
+/// the C convention ("MPI_Recv", "PMPI_Recv") and common Fortran ABI
+/// manglings ("mpi_recv_", "mpi_recv__", "pmpi_recv_", "MPI_RECV", ...) map
+/// to the canonical C name without profiling prefix (e.g. "MPI_Recv").
+/// Returns an empty StringRef if the name is not a known MPI routine.
+static inline llvm::StringRef canonicalizeMPIName(llvm::StringRef Name) {
+  llvm::StringRef Base = Name;
+  if (!Base.consume_front_insensitive("pmpi_") &&
+      !Base.consume_front_insensitive("mpi_"))
+    return "";
+  while (Base.consume_back("_")) {
+  }
+  if (Base.empty())
+    return "";
+  for (const auto &E : KnownMPIFunctions)
+    if (Base.equals_insensitive(E.first))
+      return E.second;
+  return "";
+}
+
+/// True if `Name` uses a Fortran ABI mangling of an MPI routine (trailing
+/// underscore(s), e.g. "mpi_recv_", "mpi_comm_rank__"). Such calls pass all
+/// arguments by reference and take an extra trailing `ierr` argument.
+static inline bool isFortranMPICall(llvm::StringRef Name) {
+  return endsWith(Name, "_") && !canonicalizeMPIName(Name).empty();
+}
+
+static inline std::tuple<llvm::StringRef, llvm::StringRef, llvm::StringRef>
+tripleSplitDollar(llvm::StringRef caller) {
+  if (!startsWith(caller, "ejl")) {
+    return {"", caller, ""};
+  }
+  auto &&[prefix, todo] = caller.split("$");
+  auto &&[name, postfix] = todo.split("$");
+  return std::make_tuple(prefix, name, postfix);
+}
+
+static inline std::string getRenamedPerCallingConv(llvm::StringRef caller,
+                                                   llvm::StringRef callee) {
+  if (startsWith(caller, "ejl")) {
+    auto &&[prefix, name, postfix] = tripleSplitDollar(caller);
+    return (prefix + "$" + getRenamedPerCallingConv(name, callee) + "$" +
+            postfix)
+        .str();
+  }
+  if (startsWith(caller, "PMPI_")) {
+    assert(startsWith(callee, "MPI"));
+    return ("P" + callee).str();
+  }
+  // A caller using a Fortran MPI ABI convention (e.g. "mpi_reduce_") needs
+  // the callee mangled the same way so that the call resolves against the
+  // MPI library's Fortran bindings (e.g. "mpi_bcast_").
+  if (startsWith(callee, "MPI_") && isFortranMPICall(caller)) {
+    bool profiling = caller.substr(0, 5).equals_insensitive("pmpi_");
+    size_t underscores = 0;
+    while (underscores < caller.size() &&
+           caller[caller.size() - 1 - underscores] == '_')
+      underscores++;
+    std::string result = profiling ? "pmpi_" : "mpi_";
+    result += callee.drop_front(strlen("MPI_")).lower();
+    result.append(underscores, '_');
+    return result;
+  }
+  return callee.str();
+}
+
+/// Declare `callee` in `M` under whatever naming convention the frontend used
+/// to reach `templateFn`, recording the plain name in enzyme_math so that the
+/// declaration is still recognized afterwards. A helper introduced next to a
+/// call has to follow that call's convention to resolve at link time: Julia,
+/// for one, names its lazily bound ccalls "ejlstr$<function>$<library>" and
+/// loads those libraries RTLD_LOCAL, so a plainly named declaration would not
+/// be reachable via dlsym.
+llvm::FunctionCallee getOrInsertPerCallingConv(llvm::Module &M,
+                                               llvm::Function *templateFn,
+                                               llvm::StringRef callee,
+                                               llvm::FunctionType *FT);
+
+static inline std::string convertSRetTypeToString(llvm::Type *T) {
+  return std::to_string((size_t)T);
+}
+
+static inline llvm::Type *
+convertSRetTypeFromString(llvm::StringRef str, llvm::LLVMContext *C = nullptr) {
+  if (str == "test_type") {
+    assert(C);
+    llvm::SmallVector<llvm::Type *, 1> elts;
+    elts.push_back(
+        getPointerType(llvm::StructType::get(*C, {}), AddressSpace::Tracked));
+    llvm::Type *inner = llvm::StructType::get(*C, elts);
+    llvm::SmallVector<llvm::Type *, 1> innerElts;
+    innerElts.push_back(inner);
+    return llvm::StructType::get(*C, innerElts);
+  }
+  if (str == "test_type2") {
+    assert(C);
+    return llvm::ArrayType::get(llvm::Type::getInt64Ty(*C), 6);
+  }
+  if (str == "test_type3") {
+    assert(C);
+    llvm::SmallVector<llvm::Type *, 1> elts;
+    elts.push_back(llvm::Type::getDoubleTy(*C));
+    return llvm::StructType::get(*C, elts);
+  }
+  if (str == "test_type4") {
+    assert(C);
+    llvm::SmallVector<llvm::Type *, 3> elts;
+    elts.push_back(llvm::ArrayType::get(llvm::Type::getDoubleTy(*C), 2));
+    elts.push_back(llvm::Type::getDoubleTy(*C));
+    elts.push_back(llvm::Type::getInt64Ty(*C));
+    return llvm::StructType::get(*C, elts);
+  }
+  if (str == "test_type5") {
+    assert(C);
+    llvm::SmallVector<llvm::Type *, 3> elts;
+    elts.push_back(llvm::ArrayType::get(llvm::Type::getDoubleTy(*C), 1));
+    elts.push_back(llvm::Type::getDoubleTy(*C));
+    elts.push_back(llvm::Type::getInt64Ty(*C));
+    return llvm::StructType::get(*C, elts);
+  }
+  if (str == "test_type6") {
+    assert(C);
+    llvm::SmallVector<llvm::Type *, 2> elts;
+    elts.push_back(
+        getPointerType(llvm::StructType::get(*C, {}), AddressSpace::Tracked));
+    elts.push_back(llvm::Type::getInt64Ty(*C));
+    return llvm::StructType::get(*C, elts);
+  }
+  size_t idx;
+  bool failed = str.consumeInteger(10, idx);
+  (void)failed;
+  assert(!failed);
+  return (llvm::Type *)idx;
+}
+
+static inline size_t convertRRootCountFromString(llvm::StringRef str) {
+  size_t idx;
+  bool failed = str.consumeInteger(10, idx);
+  (void)failed;
+  assert(!failed);
+  return idx;
+}
+
+static inline bool hasSRetRRootsOrUnionSRet(llvm::CallBase *CB) {
+  if (CB->hasStructRetAttr())
+    return true;
+  for (size_t i = 0; i < CB->arg_size(); i++) {
+    if (CB->getAttributeAtIndex(llvm::AttributeList::FirstArgIndex + i,
+                                "enzymejl_sret_union_bytes")
+            .isValid())
+      return true;
+    if (CB->getAttributeAtIndex(llvm::AttributeList::FirstArgIndex + i,
+                                "enzymejl_returnRoots")
+            .isValid())
+      return true;
+  }
+  return false;
+}
+
+enum class SRetRootMovement {
+  SRetPointerToRootPointer = 0,
+  SRetValueToRootPointer = 1,
+  RootPointerToSRetValue = 2,
+  RootPointerToSRetPointer = 3,
+  NullifySRetValue = 4,
+};
+
+llvm::Value *moveSRetToFromRoots(llvm::IRBuilder<> &B, llvm::Type *jltype,
+                                 llvm::Value *sret, llvm::Type *root_ty,
+                                 llvm::Value *rootRet, size_t rootOffset,
+                                 SRetRootMovement direction);
+
+void copyNonJLValueInto(llvm::IRBuilder<> &B, llvm::Type *curType,
+                        llvm::Type *dstType, llvm::Value *dst,
+                        llvm::ArrayRef<unsigned> dstPrefix, llvm::Type *srcType,
+                        llvm::Value *src, llvm::ArrayRef<unsigned> srcPrefix,
+                        bool shouldZero);
+
+static bool anyJuliaObjects(llvm::Type *T) {
+  if (isSpecialPtr(T))
+    return true;
+  if (auto ST = llvm::dyn_cast<llvm::StructType>(T)) {
+    for (auto elem : ST->elements()) {
+      if (anyJuliaObjects(elem))
+        return true;
+    }
+    return false;
+  }
+  if (auto AT = llvm::dyn_cast<llvm::ArrayType>(T)) {
+    return anyJuliaObjects(AT->getElementType());
+  }
+  if (auto VT = llvm::dyn_cast<llvm::VectorType>(T)) {
+    return anyJuliaObjects(VT->getElementType());
+  }
+  return false;
+}
+
+llvm::SmallVector<llvm::Value *, 1> getJuliaObjects(llvm::Value *v,
+                                                    llvm::IRBuilder<> &B);
+
+// Find all user instructions of AI, returning tuples of <instruction, value,
+// byte offet from AI> Unlike a simple get users, this will recurse through any
+// constant gep offsets and casts
+llvm::SmallVector<std::tuple<llvm::Instruction *, llvm::Value *, size_t>, 1>
+findAllUsersOf(llvm::Value *AI);
+
+static bool hasTerminator(llvm::BasicBlock *BB) {
+#if LLVM_VERSION_MAJOR >= 23
+  return BB->hasTerminator();
+#else
+  return BB->getTerminator();
+#endif
+}
+
+/// The value of the add recurrence AR at iteration It, like
+/// SCEVAddRecExpr::evaluateAtIteration, but without the widening that its
+/// BinomialCoefficient performs: LLVM computes I*(I-1)/2 in a type one bit
+/// wider than AR so that the halving is exact, and SCEVExpander then has to
+/// materialize a canonical induction variable of that wider type, a new
+/// loop-carried phi. Here the halving is done on whichever of I and I-1 is
+/// even, in the wider of AR's and It's own types, so that every product is of
+/// exact integers and no new type appears. Recurrences of degree at most
+/// three are handled this way; higher degrees fall back to LLVM's version.
+const llvm::SCEV *evaluateAtIterationWithoutExt(const llvm::SCEVAddRecExpr *AR,
+                                                const llvm::SCEV *It,
+                                                llvm::ScalarEvolution &SE);
 
 #endif // ENZYME_UTILS_H

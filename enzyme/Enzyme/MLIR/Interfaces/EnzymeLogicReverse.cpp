@@ -1,3 +1,4 @@
+#include "Analysis/DataFlowAliasAnalysis.h"
 #include "Dialect/Ops.h"
 #include "Interfaces/AutoDiffOpInterface.h"
 #include "Interfaces/AutoDiffTypeInterface.h"
@@ -30,8 +31,8 @@ void handleReturns(Block *oBB, Block *newBB, Block *reverseBB,
 
     OpBuilder forwardToBackwardBuilder(newBB, newBB->end());
 
-    Operation *newBranchOp = forwardToBackwardBuilder.create<cf::BranchOp>(
-        oBB->getTerminator()->getLoc(), reverseBB);
+    Operation *newBranchOp = cf::BranchOp::create(
+        forwardToBackwardBuilder, oBB->getTerminator()->getLoc(), reverseBB);
 
     gutils->originalToNewFnOps[oBB->getTerminator()] = newBranchOp;
   }
@@ -47,19 +48,6 @@ static bool isFullyInactive(Operation *op, MGradientUtils *gutils) {
          gutils->isConstantInstruction(op);
 }
 
-static Value packIntoStruct(ValueRange values, OpBuilder &builder,
-                            Location loc) {
-  SmallVector<Type> resultTypes =
-      llvm::map_to_vector(values, [](Value v) { return v.getType(); });
-  auto structType =
-      LLVM::LLVMStructType::getLiteral(builder.getContext(), resultTypes);
-  Value result = LLVM::PoisonOp::create(builder, loc, structType);
-  for (auto &&[i, v] : llvm::enumerate(values))
-    result = LLVM::InsertValueOp::create(builder, loc, result, v, i);
-
-  return result;
-}
-
 /*
 Create reverse mode adjoint for an operation.
 */
@@ -71,7 +59,8 @@ LogicalResult MEnzymeLogic::visitChild(Operation *op, OpBuilder &builder,
   if (auto ifaceOp = dyn_cast<ReverseAutoDiffOpInterface>(op)) {
     SmallVector<Value> caches = ifaceOp.cacheValues(gutils);
     OpBuilder augmentBuilder(gutils->getNewFromOriginal(op));
-    ifaceOp.createShadowValues(augmentBuilder, gutils);
+    if (failed(ifaceOp.createShadowValues(augmentBuilder, gutils)))
+      return failure();
     return ifaceOp.createReverseModeAdjoint(builder, gutils, caches);
   }
   op->emitError() << "could not compute the adjoint for this operation " << *op;
@@ -106,7 +95,7 @@ void MEnzymeLogic::handlePredecessors(
     Value cache = gutils->insertInit(gutils->getIndexCacheType());
 
     Value flag =
-        revBuilder.create<enzyme::PopOp>(loc, gutils->getIndexType(), cache);
+        enzyme::PopOp::create(revBuilder, loc, gutils->getIndexType(), cache);
 
     Block *defaultBlock = nullptr;
 
@@ -134,8 +123,8 @@ void MEnzymeLogic::handlePredecessors(
       OpBuilder predecessorBuilder(newPred->getTerminator());
 
       Value pred_idx_c =
-          predecessorBuilder.create<arith::ConstantIntOp>(loc, idx - 1, 32);
-      predecessorBuilder.create<enzyme::PushOp>(loc, cache, pred_idx_c);
+          arith::ConstantIntOp::create(predecessorBuilder, loc, idx - 1, 32);
+      enzyme::PushOp::create(predecessorBuilder, loc, cache, pred_idx_c);
 
       if (idx == 0) {
         defaultBlock = reversePred;
@@ -156,12 +145,13 @@ void MEnzymeLogic::handlePredecessors(
               if (diffes[idx]) {
 
                 Value rev_idx_c =
-                    revBuilder.create<arith::ConstantIntOp>(loc, idx - 1, 32);
+                    arith::ConstantIntOp::create(revBuilder, loc, idx - 1, 32);
 
-                auto to_prop = revBuilder.create<arith::SelectOp>(
-                    loc,
-                    revBuilder.create<arith::CmpIOp>(
-                        loc, arith::CmpIPredicate::eq, flag, rev_idx_c),
+                auto to_prop = arith::SelectOp::create(
+                    revBuilder, loc,
+                    arith::CmpIOp::create(revBuilder, loc,
+                                          arith::CmpIPredicate::eq, flag,
+                                          rev_idx_c),
                     diffes[idx],
                     cast<AutoDiffTypeInterface>(diffes[idx].getType())
                         .createNullValue(revBuilder, loc));
@@ -174,10 +164,9 @@ void MEnzymeLogic::handlePredecessors(
       }
     }
 
-    revBuilder.create<cf::SwitchOp>(
-        loc, flag, defaultBlock, ArrayRef<Value>(), ArrayRef<APInt>(indices),
-        ArrayRef<Block *>(blocks),
-        SmallVector<ValueRange>(indices.size(), ValueRange()));
+    cf::SwitchOp::create(revBuilder, loc, flag, defaultBlock, ArrayRef<Value>(),
+                         ArrayRef<APInt>(indices), ArrayRef<Block *>(blocks),
+                         SmallVector<ValueRange>(indices.size(), ValueRange()));
   }
 }
 
@@ -186,8 +175,6 @@ LogicalResult MEnzymeLogic::differentiate(
     llvm::function_ref<buildReturnFunction> buildFuncReturnOp,
     std::function<std::pair<Value, Value>(Type)> cacheCreator) {
   gutils->registerCacheCreatorHook(cacheCreator);
-  auto scope = llvm::make_scope_exit(
-      [&]() { gutils->deregisterCacheCreatorHook(cacheCreator); });
 
   gutils->createReverseModeBlocks(oldRegion, newRegion);
 
@@ -199,6 +186,8 @@ LogicalResult MEnzymeLogic::differentiate(
     valid &= visitChildren(&oBB, reverseBB, gutils).succeeded();
     handlePredecessors(&oBB, newBB, reverseBB, gutils, buildFuncReturnOp);
   }
+
+  gutils->deregisterCacheCreatorHook(cacheCreator);
   return success(valid);
 }
 
@@ -206,14 +195,16 @@ FunctionOpInterface MEnzymeLogic::CreateReverseDiff(
     FunctionOpInterface fn, std::vector<DIFFE_TYPE> retType,
     std::vector<DIFFE_TYPE> constants, MTypeAnalysis &TA,
     std::vector<bool> returnPrimals, std::vector<bool> returnShadows,
-    DerivativeMode mode, bool freeMemory, size_t width, mlir::Type addedType,
-    MFnTypeInfo type_args, std::vector<bool> volatile_args, void *augmented,
-    bool omp, llvm::StringRef postpasses, bool verifyPostPasses,
-    bool strongZero) {
+    DerivativeMode mode, bool freeMemory, bool atomicAdd, size_t width,
+    mlir::Type addedType, MFnTypeInfo type_args,
+    std::vector<bool> overwritten_args, void *augmented, bool omp,
+    llvm::StringRef postpasses, bool verifyPostPasses, bool strongZero,
+    bool markReadonly) {
 
   if (fn.getFunctionBody().empty()) {
-    llvm::errs() << fn << "\n";
-    llvm_unreachable("Differentiating empty function");
+    fn.emitError() << "cannot differentiate a function without a body: "
+                   << fn.getNameAttr() << "\n";
+    return nullptr;
   }
 
   MReverseCacheKey tup = {fn,
@@ -223,10 +214,11 @@ FunctionOpInterface MEnzymeLogic::CreateReverseDiff(
                           returnShadows,
                           mode,
                           freeMemory,
+                          atomicAdd,
                           static_cast<unsigned>(width),
                           addedType,
                           type_args,
-                          volatile_args,
+                          overwritten_args,
                           omp};
 
   {
@@ -242,6 +234,13 @@ FunctionOpInterface MEnzymeLogic::CreateReverseDiff(
       *this, mode, width, fn, TA, type_args, returnPrimalsP, returnShadowsP,
       retType, constants, addedType, omp, postpasses, verifyPostPasses,
       strongZero);
+  if (markReadonly) {
+    markReadOnlyLoads(gutils->oldFunc, [&](Operation *origOp) {
+      gutils->getNewFromOriginal(origOp)->setAttr(
+          "enzyme.readonly", UnitAttr::get(origOp->getContext()));
+    });
+  }
+  gutils->AtomicAdd = atomicAdd;
 
   ReverseCachedFunctions[tup] = gutils->newFunc;
 
@@ -263,16 +262,11 @@ FunctionOpInterface MEnzymeLogic::CreateReverseDiff(
     }
 
     Location loc = oBB->rbegin()->getLoc();
-    if (isa<LLVM::LLVMFuncOp>(fn)) {
-      if (retargs.size() > 1) {
-        Value packedReturns = packIntoStruct(retargs, builder, loc);
-        builder.create<LLVM::ReturnOp>(loc, packedReturns);
-      } else {
-        builder.create<LLVM::ReturnOp>(loc, retargs);
-      }
-    } else {
-      builder.create<func::ReturnOp>(loc, retargs);
-    }
+    if (auto iface = dyn_cast<enzyme::AutoDiffFunctionInterface>(*fn))
+      iface.createReturn(builder, loc, retargs);
+    else
+      fn->emitError() << "this function operation does not implement "
+                         "AutoDiffFunctionInterface";
     return;
   };
 

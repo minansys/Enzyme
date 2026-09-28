@@ -130,6 +130,10 @@ cl::opt<bool> EnzymePreopt("enzyme-preopt", cl::init(true), cl::Hidden,
 cl::opt<bool> EnzymeInline("enzyme-inline", cl::init(false), cl::Hidden,
                            cl::desc("Force inlining of autodiff"));
 
+cl::opt<int> EnzymePostInlineOpt("enzyme-post-inline-opt", cl::init(0),
+                                 cl::Hidden,
+                                 cl::desc("Force inlining of autodiff"));
+
 cl::opt<bool> EnzymeNoAlias("enzyme-noalias", cl::init(false), cl::Hidden,
                             cl::desc("Force noalias of autodiff"));
 #if LLVM_VERSION_MAJOR < 16
@@ -282,70 +286,14 @@ static inline bool OnlyUsedInOMP(AllocaInst *AI) {
   return true;
 }
 
-bool anyJuliaObjects(Type *T) {
-  if (isSpecialPtr(T))
-    return true;
-  if (auto ST = dyn_cast<StructType>(T)) {
-    for (auto elem : ST->elements()) {
-      if (anyJuliaObjects(elem))
-        return true;
-    }
-    return false;
-  }
-  if (auto AT = dyn_cast<ArrayType>(T)) {
-    return anyJuliaObjects(AT->getElementType());
-  }
-  if (auto VT = dyn_cast<VectorType>(T)) {
-    return anyJuliaObjects(VT->getElementType());
-  }
-  return false;
-}
-
-SmallVector<Value *, 1> getJuliaObjects(Value *v, IRBuilder<> &B) {
-  SmallVector<Value *, 1> todo = {v};
-  SmallVector<Value *, 1> done;
-  while (todo.size()) {
-    auto cur = todo.pop_back_val();
-    auto T = cur->getType();
-    if (!anyJuliaObjects(T)) {
-      continue;
-    }
-    if (isSpecialPtr(T)) {
-      done.push_back(cur);
-      continue;
-    }
-    if (auto ST = dyn_cast<StructType>(T)) {
-      for (auto en : llvm::enumerate(ST->elements())) {
-        if (anyJuliaObjects(en.value())) {
-          auto V2 = B.CreateExtractValue(cur, en.index());
-          todo.push_back(V2);
-        }
-      }
-      continue;
-    }
-    if (auto AT = dyn_cast<ArrayType>(T)) {
-      for (size_t i = 0; i < AT->getNumElements(); i++) {
-        todo.push_back(B.CreateExtractValue(cur, i));
-      }
-      continue;
-    }
-    if (auto VT = dyn_cast<VectorType>(T)) {
-      assert(!VT->getElementCount().isScalable());
-      size_t numElems = VT->getElementCount().getKnownMinValue();
-      for (size_t i = 0; i < numElems; i++) {
-        todo.push_back(B.CreateExtractElement(cur, i));
-      }
-      continue;
-    }
-    llvm_unreachable("unknown source of julia type");
-  }
-  return done;
-}
-
 void RecursivelyReplaceAddressSpace(
     SmallVector<std::tuple<Value *, Value *, Instruction *>, 1> &Todo,
     SmallVector<Instruction *, 1> &toErase, bool legal) {
   SmallVector<StoreInst *, 1> toPostCache;
+  // Since MTI may have both source and dest replaced, we keep a list of the
+  // ones being replaced to the current dst, src so we can still follow usage
+  // chain.
+  DenseMap<MemTransferInst *, std::pair<Value *, Value *>> MTIReplacements;
   while (Todo.size()) {
     auto cur = Todo.back();
     Todo.pop_back();
@@ -356,6 +304,7 @@ void RecursivelyReplaceAddressSpace(
       auto AS = cast<PointerType>(rep->getType())->getAddressSpace();
       if (AS == ASC->getDestAddressSpace()) {
         ASC->replaceAllUsesWith(rep);
+        assert(ASC);
         toErase.push_back(ASC);
         continue;
       }
@@ -366,6 +315,7 @@ void RecursivelyReplaceAddressSpace(
           Todo.push_back(
               std::make_tuple(rep, (Value *)ASC, cast<Instruction>(U)));
         }
+        assert(ASC);
         toErase.push_back(ASC);
         continue;
       }
@@ -378,21 +328,27 @@ void RecursivelyReplaceAddressSpace(
         continue;
       }
       IRBuilder<> B(CI);
-      auto nCI0 = B.CreateCast(
-          CI->getOpcode(), rep,
+      Type *resTy;
 #if LLVM_VERSION_MAJOR < 17
-          PointerType::get(CI->getType()->getPointerElementType(),
-                           cast<PointerType>(rep->getType())->getAddressSpace())
+      if (CI->getContext().supportsTypedPointers()) {
+        resTy = getPointerType(
+            CI->getType()->getPointerElementType(),
+            cast<PointerType>(rep->getType())->getAddressSpace());
+      } else {
+        resTy = rep->getType();
+      }
 #else
-          rep->getType()
+      resTy = rep->getType();
 #endif
-      );
+
+      auto nCI0 = B.CreateCast(CI->getOpcode(), rep, resTy);
       if (auto nCI = dyn_cast<CastInst>(nCI0))
         nCI->takeName(CI);
       for (auto U : CI->users()) {
         Todo.push_back(
             std::make_tuple((Value *)nCI0, (Value *)CI, cast<Instruction>(U)));
       }
+      assert(CI);
       toErase.push_back(CI);
       continue;
     }
@@ -400,14 +356,10 @@ void RecursivelyReplaceAddressSpace(
       IRBuilder<> B(GEP);
       if (EnzymeJuliaAddrLoad &&
           cast<PointerType>(rep->getType())->getAddressSpace() == 10) {
-        rep = B.CreateAddrSpaceCast(
-            rep,
-#if LLVM_VERSION_MAJOR < 17
-            PointerType::get(rep->getType()->getPointerElementType(), 11)
-#else
-            PointerType::get(rep->getContext(), 11)
-#endif
-        );
+
+        Type *resTy =
+            changePointerAddrSpace(cast<PointerType>(rep->getType()), 11);
+        rep = B.CreateAddrSpaceCast(rep, resTy);
       }
       SmallVector<Value *, 1> ind(GEP->indices());
       auto nGEP = cast<GetElementPtrInst>(
@@ -417,6 +369,7 @@ void RecursivelyReplaceAddressSpace(
         Todo.push_back(
             std::make_tuple((Value *)nGEP, (Value *)GEP, cast<Instruction>(U)));
       }
+      assert(GEP);
       toErase.push_back(GEP);
       continue;
     }
@@ -464,6 +417,7 @@ void RecursivelyReplaceAddressSpace(
           Todo.push_back(
               std::make_tuple((Value *)nP, (Value *)P, cast<Instruction>(U)));
         }
+        assert(P);
         toErase.push_back(P);
         for (int i = Todo.size() - 1; i >= 0; i--) {
           if (std::get<2>(Todo[i]) != P)
@@ -497,6 +451,7 @@ void RecursivelyReplaceAddressSpace(
           Todo.push_back(
               std::make_tuple((Value *)nII, (Value *)II, cast<Instruction>(U)));
         }
+        assert(II);
         toErase.push_back(II);
         continue;
       }
@@ -505,14 +460,9 @@ void RecursivelyReplaceAddressSpace(
       if (EnzymeJuliaAddrLoad &&
           cast<PointerType>(rep->getType())->getAddressSpace() == 10) {
         IRBuilder<> B(LI);
-        rep = B.CreateAddrSpaceCast(
-            rep,
-#if LLVM_VERSION_MAJOR < 17
-            PointerType::get(rep->getType()->getPointerElementType(), 11)
-#else
-            PointerType::get(rep->getContext(), 11)
-#endif
-        );
+        Type *resTy =
+            changePointerAddrSpace(cast<PointerType>(rep->getType()), 11);
+        rep = B.CreateAddrSpaceCast(rep, resTy);
       }
       LI->setOperand(0, rep);
       continue;
@@ -522,14 +472,9 @@ void RecursivelyReplaceAddressSpace(
         if (EnzymeJuliaAddrLoad &&
             cast<PointerType>(rep->getType())->getAddressSpace() == 10) {
           IRBuilder<> B(SI);
-          rep = B.CreateAddrSpaceCast(
-              rep,
-#if LLVM_VERSION_MAJOR < 17
-              PointerType::get(rep->getType()->getPointerElementType(), 11)
-#else
-              PointerType::get(rep->getContext(), 11)
-#endif
-          );
+          Type *resTy =
+              changePointerAddrSpace(cast<PointerType>(rep->getType()), 11);
+          rep = B.CreateAddrSpaceCast(rep, resTy);
         }
         SI->setOperand(1, rep);
         if (EnzymeJuliaAddrLoad &&
@@ -540,8 +485,9 @@ void RecursivelyReplaceAddressSpace(
           auto subvals = getJuliaObjects(SI->getValueOperand(), B);
           if (subvals.size()) {
             auto JLT =
-                PointerType::get(StructType::get(SI->getContext(), {}), 10);
-            auto FT = FunctionType::get(JLT, {}, true);
+                getPointerType(StructType::get(SI->getContext(), {}), 10);
+            auto FT = FunctionType::get(Type::getVoidTy(rep->getContext()),
+                                        {JLT}, true);
             auto wb = B.GetInsertBlock()
                           ->getParent()
                           ->getParent()
@@ -575,40 +521,35 @@ void RecursivelyReplaceAddressSpace(
           nargs));
       nMS->copyMetadata(*MS);
       nMS->setAttributes(MS->getAttributes());
+      assert(MS);
       toErase.push_back(MS);
       continue;
     }
     if (auto MTI = dyn_cast<MemTransferInst>(inst)) {
-      IRBuilder<> B(MTI);
+      auto &dstsrc = MTIReplacements[MTI];
+      if (!dstsrc.first) {
+        dstsrc.first = MTI->getArgOperand(0);
+      }
+      if (!dstsrc.second) {
+        dstsrc.second = MTI->getArgOperand(1);
+      }
 
-      Value *nargs[4] = {MTI->getArgOperand(0), MTI->getArgOperand(1),
-                         MTI->getArgOperand(2), MTI->getArgOperand(3)};
+      if (MTI->getArgOperand(0) == prev)
+        dstsrc.first = rep;
 
-      if (nargs[0] == prev)
-        nargs[0] = rep;
-
-      if (nargs[1] == prev)
-        nargs[1] = rep;
-
-      Type *tys[] = {nargs[0]->getType(), nargs[1]->getType(),
-                     nargs[2]->getType()};
-
-      auto nMTI = cast<CallInst>(B.CreateCall(
-          getIntrinsicDeclaration(MTI->getParent()->getParent()->getParent(),
-                                  MTI->getIntrinsicID(), tys),
-          nargs));
-      nMTI->copyMetadata(*MTI);
-      nMTI->setAttributes(MTI->getAttributes());
-      toErase.push_back(MTI);
+      if (MTI->getArgOperand(1) == prev)
+        dstsrc.second = rep;
       continue;
     }
     if (auto CI = dyn_cast<CallInst>(inst)) {
       if (auto F = CI->getCalledFunction()) {
         if (F->getName() == "julia.write_barrier" && legal) {
+          assert(CI);
           toErase.push_back(CI);
           continue;
         }
         if (F->getName() == "julia.write_barrier_binding" && legal) {
+          assert(CI);
           toErase.push_back(CI);
           continue;
         }
@@ -633,13 +574,68 @@ void RecursivelyReplaceAddressSpace(
         continue;
       }
     }
-    if (auto I = dyn_cast<Instruction>(inst))
-      llvm::errs() << *I->getParent()->getParent() << "\n";
-    llvm::errs() << " inst: " << *inst << "\n";
+    if (auto cmp = dyn_cast<CmpInst>(inst)) {
+      IRBuilder<> B(cmp);
+      Value *op0 = cmp->getOperand(0);
+      Value *op1 = cmp->getOperand(1);
+      if (op0 == prev && isa<Constant>(op1)) {
+        cmp->setOperand(0, rep);
+        cmp->setOperand(1, B.CreateAddrSpaceCast(op1, rep->getType()));
+      } else if (op1 == prev && isa<Constant>(op0)) {
+        cmp->setOperand(0, B.CreateAddrSpaceCast(op0, rep->getType()));
+        cmp->setOperand(1, rep);
+      } else {
+        auto Addr = B.CreateAddrSpaceCast(rep, prev->getType());
+        for (size_t i = 0; i < cmp->getNumOperands(); i++) {
+          if (cmp->getOperand(i) == prev) {
+            cmp->setOperand(i, Addr);
+          }
+        }
+      }
+      continue;
+    }
+
+    std::string s;
+    llvm::raw_string_ostream ss(s);
+    ss << "Illegal address space propagation\n";
+    ss << " + rep: " << *rep << "\n";
+    ss << " + prev: " << *prev << "\n";
+    ss << " + inst: " << *inst << "\n";
+
+    if (CustomErrorHandler) {
+      CustomErrorHandler(s.c_str(), wrap(inst), ErrorType::InternalError,
+                         nullptr, nullptr, nullptr);
+    } else {
+      auto instI = cast<Instruction>(inst);
+      ss << *instI->getParent()->getParent() << "\n";
+      EmitFailure("IllegalAddressSpacePropagation", instI->getDebugLoc(), instI,
+                  ss.str());
+    }
     llvm_unreachable("Illegal address space propagation");
   }
 
+  for (auto MTIPair : MTIReplacements) {
+    auto MTI = MTIPair.first;
+    auto dst = MTIPair.second.first;
+    auto src = MTIPair.second.second;
+
+    Value *nargs[] = {dst, src, MTI->getArgOperand(2), MTI->getArgOperand(3)};
+
+    Type *tys[] = {dst->getType(), src->getType(), nargs[2]->getType()};
+
+    IRBuilder<> B(MTI);
+    auto nMTI = cast<CallInst>(B.CreateCall(
+        getIntrinsicDeclaration(MTI->getParent()->getParent()->getParent(),
+                                MTI->getIntrinsicID(), tys),
+        nargs));
+    nMTI->copyMetadata(*MTI);
+    nMTI->setAttributes(MTI->getAttributes());
+    assert(MTI);
+    MTI->eraseFromParent();
+  }
+
   for (auto I : llvm::reverse(toErase)) {
+    assert(I);
     I->eraseFromParent();
   }
   for (auto SI : toPostCache) {
@@ -655,8 +651,10 @@ void RecursivelyReplaceAddressSpace(Value *AI, Value *rep, bool legal) {
         std::make_tuple((Value *)rep, (Value *)AI, cast<Instruction>(U)));
   }
   SmallVector<Instruction *, 1> toErase;
-  if (auto I = dyn_cast<Instruction>(AI))
+  if (auto I = dyn_cast<Instruction>(AI)) {
+    assert(I);
     toErase.push_back(I);
+  }
   RecursivelyReplaceAddressSpace(Todo, toErase, legal);
 }
 
@@ -763,11 +761,17 @@ UpgradeAllocasToMallocs(Function *NewF, DerivativeMode mode,
     CI->setMetadata(
         "enzyme_fromstack",
         MDNode::get(CI->getContext(),
-                    {ConstantAsMetadata::get(ConstantInt::get(
-                        IntegerType::get(AI->getContext(), 64), align))}));
+                    {
+                        ConstantAsMetadata::get(ConstantInt::get(
+                            IntegerType::get(AI->getContext(), 64), align)),
+                        ConstantAsMetadata::get(ConstantInt::get(
+                            IntegerType::get(AI->getContext(), 64),
+                            (size_t)AI->getAllocatedType())),
+                    }));
 
     for (auto MD : {"enzyme_active", "enzyme_inactive", "enzyme_type",
-                    "enzymejl_allocart", "enzymejl_allocart_name"})
+                    "enzymejl_allocart", "enzymejl_allocart_name",
+                    "enzymejl_gc_alloc_rt"})
       if (auto M = AI->getMetadata(MD))
         CI->setMetadata(MD, M);
 
@@ -787,8 +791,10 @@ UpgradeAllocasToMallocs(Function *NewF, DerivativeMode mode,
         Todo.push_back(
             std::make_tuple((Value *)rep, (Value *)AI, cast<Instruction>(U)));
       }
-      if (auto I = dyn_cast<Instruction>(AI))
+      if (auto I = dyn_cast<Instruction>(AI)) {
+        assert(I);
         toErase.push_back(I);
+      }
     } else {
       assert(rep->getType() == AI->getType());
       AI->replaceAllUsesWith(rep);
@@ -1069,34 +1075,45 @@ void simplifyExtractions(Function *NewF) {
 
 void PreProcessCache::LowerAllocAddr(Function *NewF) {
   simplifyExtractions(NewF);
-  SmallVector<Instruction *, 1> Todo;
+  SmallVector<Instruction *, 1> InitialTodo;
   for (auto &BB : *NewF) {
     for (auto &I : BB) {
       if (hasMetadata(&I, "enzyme_backstack")) {
-        Todo.push_back(&I);
+        InitialTodo.push_back(&I);
         // TODO
         // I.eraseMetadata("enzyme_backstack");
       }
     }
   }
-  for (auto T : Todo) {
+  SmallVector<std::tuple<Value *, Value *, Instruction *>, 1> Todo;
+  SmallVector<Instruction *, 1> toErase;
+  for (auto T : InitialTodo) {
     auto T0 = T->getOperand(0);
     if (auto CI = dyn_cast<BitCastInst>(T0))
       T0 = CI->getOperand(0);
     auto AI = cast<AllocaInst>(T0);
     llvm::Value *AIV = AI;
 #if LLVM_VERSION_MAJOR < 17
-    if (AIV->getType()->getPointerElementType() !=
-        T->getType()->getPointerElementType()) {
+    if (AIV->getContext().supportsTypedPointers() &&
+        AIV->getType()->getPointerElementType() !=
+            T->getType()->getPointerElementType()) {
       IRBuilder<> B(AI->getNextNode());
       AIV = B.CreateBitCast(
-          AIV, PointerType::get(
-                   T->getType()->getPointerElementType(),
-                   cast<PointerType>(AI->getType())->getAddressSpace()));
+          AIV,
+          getPointerType(T->getType()->getPointerElementType(),
+                         cast<PointerType>(AI->getType())->getAddressSpace()));
     }
 #endif
-    RecursivelyReplaceAddressSpace(T, AIV, /*legal*/ true);
+    for (auto U : T->users()) {
+      Todo.push_back(
+          std::make_tuple((Value *)AIV, (Value *)T, cast<Instruction>(U)));
+    }
+    if (auto I = dyn_cast<Instruction>(T)) {
+      assert(I);
+      toErase.push_back(I);
+    }
   }
+  RecursivelyReplaceAddressSpace(Todo, toErase, /*legal*/ true);
 
 #if LLVM_VERSION_MAJOR >= 22
   {
@@ -1259,8 +1276,12 @@ Function *CreateMPIWrapper(Function *F) {
   std::string name = ("enzyme_wrapmpi$$" + F->getName() + "#").str();
   if (auto W = F->getParent()->getFunction(name))
     return W;
-  Type *types = {F->getFunctionType()->getParamType(0)};
-  auto FT = FunctionType::get(F->getReturnType(), types, false);
+
+  // MPI_Comm_rank(MPI_Comm comm, int *rank)
+  // MPI_Comm_size(MPI_Comm comm, int *size)
+  Type *ReturnType = Type::getInt32Ty(F->getContext());
+  Type *types = {F->getFunctionType()->getParamType(0)}; // MPI_Comm
+  auto FT = FunctionType::get(ReturnType, types, false);
   Function *W = Function::Create(FT, GlobalVariable::InternalLinkage, name,
                                  F->getParent());
   llvm::Attribute::AttrKind attrs[] = {
@@ -1288,7 +1309,7 @@ Function *CreateMPIWrapper(Function *F) {
   W->addFnAttr(Attribute::get(F->getContext(), "enzyme_inactive"));
   BasicBlock *entry = BasicBlock::Create(W->getContext(), "entry", W);
   IRBuilder<> B(entry);
-  auto alloc = B.CreateAlloca(F->getReturnType());
+  auto alloc = B.CreateAlloca(ReturnType);
   Value *args[] = {W->arg_begin(), alloc};
 
   auto T = F->getFunctionType()->getParamType(1);
@@ -1297,7 +1318,7 @@ Function *CreateMPIWrapper(Function *F) {
     args[1] = B.CreatePtrToInt(args[1], T);
   }
   B.CreateCall(F, args);
-  B.CreateRet(B.CreateLoad(F->getReturnType(), alloc));
+  B.CreateRet(B.CreateLoad(ReturnType, alloc));
   return W;
 }
 
@@ -1311,16 +1332,15 @@ static void SimplifyMPIQueries(Function &NewF, FunctionAnalysisManager &FAM) {
         Function *Fn = CI->getCalledFunction();
         if (Fn == nullptr)
           continue;
-        if (Fn->getName() == "MPI_Comm_rank" ||
-            Fn->getName() == "PMPI_Comm_rank" ||
-            Fn->getName() == "MPI_Comm_size" ||
-            Fn->getName() == "PMPI_Comm_size") {
+        auto name = getFuncName(Fn);
+        if (name == "MPI_Comm_rank" || name == "PMPI_Comm_rank" ||
+            name == "MPI_Comm_size" || name == "PMPI_Comm_size") {
           Todo.push_back(CI);
         }
-        if (Fn->getName() == "__kmpc_for_static_init_4" ||
-            Fn->getName() == "__kmpc_for_static_init_4u" ||
-            Fn->getName() == "__kmpc_for_static_init_8" ||
-            Fn->getName() == "__kmpc_for_static_init_8u") {
+        if (name == "__kmpc_for_static_init_4" ||
+            name == "__kmpc_for_static_init_4u" ||
+            name == "__kmpc_for_static_init_8" ||
+            name == "__kmpc_for_static_init_8u") {
           OMPBounds.push_back(CI);
         }
       }
@@ -1360,13 +1380,12 @@ static void SimplifyMPIQueries(Function &NewF, FunctionAnalysisManager &FAM) {
         if (PT->getPointerElementType() != res->getType())
           storePointer = B.CreateBitCast(
               storePointer,
-              PointerType::get(res->getType(), PT->getAddressSpace()));
+              getPointerType(res->getType(), PT->getAddressSpace()));
       }
 #endif
     } else {
       assert(isa<IntegerType>(storePointer->getType()));
-      storePointer = B.CreateIntToPtr(storePointer,
-                                      PointerType::getUnqual(res->getType()));
+      storePointer = B.CreateIntToPtr(storePointer, getUnqual(res->getType()));
     }
     if (isa<AllocaInst>(storePointer)) {
       // If this is only loaded from, immedaitely replace
@@ -1389,7 +1408,7 @@ static void SimplifyMPIQueries(Function &NewF, FunctionAnalysisManager &FAM) {
       }
     }
     if (auto II = dyn_cast<InvokeInst>(res)) {
-      B.SetInsertPoint(II->getNormalDest()->getFirstNonPHI());
+      B.SetInsertPoint(getFirstNonPHI(II->getNormalDest()));
     } else {
       B.SetInsertPoint(res->getNextNode());
     }
@@ -1405,7 +1424,7 @@ static void SimplifyMPIQueries(Function &NewF, FunctionAnalysisManager &FAM) {
       B.CreateStore(B.CreateLoad(AI->getAllocatedType(), AI), AI2);
       Bound->setArgOperand(i, AI2);
       if (auto II = dyn_cast<InvokeInst>(Bound)) {
-        B.SetInsertPoint(II->getNormalDest()->getFirstNonPHI());
+        B.SetInsertPoint(getFirstNonPHI(II->getNormalDest()));
       } else {
         B.SetInsertPoint(Bound->getNextNode());
       }
@@ -1478,7 +1497,7 @@ void CanonicalizeLoops(Function *F, FunctionAnalysisManager &FAM) {
     PHINode *CanonicalIV = pair.first;
     assert(CanonicalIV);
     RemoveRedundantIVs(
-        L->getHeader(), CanonicalIV, pair.second, SE,
+        L, CanonicalIV, pair.second, SE,
         [&](Instruction *I, Value *V) { I->replaceAllUsesWith(V); },
         [&](Instruction *I) { I->eraseFromParent(); });
   }
@@ -1655,11 +1674,11 @@ void SplitPHIs(llvm::Function &F) {
         todo.insert(nPhi);
       } else {
         auto cur3 = cast<SelectInst>(cur);
-        auto rep = B.CreateSelect(
-            cur3->getCondition(),
-            GradientUtils::extractMeta(B, cur3->getTrueValue(), i),
-            GradientUtils::extractMeta(B, cur3->getFalseValue(), i),
-            cur->getName() + ".extract." + std::to_string(i));
+        auto falseV = GradientUtils::extractMeta(B, cur3->getFalseValue(), i);
+        auto trueV = GradientUtils::extractMeta(B, cur3->getTrueValue(), i);
+        auto rep =
+            B.CreateSelect(cur3->getCondition(), trueV, falseV,
+                           cur->getName() + ".extract." + std::to_string(i));
         replacements.push_back(rep);
         if (auto sel = dyn_cast<SelectInst>(rep))
           todo.insert(sel);
@@ -1676,6 +1695,272 @@ void SplitPHIs(llvm::Function &F) {
       user->eraseFromParent();
     }
     cur->eraseFromParent();
+  }
+}
+
+// returns if newly changed, subject to the pending calls
+bool DetectPointerArgOfFn(llvm::Function &F,
+                          SmallPtrSetImpl<Function *> &calls_todo) {
+  if (F.empty())
+    return false;
+  bool changed = false;
+  for (auto &arg : F.args()) {
+    if (!arg.getType()->isPointerTy())
+      continue;
+    // Store list of values we need to check
+    std::deque<Value *> todo = {&arg};
+    SmallPtrSet<Value *, 1> seen;
+
+    bool captured = false;
+    bool read = false;
+    bool written = false;
+
+    AttributeList Attrs = arg.getParent()->getAttributes();
+
+    // We have already hit the max state.
+
+    if (Attrs.hasParamAttr(arg.getArgNo(), Attribute::ReadNone) &&
+        arg.hasNoCaptureAttr())
+      continue;
+
+    while (!todo.empty()) {
+      auto cur = todo.back();
+      todo.pop_back();
+      if (seen.contains(cur))
+        continue;
+      seen.insert(cur);
+      for (auto &U : cur->uses()) {
+        auto I = cast<Instruction>(U.getUser());
+        if (isPointerArithmeticInst(I)) {
+          todo.push_back(I);
+          continue;
+        }
+        if (isa<LoadInst>(I)) {
+          read = true;
+          continue;
+        }
+        if (auto SI = dyn_cast<StoreInst>(I)) {
+          if (SI->getValueOperand() == cur) {
+            captured = true;
+            read = true;
+            written = true;
+            break;
+          }
+          if (SI->getPointerOperand() == cur) {
+            written = true;
+            continue;
+          }
+        }
+        if (auto MSI = dyn_cast<MemSetInst>(I)) {
+          if (MSI->getRawDest() == cur) {
+            written = true;
+          }
+          continue;
+        }
+        if (auto MTI = dyn_cast<MemTransferInst>(I)) {
+          if (MTI->getRawDest() == cur) {
+            written = true;
+          }
+          if (MTI->getRawSource() == cur) {
+            read = true;
+          }
+          continue;
+        }
+        if (auto CB = dyn_cast<CallBase>(I)) {
+
+          if (CB->getCalledOperand() == cur) {
+            captured = true;
+            read = true;
+            written = true;
+            break;
+          }
+
+          auto F2 = dyn_cast<Function>(CB->getCalledOperand());
+
+          if (F2 == &F && U.getOperandNo() == arg.getArgNo()) {
+            continue;
+          }
+
+          auto name = getFuncNameFromCall(CB);
+
+          if (name == "julia.write_barrier") {
+            continue;
+          }
+
+          // Used as operand bundle
+          if (U.getOperandNo() >= CB->arg_size()) {
+            captured = true;
+            read = true;
+            written = true;
+            break;
+          }
+
+          if (!isNoCapture(CB, U.getOperandNo()) && !arg.hasNoCaptureAttr()) {
+            captured = true;
+            if (F2)
+              calls_todo.insert(F2);
+          }
+
+          if (!isReadOnly(CB, U.getOperandNo()) &&
+              !Attrs.hasParamAttr(arg.getArgNo(), Attribute::ReadNone) &&
+              !Attrs.hasParamAttr(arg.getArgNo(), Attribute::ReadOnly)) {
+            written = true;
+            if (F2)
+              calls_todo.insert(F2);
+          }
+
+          if (!isWriteOnly(CB, U.getOperandNo()) &&
+              !Attrs.hasParamAttr(arg.getArgNo(), Attribute::ReadNone) &&
+              !Attrs.hasParamAttr(arg.getArgNo(), Attribute::WriteOnly)) {
+            read = true;
+            if (F2)
+              calls_todo.insert(F2);
+          }
+          continue;
+        }
+
+        captured = true;
+        read = true;
+        written = true;
+        break;
+      }
+    }
+
+    if (!captured && !arg.hasNoCaptureAttr()) {
+      addFunctionNoCapture(arg.getParent(), arg.getArgNo());
+      changed = true;
+    }
+
+    if ((!read && !written) ||
+        Attrs.hasParamAttr(arg.getArgNo(), Attribute::ReadNone)) {
+      if (!Attrs.hasParamAttr(arg.getArgNo(), Attribute::ReadNone)) {
+        if (Attrs.hasParamAttr(arg.getArgNo(), Attribute::ReadOnly)) {
+          arg.removeAttr(Attribute::ReadOnly);
+        }
+        if (Attrs.hasParamAttr(arg.getArgNo(), Attribute::WriteOnly)) {
+          arg.removeAttr(Attribute::WriteOnly);
+        }
+#if LLVM_VERSION_MAJOR >= 18
+        if (Attrs.hasParamAttr(arg.getArgNo(), Attribute::Writable)) {
+          arg.removeAttr(Attribute::Writable);
+        }
+#endif
+        arg.addAttr(Attribute::ReadNone);
+        changed = true;
+      }
+    } else if (!written) {
+      if (!Attrs.hasParamAttr(arg.getArgNo(), Attribute::ReadOnly)) {
+        arg.addAttr(Attribute::ReadOnly);
+        changed = true;
+      }
+#if LLVM_VERSION_MAJOR >= 18
+      if (Attrs.hasParamAttr(arg.getArgNo(), Attribute::Writable)) {
+        arg.removeAttr(Attribute::Writable);
+      }
+#endif
+    } else if (!read) {
+      if (!Attrs.hasParamAttr(arg.getArgNo(), Attribute::WriteOnly)) {
+        arg.addAttr(Attribute::WriteOnly);
+        changed = true;
+      }
+    }
+  }
+  return changed;
+}
+
+// returns if newly changed, subject to the pending calls
+bool DetectNoUnwindOfFn(llvm::Function &F,
+                        SmallPtrSetImpl<Function *> &calls_todo) {
+  if (F.empty())
+    return false;
+  if (F.doesNotThrow())
+    return false;
+
+  bool mayThrow = false;
+
+  for (auto &BB : F) {
+    for (auto &I : BB) {
+#if LLVM_VERSION_MAJOR >= 17
+      if (!I.mayThrow(/*IncludePhaseOneUnwind*/ true)) {
+        continue;
+      }
+#else
+      if (!I.mayThrow()) {
+        continue;
+      }
+#endif
+      if (auto CB = dyn_cast<CallBase>(&I)) {
+        if (auto F2 = CB->getCalledFunction()) {
+          if (F2 == &F)
+            continue;
+          if (F2->doesNotThrow())
+            continue;
+          calls_todo.insert(F2);
+        }
+      }
+      mayThrow = true;
+      break;
+    }
+  }
+  if (mayThrow)
+    return false;
+  F.setDoesNotThrow();
+  return true;
+}
+
+// Restate what `enzyme_ReadOnlyOrThrow` / `enzyme_LocalReadOnlyOrThrow` mean in
+// attributes LLVM's alias analysis understands: the function reads any memory,
+// writes only inaccessible memory (the exception it may allocate, GC
+// bookkeeping) and, for the local variant, its `sret`-like arguments; every
+// other pointer argument is `readonly`. Effects a location already had are
+// kept when they are tighter. The derivative of a function marked here does
+// not inherit them: `CloneFunctionWithReturns` builds it afresh and only
+// copies `readonly` onto the primal arguments, which the derivative reads.
+//
+// This is only valid with Julia's setjmp/longjmp exceptions: the analysis
+// permits writes on paths that throw, and there such a write is only
+// observable after control re-enters through a `returns_twice` call, which
+// LLVM already treats as clobbering all memory. With `invoke`/landingpad
+// exception handling the landing pad succeeds the throwing call itself, so
+// the attributes would be wrong.
+static void addReadOnlyOrThrowAttributes(llvm::Function &F, bool local) {
+  if (!EnzymeJuliaAddrLoad)
+    return;
+#if LLVM_VERSION_MAJOR >= 16
+  MemoryEffects derived =
+      MemoryEffects::readOnly() |
+      MemoryEffects::inaccessibleMemOnly(ModRefInfo::ModRef);
+  if (local)
+    derived |= MemoryEffects::argMemOnly(ModRefInfo::ModRef);
+  F.setMemoryEffects(F.getMemoryEffects() & derived);
+#endif
+  // Before LLVM 16 there is no attribute for "reads anything, writes only
+  // inaccessible memory": `readonly` would also let an unused `nounwind` call
+  // be deleted, so only the parameters are annotated there.
+  for (auto &arg : F.args()) {
+    if (!arg.getType()->isPointerTy())
+      continue;
+    if (local) {
+      if (arg.hasStructRetAttr() ||
+          F.getAttribute(arg.getArgNo() + AttributeList::FirstArgIndex,
+                         "enzymejl_returnRoots")
+              .isValid() ||
+          F.getAttribute(arg.getArgNo() + AttributeList::FirstArgIndex,
+                         "enzymejl_sret_union_bytes")
+              .isValid())
+        continue;
+    }
+    unsigned argno = arg.getArgNo();
+    if (F.hasParamAttribute(argno, Attribute::ReadNone) ||
+        F.hasParamAttribute(argno, Attribute::ReadOnly))
+      continue;
+    // Never written by us and never read per the existing attribute.
+    if (F.hasParamAttribute(argno, Attribute::WriteOnly)) {
+      F.removeParamAttr(argno, Attribute::WriteOnly);
+      F.addParamAttr(argno, Attribute::ReadNone);
+      continue;
+    }
+    F.addParamAttr(argno, Attribute::ReadOnly);
   }
 }
 
@@ -1721,6 +2006,10 @@ bool DetectReadonlyOrThrowFn(llvm::Function &F,
               arg->getParent()
                   ->getAttribute(arg->getArgNo() + AttributeList::FirstArgIndex,
                                  "enzymejl_returnRoots")
+                  .isValid() ||
+              arg->getParent()
+                  ->getAttribute(arg->getArgNo() + AttributeList::FirstArgIndex,
+                                 "enzymejl_sret_union_bytes")
                   .isValid()) {
             local = true;
             continue;
@@ -1748,6 +2037,10 @@ bool DetectReadonlyOrThrowFn(llvm::Function &F,
               arg->getParent()
                   ->getAttribute(arg->getArgNo() + AttributeList::FirstArgIndex,
                                  "enzymejl_returnRoots")
+                  .isValid() ||
+              arg->getParent()
+                  ->getAttribute(arg->getArgNo() + AttributeList::FirstArgIndex,
+                                 "enzymejl_sret_union_bytes")
                   .isValid()) {
             local = true;
             continue;
@@ -1757,12 +2050,79 @@ bool DetectReadonlyOrThrowFn(llvm::Function &F,
 
       if (auto CI = dyn_cast<CallBase>(&I)) {
         if (isLocalReadOnlyOrThrow(CI)) {
+          // A local read-only-or-throw callee may still write through its
+          // sret-like arguments, and those writes land in memory of ours.
+          // Classify them as we would a store of our own: memory local to us
+          // is fine, our own sret-like argument makes us local too (e.g. an
+          // sret passed straight through to the callee after call-slot
+          // optimization), and anything else disqualifies us.
+          if (!isReadOnlyOrThrow(CI)) {
+            auto Callee = CI->getCalledFunction();
+#if LLVM_VERSION_MAJOR >= 14
+            size_t nargs = CI->arg_size();
+#else
+            size_t nargs = CI->getNumArgOperands();
+#endif
+            for (size_t i = 0; i < nargs; i++) {
+              Value *arg = CI->getArgOperand(i);
+              if (!arg->getType()->isPointerTy())
+                continue;
+              bool sretLike = CI->paramHasAttr(i, Attribute::StructRet);
+              if (!sretLike && Callee && i < Callee->arg_size()) {
+                sretLike = Callee
+                               ->getAttribute(i + AttributeList::FirstArgIndex,
+                                              "enzymejl_returnRoots")
+                               .isValid() ||
+                           Callee
+                               ->getAttribute(i + AttributeList::FirstArgIndex,
+                                              "enzymejl_sret_union_bytes")
+                               .isValid();
+              }
+              if (!sretLike)
+                continue;
+              auto Obj = getBaseObject(arg);
+              if (isa<AllocaInst>(Obj))
+                continue;
+              if (isAllocationCall(Obj, TLI)) {
+                if (local)
+                  continue;
+                if (notCaptured(Obj))
+                  continue;
+                local = true;
+                continue;
+              }
+              if (auto A = dyn_cast<Argument>(Obj)) {
+                if (A->hasStructRetAttr() ||
+                    A->getParent()
+                        ->getAttribute(A->getArgNo() +
+                                           AttributeList::FirstArgIndex,
+                                       "enzymejl_returnRoots")
+                        .isValid() ||
+                    A->getParent()
+                        ->getAttribute(A->getArgNo() +
+                                           AttributeList::FirstArgIndex,
+                                       "enzymejl_sret_union_bytes")
+                        .isValid()) {
+                  local = true;
+                  continue;
+                }
+              }
+              if (EnzymePrintPerf) {
+                EmitWarning("WritingInstruction", I,
+                            "Instruction could write forcing ", F.getName(),
+                            " to not be marked readonly_or_throw per "
+                            "argument ",
+                            i, " of local read-only-or-throw call ", I);
+              }
+              return false;
+            }
+          }
           continue;
         }
         if (isAllocationCall(CI, TLI)) {
           continue;
         }
-        if (getFuncNameFromCall(CI) == "zeroType") {
+        if (getFuncNameFromCall(CI) == "enzyme_zerotype") {
           auto Obj = getBaseObject(CI->getArgOperand(0));
           // Storing into local memory is fine since it definitionally will not
           // be seen outside the function. Note, even if one stored into x =
@@ -1784,6 +2144,11 @@ bool DetectReadonlyOrThrowFn(llvm::Function &F,
                     ->getAttribute(arg->getArgNo() +
                                        AttributeList::FirstArgIndex,
                                    "enzymejl_returnRoots")
+                    .isValid() ||
+                arg->getParent()
+                    ->getAttribute(arg->getArgNo() +
+                                       AttributeList::FirstArgIndex,
+                                   "enzymejl_sret_union_bytes")
                     .isValid()) {
               local = true;
               continue;
@@ -1835,6 +2200,10 @@ bool DetectReadonlyOrThrowFn(llvm::Function &F,
               arg->getParent()
                   ->getAttribute(arg->getArgNo() + AttributeList::FirstArgIndex,
                                  "enzymejl_returnRoots")
+                  .isValid() ||
+              arg->getParent()
+                  ->getAttribute(arg->getArgNo() + AttributeList::FirstArgIndex,
+                                 "enzymejl_sret_union_bytes")
                   .isValid()) {
             local = true;
             continue;
@@ -1866,10 +2235,12 @@ bool DetectReadonlyOrThrowFn(llvm::Function &F,
   }
 
   if (calls_todo.size() == 0) {
-    if (local)
+    if (local) {
       F.addFnAttr("enzyme_LocalReadOnlyOrThrow");
-    else
+    } else {
       F.addFnAttr("enzyme_ReadOnlyOrThrow");
+    }
+    addReadOnlyOrThrowAttributes(F, local);
   }
   return true;
 }
@@ -1877,6 +2248,98 @@ bool DetectReadonlyOrThrowFn(llvm::Function &F,
 bool DetectReadonlyOrThrow(Module &M) {
 
   bool changed = false;
+
+  {
+    // Set of functions newly deduced readonly/nocapture/etc by this pass
+    SmallVector<llvm::Function *> todo;
+
+    // Map of functions which could be readonly if all functions in the set are
+    // marked readonly
+    DenseMap<llvm::Function *, SmallPtrSet<Function *, 1>> todo_map;
+
+    for (Function &F : M) {
+      SmallPtrSet<Function *, 1> calls_todo;
+      if (DetectNoUnwindOfFn(F, calls_todo)) {
+        changed = true;
+        for (auto F2 : todo_map[&F]) {
+          todo.push_back(F2);
+        }
+        todo_map.erase(&F);
+      }
+      for (auto tocheck : calls_todo) {
+        todo_map[tocheck].insert(&F);
+        todo.push_back(tocheck);
+      }
+    }
+
+    while (!todo.empty()) {
+      auto cur = todo.pop_back_val();
+
+      SmallPtrSet<Function *, 1> calls_todo;
+
+      if (!DetectNoUnwindOfFn(*cur, calls_todo))
+        continue;
+
+      for (auto F2 : todo_map[cur]) {
+        todo.push_back(F2);
+      }
+
+      todo_map.erase(cur);
+
+      for (auto tocheck : calls_todo) {
+        todo_map[tocheck].insert(cur);
+        todo.push_back(tocheck);
+      }
+
+      changed = true;
+    }
+  }
+
+  {
+    // Set of functions newly deduced readonly/nocapture/etc by this pass
+    SmallVector<llvm::Function *> todo;
+
+    // Map of functions which could be readonly if all functions in the set are
+    // marked readonly
+    DenseMap<llvm::Function *, SmallPtrSet<Function *, 1>> todo_map;
+
+    for (Function &F : M) {
+      SmallPtrSet<Function *, 1> calls_todo;
+      if (DetectPointerArgOfFn(F, calls_todo)) {
+        changed = true;
+        for (auto F2 : todo_map[&F]) {
+          todo.push_back(F2);
+        }
+        todo_map.erase(&F);
+      }
+      for (auto tocheck : calls_todo) {
+        todo_map[tocheck].insert(&F);
+        todo.push_back(tocheck);
+      }
+    }
+
+    while (!todo.empty()) {
+      auto cur = todo.pop_back_val();
+
+      SmallPtrSet<Function *, 1> calls_todo;
+
+      if (!DetectPointerArgOfFn(*cur, calls_todo))
+        continue;
+
+      for (auto F2 : todo_map[cur]) {
+        todo.push_back(F2);
+      }
+
+      todo_map.erase(cur);
+
+      for (auto tocheck : calls_todo) {
+        todo_map[tocheck].insert(cur);
+        todo.push_back(tocheck);
+      }
+
+      changed = true;
+    }
+  }
 
   PassBuilder PB;
   LoopAnalysisManager LAM;
@@ -1935,10 +2398,13 @@ bool DetectReadonlyOrThrow(Module &M) {
       auto &fwd_set = found2->second;
       fwd_set.erase(cur);
       if (fwd_set.size() == 0) {
-        if (LocalReadOnlyFunctions.contains(F2))
+        bool local = LocalReadOnlyFunctions.contains(F2);
+        if (local) {
           F2->addFnAttr("enzyme_LocalReadOnlyOrThrow");
-        else
+        } else {
           F2->addFnAttr("enzyme_ReadOnlyOrThrow");
+        }
+        addReadOnlyOrThrowAttributes(*F2, local);
         todo.push_back(F2);
         todo_map.erase(F2);
       }
@@ -1946,6 +2412,379 @@ bool DetectReadonlyOrThrow(Module &M) {
 
     inverse_todo_map.erase(found);
   }
+  return changed;
+}
+
+namespace {
+
+/// Post-dominance over the CFG with the blocks that can only lead to an abort
+/// (see `getGuaranteedUnreachable`) removed.
+///
+/// LLVM's PostDominatorTree treats every `unreachable` as a function exit, and
+/// Julia ends every bounds check in one, so with them left in almost nothing
+/// post-dominates anything.  Those paths never return, which is exactly why
+/// ignoring them is the right model here: what runs after a preserve region
+/// closes only matters on paths that do return.
+class AbortIgnoringPostDom {
+  static constexpr unsigned Undef = ~0U;
+
+  const SmallPtrSetImpl<BasicBlock *> &Unreachable;
+  SmallVector<BasicBlock *, 32> Nodes;
+  DenseMap<BasicBlock *, unsigned> Ids;
+  SmallVector<SmallVector<unsigned, 2>, 32> Succs;
+  SmallVector<SmallVector<unsigned, 2>, 32> Preds;
+  SmallVector<unsigned, 32> Rank; // post-order number in the reversed CFG
+  SmallVector<unsigned, 32> IPDom;
+  unsigned Root; // virtual exit, sitting behind every returning block
+
+  unsigned intersect(unsigned A, unsigned B) const {
+    while (A != B) {
+      while (Rank[A] < Rank[B])
+        A = IPDom[A];
+      while (Rank[B] < Rank[A])
+        B = IPDom[B];
+    }
+    return A;
+  }
+
+public:
+  /// `Unreachable` is the abort-only block set of `F` (see
+  /// `getGuaranteedUnreachable`); it must outlive this object.
+  AbortIgnoringPostDom(Function &F,
+                       const SmallPtrSetImpl<BasicBlock *> &Unreachable)
+      : Unreachable(Unreachable) {
+    Root = 0;
+    if (F.empty() || Unreachable.count(&F.getEntryBlock()))
+      return;
+
+    SmallVector<BasicBlock *, 32> Todo = {&F.getEntryBlock()};
+    Ids[&F.getEntryBlock()] = 0;
+    Nodes.push_back(&F.getEntryBlock());
+    while (!Todo.empty()) {
+      auto BB = Todo.pop_back_val();
+      for (auto Succ : successors(BB)) {
+        if (Unreachable.count(Succ) || Ids.count(Succ))
+          continue;
+        Ids[Succ] = Nodes.size();
+        Nodes.push_back(Succ);
+        Todo.push_back(Succ);
+      }
+    }
+
+    Root = Nodes.size();
+    Succs.resize(Root + 1);
+    Preds.resize(Root + 1);
+    for (unsigned I = 0; I != Root; ++I) {
+      for (auto Succ : successors(Nodes[I])) {
+        auto Found = Ids.find(Succ);
+        if (Found == Ids.end())
+          continue;
+        Succs[I].push_back(Found->second);
+        Preds[Found->second].push_back(I);
+      }
+      // Nothing left to go to in the pruned CFG means this block returns, as
+      // far as this analysis is concerned.
+      if (Succs[I].empty()) {
+        Succs[I].push_back(Root);
+        Preds[Root].push_back(I);
+      }
+    }
+
+    // Post-order of the reversed CFG, walking back from the virtual exit.
+    Rank.assign(Root + 1, Undef);
+    SmallVector<unsigned, 32> Order;
+    SmallVector<std::pair<unsigned, unsigned>, 32> Stack;
+    SmallVector<bool, 32> Seen(Root + 1, false);
+    Stack.push_back({Root, 0});
+    Seen[Root] = true;
+    while (!Stack.empty()) {
+      unsigned Node = Stack.back().first;
+      unsigned &Idx = Stack.back().second;
+      if (Idx < Preds[Node].size()) {
+        unsigned Child = Preds[Node][Idx++];
+        if (!Seen[Child]) {
+          Seen[Child] = true;
+          Stack.push_back({Child, 0});
+        }
+        continue;
+      }
+      Rank[Node] = Order.size();
+      Order.push_back(Node);
+      Stack.pop_back();
+    }
+
+    // Cooper-Harvey-Kennedy, on the reversed CFG.
+    IPDom.assign(Root + 1, Undef);
+    IPDom[Root] = Root;
+    bool Changed = true;
+    while (Changed) {
+      Changed = false;
+      for (auto It = Order.rbegin(), End = Order.rend(); It != End; ++It) {
+        unsigned Node = *It;
+        if (Node == Root)
+          continue;
+        unsigned New = Undef;
+        for (unsigned Succ : Succs[Node]) {
+          if (IPDom[Succ] == Undef)
+            continue;
+          New = (New == Undef) ? Succ : intersect(Succ, New);
+        }
+        if (New != Undef && New != IPDom[Node]) {
+          IPDom[Node] = New;
+          Changed = true;
+        }
+      }
+    }
+  }
+
+  /// Whether every path through `BB` ends in an abort rather than a return.
+  bool isAbort(BasicBlock *BB) const { return Unreachable.count(BB); }
+
+  /// The nearest block that every returning path out of each of `BBs` runs
+  /// through, or null if there is none.
+  BasicBlock *nearestCommonPostDominator(ArrayRef<BasicBlock *> BBs) const {
+    unsigned Cur = Undef;
+    for (auto BB : BBs) {
+      auto Found = Ids.find(BB);
+      if (Found == Ids.end() || IPDom[Found->second] == Undef)
+        return nullptr;
+      Cur = (Cur == Undef) ? Found->second : intersect(Found->second, Cur);
+    }
+    if (Cur == Undef || Cur == Root)
+      return nullptr;
+    return Nodes[Cur];
+  }
+};
+
+enum class MergeResult { Merged, NoMergePoint, Failed };
+
+} // namespace
+
+/// Whether a returning path leads from the end of `From` back into `To`
+/// without passing through `Avoid`.
+static bool reachesAvoiding(BasicBlock *From, BasicBlock *To, BasicBlock *Avoid,
+                            const AbortIgnoringPostDom &PDT) {
+  SmallPtrSet<BasicBlock *, 16> Seen;
+  SmallVector<BasicBlock *, 16> Todo(succ_begin(From), succ_end(From));
+  while (!Todo.empty()) {
+    auto Cur = Todo.pop_back_val();
+    if (Cur == To)
+      return true;
+    if (Cur == Avoid || PDT.isAbort(Cur) || !Seen.insert(Cur).second)
+      continue;
+    Todo.append(succ_begin(Cur), succ_end(Cur));
+  }
+  return false;
+}
+
+/// Route every `ret` of `F` through one new return block.  Unlike
+/// UnifyFunctionExitNodesPass this leaves the `unreachable`s alone, which the
+/// augmented primal relies on to spot calls that never return.
+static bool unifyReturnBlocks(Function &F) {
+  SmallVector<BasicBlock *, 4> Returning;
+  for (auto &BB : F)
+    if (isa<ReturnInst>(BB.getTerminator()))
+      Returning.push_back(&BB);
+  if (Returning.size() < 2)
+    return false;
+
+  auto NewRet = BasicBlock::Create(F.getContext(), "UnifiedReturnBlock", &F);
+  IRBuilder<> B(NewRet);
+  PHINode *PN = nullptr;
+  if (F.getReturnType()->isVoidTy()) {
+    B.CreateRetVoid();
+  } else {
+    PN = B.CreatePHI(F.getReturnType(), Returning.size(), "UnifiedRetVal");
+    B.CreateRet(PN);
+  }
+  for (auto BB : Returning) {
+    auto Ret = BB->getTerminator();
+    if (PN)
+      PN->addIncoming(Ret->getOperand(0), BB);
+    IRBuilder<>(Ret).CreateBr(NewRet);
+    Ret->eraseFromParent();
+  }
+  return true;
+}
+
+/// Give `Begin` a single returning `llvm.julia.gc_preserve_end` that
+/// post-dominates it, replacing the several ends it currently has.  Ends on
+/// abort-only paths are left as they are: those paths never return, and the
+/// reverse pass drops their blocks wholesale rather than visiting them.
+/// Returns NoMergePoint when only the function exit post-dominates the ends,
+/// and Failed for any other reason not to merge; the function is then left
+/// untouched but for a possible edge split.
+static MergeResult MergeGCPreserveEnds(CallInst *Begin,
+                                       ArrayRef<CallInst *> AllEnds,
+                                       DominatorTree &DT,
+                                       AbortIgnoringPostDom &PDT,
+                                       bool &CFGChanged) {
+  auto BB = Begin->getParent();
+  if (!DT.getNode(BB))
+    return MergeResult::Failed;
+
+  SmallVector<CallInst *, 2> Ends;
+  for (auto End : AllEnds)
+    if (!PDT.isAbort(End->getParent()))
+      Ends.push_back(End);
+  if (Ends.size() < 2)
+    return MergeResult::Failed;
+
+  auto EndFn = Ends[0]->getCalledFunction();
+  if (!EndFn)
+    return MergeResult::Failed;
+
+  // Every returning path out of the region runs through `Merge`.  The begin's
+  // own block takes part so that a path leaving the begin without ever meeting
+  // an end still ends up covered; `Merge` is then a legal home for the end as
+  // long as the begin dominates it.
+  SmallVector<BasicBlock *, 3> Blocks = {BB};
+  for (auto End : Ends)
+    Blocks.push_back(End->getParent());
+  auto Merge = PDT.nearestCommonPostDominator(Blocks);
+  if (!Merge)
+    return MergeResult::NoMergePoint;
+
+  if (!DT.dominates(BB, Merge)) {
+    // `Merge` is also reachable without ever running the begin.  The paths that
+    // did run it all enter `Merge` from inside the begin's dominator subtree,
+    // so splitting those edges off into a block of their own gives a home that
+    // the begin does dominate -- as long as they are the only returning way
+    // out of that subtree, otherwise a path could leave the region without
+    // ever reaching the split block.
+    SmallVector<BasicBlock *, 2> InRegion;
+    for (auto Pred : predecessors(Merge))
+      if (DT.dominates(BB, Pred))
+        InRegion.push_back(Pred);
+    if (InRegion.empty())
+      return MergeResult::Failed;
+
+    for (auto Node : depth_first(DT.getNode(BB)))
+      for (auto Succ : successors(Node->getBlock()))
+        if (Succ != Merge && !DT.dominates(BB, Succ) && !PDT.isAbort(Succ))
+          return MergeResult::Failed;
+
+    Merge = SplitBlockPredecessors(Merge, InRegion, ".gcpreserve", &DT);
+    if (!Merge)
+      return MergeResult::Failed;
+    CFGChanged = true;
+  }
+
+  // Post-dominance does not stop the begin from running again before `Merge`,
+  // e.g. when one end sat on a loop back edge.  Each begin must meet exactly
+  // one end before the next begin, and vice versa.
+  if (Merge != BB && (reachesAvoiding(BB, BB, Merge, PDT) ||
+                      reachesAvoiding(Merge, Merge, BB, PDT)))
+    return MergeResult::Failed;
+
+  // Placing the end at the top of `Merge` is only right if none of the old
+  // ends sit in `Merge` themselves: the region used to cover everything up to
+  // the last of those, so that is where the merged end has to go.
+  Instruction *InsertPt = nullptr;
+  for (auto End : Ends)
+    if (End->getParent() == Merge && (!InsertPt || InsertPt->comesBefore(End)))
+      InsertPt = End;
+  if (!InsertPt)
+    InsertPt = &*Merge->getFirstInsertionPt();
+  if (!DT.dominates(Begin, InsertPt))
+    return MergeResult::Failed;
+
+  IRBuilder<> B(InsertPt);
+  Value *Args[] = {Begin};
+  auto NewEnd = B.CreateCall(EndFn, Args);
+  NewEnd->setCallingConv(Ends[0]->getCallingConv());
+  NewEnd->setAttributes(Ends[0]->getAttributes());
+  NewEnd->setDebugLoc(Ends[0]->getDebugLoc());
+
+  for (auto End : Ends)
+    End->eraseFromParent();
+  return MergeResult::Merged;
+}
+
+/// A pass such as JumpThreading is free to clone a basic block holding an
+/// `llvm.julia.gc_preserve_end`: the token it consumes may legally have many
+/// uses, and only the instruction *producing* a token blocks duplication.  That
+/// leaves a single `llvm.julia.gc_preserve_begin` paired with several ends.
+///
+/// Reverse mode mirrors a preserve region by emitting a `gc_preserve_begin` at
+/// the invert of the end and the matching `gc_preserve_end` at the invert of
+/// the begin, so it needs the end to post-dominate the begin.  With several
+/// ends no mirrored begin dominates the mirrored end, and the differentiated
+/// function fails verification.
+///
+/// Restore the one-end invariant.  The preserved region can only grow, which is
+/// always safe.
+static bool CanonicalizeGCPreserveEnds(Function &F,
+                                       FunctionAnalysisManager &FAM) {
+  SmallVector<CallInst *, 1> Begins;
+  for (auto &BB : F)
+    for (auto &I : BB)
+      if (auto CI = dyn_cast<CallInst>(&I))
+        if (getFuncNameFromCall(CI) == "llvm.julia.gc_preserve_begin")
+          Begins.push_back(CI);
+
+  bool changed = false;
+  bool CFGChanged = false;
+  DominatorTree *DT = nullptr;
+  // The merge only ever splits edges into a returning block, and the return
+  // unification only adds one, so the abort-only set stays valid across the
+  // post-dominator rebuilds below.
+  SmallPtrSet<BasicBlock *, 4> Unreachable;
+  std::unique_ptr<AbortIgnoringPostDom> PDT;
+  bool UnifiedExits = false;
+
+  for (auto Begin : Begins) {
+    SmallVector<CallInst *, 2> Ends;
+    for (auto U : Begin->users())
+      if (auto CI = dyn_cast<CallInst>(U))
+        if (getFuncNameFromCall(CI) == "llvm.julia.gc_preserve_end")
+          Ends.push_back(CI);
+    if (Ends.size() < 2)
+      continue;
+
+    if (!DT) {
+      DT = &FAM.getResult<DominatorTreeAnalysis>(F);
+      Unreachable = getGuaranteedUnreachable(&F);
+    }
+    if (!PDT)
+      PDT = std::make_unique<AbortIgnoringPostDom>(F, Unreachable);
+
+    bool Split = false;
+    auto Result = MergeGCPreserveEnds(Begin, Ends, *DT, *PDT, Split);
+    if (Split) {
+      CFGChanged = true;
+      PDT.reset();
+    }
+
+    // Ends that were cloned into separate `end; ret` tails have no common
+    // post-dominator short of the function exit itself.  Give the function a
+    // single return block and try once more; that block, or the edges from the
+    // region into it, is then the place for the merged end.
+    if (Result == MergeResult::NoMergePoint && !UnifiedExits) {
+      UnifiedExits = true;
+      if (unifyReturnBlocks(F)) {
+        FAM.invalidate(F, PreservedAnalyses::none());
+        CFGChanged = true;
+        DT = &FAM.getResult<DominatorTreeAnalysis>(F);
+        PDT = std::make_unique<AbortIgnoringPostDom>(F, Unreachable);
+        Split = false;
+        Result = MergeGCPreserveEnds(Begin, Ends, *DT, *PDT, Split);
+        if (Split)
+          PDT.reset();
+      }
+    }
+    changed |= Result == MergeResult::Merged;
+  }
+
+  if (changed || CFGChanged) {
+    PreservedAnalyses PA;
+    if (CFGChanged)
+      PA.preserve<DominatorTreeAnalysis>();
+    else
+      PA.preserveSet<CFGAnalyses>();
+    FAM.invalidate(F, PA);
+  }
+
   return changed;
 }
 
@@ -2007,6 +2846,31 @@ Function *PreProcessCache::preprocessForClone(Function *F,
       setFullWillReturn(NewF);
       PreservedAnalyses PA;
       FAM.invalidate(*NewF, PA);
+
+      OptimizationLevel Level = OptimizationLevel::O0;
+
+      switch (EnzymePostInlineOpt) {
+      default:
+      case 0:
+        Level = OptimizationLevel::O0;
+        break;
+      case 1:
+        Level = OptimizationLevel::O1;
+        break;
+      case 2:
+        Level = OptimizationLevel::O2;
+        break;
+      case 3:
+        Level = OptimizationLevel::O3;
+        break;
+      }
+      if (Level != OptimizationLevel::O0) {
+        PassBuilder PB;
+        FunctionPassManager FPM = PB.buildFunctionSimplificationPipeline(
+            Level, ThinOrFullLTOPhase::None);
+        PA = FPM.run(*NewF, FAM);
+        FAM.invalidate(*NewF, PA);
+      }
     }
   }
 
@@ -2025,7 +2889,7 @@ Function *PreProcessCache::preprocessForClone(Function *F,
             }
           }
 
-          if (called && called->getName() == "__enzyme_iter") {
+          if (called && called->getName().contains("__enzyme_iter")) {
             ItersToErase.push_back(CI);
           }
         }
@@ -2052,7 +2916,8 @@ Function *PreProcessCache::preprocessForClone(Function *F,
             if (isa<ConstantPointerNull>(IC->getOperand(1 - i)))
               if (isAllocationCall(IC->getOperand(i), TLI)) {
                 for (auto U : IC->users()) {
-                  if (auto BI = dyn_cast<BranchInst>(U))
+                  if (auto BI =
+                          (isAnyBranch(U) ? cast<Instruction>(U) : nullptr))
                     BranchesToErase.push_back(BI->getParent());
                 }
                 IC->replaceAllUsesWith(
@@ -2248,8 +3113,8 @@ Function *PreProcessCache::preprocessForClone(Function *F,
               g.getValueType(), g.getType()->getPointerAddressSpace(), nullptr,
               g.getName() + "_local");
 
-          if (g.getAlignment()) {
-            antialloca->setAlignment(Align(g.getAlignment()));
+          if (g.getAlign()) {
+            antialloca->setAlignment(*g.getAlign());
           }
 
           std::map<Constant *, Value *> remap;
@@ -2308,13 +3173,11 @@ Function *PreProcessCache::preprocessForClone(Function *F,
           {
 
             auto cal = bb.CreateCall(intr, args);
-            if (g.getAlignment()) {
-              cal->addParamAttr(
-                  0, Attribute::getWithAlignment(g.getContext(),
-                                                 Align(g.getAlignment())));
-              cal->addParamAttr(
-                  1, Attribute::getWithAlignment(g.getContext(),
-                                                 Align(g.getAlignment())));
+            if (g.getAlign()) {
+              cal->addParamAttr(0, Attribute::getWithAlignment(g.getContext(),
+                                                               *g.getAlign()));
+              cal->addParamAttr(1, Attribute::getWithAlignment(g.getContext(),
+                                                               *g.getAlign()));
             }
           }
 
@@ -2323,13 +3186,11 @@ Function *PreProcessCache::preprocessForClone(Function *F,
           for (ReturnInst *RI : Returns) {
             IRBuilder<> IB(RI);
             auto cal = IB.CreateCall(intr, args);
-            if (g.getAlignment()) {
-              cal->addParamAttr(
-                  0, Attribute::getWithAlignment(g.getContext(),
-                                                 Align(g.getAlignment())));
-              cal->addParamAttr(
-                  1, Attribute::getWithAlignment(g.getContext(),
-                                                 Align(g.getAlignment())));
+            if (g.getAlign()) {
+              cal->addParamAttr(0, Attribute::getWithAlignment(g.getContext(),
+                                                               *g.getAlign()));
+              cal->addParamAttr(1, Attribute::getWithAlignment(g.getContext(),
+                                                               *g.getAlign()));
             }
           }
         }
@@ -2595,6 +3456,12 @@ Function *PreProcessCache::preprocessForClone(Function *F,
     }
   }
 
+  // Only the reverse pass mirrors preserve regions, so only it needs the
+  // one-end invariant.  The augmented primal and split forward mode share
+  // their preprocessing with it, so everything but plain forward mode runs it.
+  if (mode != DerivativeMode::ForwardMode)
+    CanonicalizeGCPreserveEnds(*NewF, FAM);
+
   {
     SmallPtrSet<Function *, 1> calls_todo;
     bool local = false;
@@ -2770,31 +3637,22 @@ Function *PreProcessCache::CloneFunctionWithReturns(
 
   for (auto i = F->arg_begin(), j = NewF->arg_begin(); i != F->arg_end();) {
     if (F->hasParamAttribute(ii, Attribute::StructRet)) {
-      NewF->addParamAttr(jj, Attribute::get(F->getContext(), "enzyme_sret"));
-      // TODO
-      // NewF->addParamAttr(
-      //    jj,
-      //    Attribute::get(
-      //        F->getContext(), Attribute::AttrKind::ElementType,
-      //        F->getParamAttribute(ii,
-      //        Attribute::StructRet).getValueAsType()));
-    }
-    if (F->getAttributes().hasParamAttr(ii, "enzymejl_returnRoots")) {
       NewF->addParamAttr(
-          jj, F->getAttributes().getParamAttr(ii, "enzymejl_returnRoots"));
-      // TODO
-      // NewF->addParamAttr(jj, F->getParamAttribute(ii,
-      // Attribute::ElementType));
+          jj, Attribute::get(F->getContext(), "enzyme_sret",
+                             convertSRetTypeToString(
+                                 F->getParamAttribute(ii, Attribute::StructRet)
+                                     .getValueAsType())));
     }
-    for (auto attr :
-         {"enzymejl_parmtype", "enzymejl_parmtype_ref", "enzyme_type"})
+    for (auto attr : {"enzymejl_parmtype", "enzymejl_parmtype_ref",
+                      "enzyme_type", "enzymejl_rooted_typ",
+                      "enzymejl_returnRoots", "enzymejl_sret_union_bytes"})
       if (F->getAttributes().hasParamAttr(ii, attr)) {
         NewF->addParamAttr(jj, F->getAttributes().getParamAttr(ii, attr));
-        for (auto ty : PrimalParamAttrsToPreserve)
-          if (F->getAttributes().hasParamAttr(ii, ty)) {
-            auto attr = F->getAttributes().getParamAttr(ii, ty);
-            NewF->addParamAttr(jj, attr);
-          }
+      }
+    for (auto ty : PrimalParamAttrsToPreserve)
+      if (F->getAttributes().hasParamAttr(ii, ty)) {
+        auto attr = F->getAttributes().getParamAttr(ii, ty);
+        NewF->addParamAttr(jj, attr);
       }
     if (constant_args[ii] == DIFFE_TYPE::CONSTANT) {
       if (!i->hasByValAttr())
@@ -2819,6 +3677,12 @@ Function *PreProcessCache::CloneFunctionWithReturns(
       if (F->hasParamAttribute(ii, Attribute::NoUndef)) {
         NewF->removeParamAttr(jj, Attribute::NoUndef);
       }
+      if (F->hasParamAttribute(ii, Attribute::Dereferenceable)) {
+        NewF->removeParamAttr(jj, Attribute::Dereferenceable);
+      }
+      if (F->hasParamAttribute(ii, Attribute::DereferenceableOrNull)) {
+        NewF->removeParamAttr(jj, Attribute::DereferenceableOrNull);
+      }
     }
 
     if (constant_args[ii] == DIFFE_TYPE::DUP_ARG ||
@@ -2826,58 +3690,47 @@ Function *PreProcessCache::CloneFunctionWithReturns(
       hasPtrInput = true;
       ptrInputs[i] = (j + 1);
       // TODO: find a way to keep the attributes in vector mode.
-      if (width == 1)
-        for (auto ty : ShadowParamAttrsToPreserve)
+      if (width == 1) {
+        for (auto ty : ShadowParamAttrsToPreserve) {
           if (F->getAttributes().hasParamAttr(ii, ty)) {
             auto attr = F->getAttributes().getParamAttr(ii, ty);
             NewF->addParamAttr(jj + 1, attr);
           }
+        }
+      }
 
-      for (auto attr :
-           {"enzymejl_parmtype", "enzymejl_parmtype_ref", "enzyme_type"})
+      for (auto attr : {"enzymejl_parmtype", "enzymejl_parmtype_ref",
+                        "enzyme_type", "enzymejl_rooted_typ",
+                        "enzymejl_returnRoots", "enzymejl_sret_union_bytes"})
         if (F->getAttributes().hasParamAttr(ii, attr)) {
-          if (width == 1)
+          if (width == 1) {
             NewF->addParamAttr(jj + 1,
                                F->getAttributes().getParamAttr(ii, attr));
+          } else {
+            NewF->addParamAttr(jj + 1,
+                               Attribute::get(F->getContext(),
+                                              attr + std::string("_v"),
+                                              F->getAttributes()
+                                                  .getParamAttr(ii, attr)
+                                                  .getValueAsString()));
+          }
         }
-
-      if (F->getAttributes().hasParamAttr(ii, "enzymejl_returnRoots")) {
-        if (width == 1) {
-          NewF->addParamAttr(jj + 1, F->getAttributes().getParamAttr(
-                                         ii, "enzymejl_returnRoots"));
-        } else {
-          NewF->addParamAttr(jj + 1, Attribute::get(F->getContext(),
-                                                    "enzymejl_returnRoots_v"));
-        }
-        // TODO
-        // NewF->addParamAttr(jj + 1,
-        //                   F->getParamAttribute(ii,
-        //                   Attribute::ElementType));
-      }
 
       if (F->hasParamAttribute(ii, Attribute::StructRet)) {
         if (width == 1) {
-          NewF->addParamAttr(jj + 1,
-                             Attribute::get(F->getContext(), "enzyme_sret"));
-          // TODO
-          // NewF->addParamAttr(
-          //     jj + 1,
-          //     Attribute::get(F->getContext(),
-          //     Attribute::AttrKind::ElementType,
-          //                    F->getParamAttribute(ii,
-          //                    Attribute::StructRet)
-          //                        .getValueAsType()));
+          NewF->addParamAttr(
+              jj + 1,
+              Attribute::get(F->getContext(), "enzyme_sret",
+                             convertSRetTypeToString(
+                                 F->getParamAttribute(ii, Attribute::StructRet)
+                                     .getValueAsType())));
         } else {
-          NewF->addParamAttr(jj + 1,
-                             Attribute::get(F->getContext(), "enzyme_sret_v"));
-          // TODO
-          // NewF->addParamAttr(
-          //     jj + 1,
-          //     Attribute::get(F->getContext(),
-          //     Attribute::AttrKind::ElementType,
-          //                    F->getParamAttribute(ii,
-          //                    Attribute::StructRet)
-          //                        .getValueAsType()));
+          NewF->addParamAttr(
+              jj + 1,
+              Attribute::get(F->getContext(), "enzyme_sret_v",
+                             convertSRetTypeToString(
+                                 F->getParamAttribute(ii, Attribute::StructRet)
+                                     .getValueAsType())));
         }
       }
 
@@ -2934,12 +3787,13 @@ void CoaleseTrivialMallocs(Function &F, DominatorTree &DT) {
   for (BasicBlock &BB : F) {
     for (Instruction &I : BB) {
       if (auto CI = dyn_cast<CallInst>(&I)) {
-        if (auto F2 = CI->getCalledFunction()) {
-          if (F2->getName() == "free") {
-            if (auto MD = hasMetadata(CI, "enzyme_cache_free")) {
-              Metadata *op = MD->getOperand(0);
-              frees[op].push_back(CI);
-            }
+        if (auto MD = hasMetadata(CI, "enzyme_cache_free")) {
+          Metadata *op = MD->getOperand(0);
+          if (cast<ConstantInt>(
+                  cast<ConstantAsMetadata>(cast<MDNode>(op)->getOperand(0))
+                      ->getValue())
+                  ->isOne()) {
+            frees[op].push_back(CI);
           }
         }
       }
@@ -2967,8 +3821,13 @@ void CoaleseTrivialMallocs(Function &F, DominatorTree &DT) {
             if (!freeCall) {
               if (auto MD = hasMetadata(CI, "enzyme_cache_alloc")) {
                 Metadata *op = MD->getOperand(0);
-                if (frees[op].size() == 1)
-                  freeCall = frees[op][0];
+                if (cast<ConstantInt>(cast<ConstantAsMetadata>(
+                                          cast<MDNode>(op)->getOperand(0))
+                                          ->getValue())
+                        ->isOne()) {
+                  if (frees[op].size() == 1)
+                    freeCall = frees[op][0];
+                }
               }
             }
             if (freeCall)
@@ -3024,11 +3883,13 @@ void CoaleseTrivialMallocs(Function &F, DominatorTree &DT) {
 void SelectOptimization(Function *F) {
   DominatorTree DT(*F);
   for (auto &BB : *F) {
-    if (auto BI = dyn_cast<BranchInst>(BB.getTerminator())) {
-      if (BI->isConditional()) {
+    if (auto BI = (isAnyBranch(BB.getTerminator())
+                       ? cast<Instruction>(BB.getTerminator())
+                       : nullptr)) {
+      if (isConditionalBranch(BI)) {
         for (auto &I : BB) {
           if (auto SI = dyn_cast<SelectInst>(&I)) {
-            if (SI->getCondition() == BI->getCondition()) {
+            if (SI->getCondition() == getBranchCondition(BI)) {
               for (Value::use_iterator UI = SI->use_begin(), E = SI->use_end();
                    UI != E;) {
                 Use &U = *UI;
@@ -3073,7 +3934,7 @@ static Function *getOrCreateMinMaxIntrinsicFallback(Module &M,
   Fallback->addFnAttr(Attribute::AlwaysInline);
   Fallback->addFnAttr(Attribute::NoUnwind);
   Fallback->addFnAttr(Attribute::WillReturn);
-  Fallback->addFnAttr(Attribute::ReadNone);
+  Fallback->setDoesNotAccessMemory();
 
   auto *Entry = BasicBlock::Create(M.getContext(), "entry", Fallback);
   IRBuilder<> Builder(Entry);
@@ -3127,8 +3988,9 @@ void ReplaceFunctionImplementation(Module &M) {
       }
       if (Impl.isDeclaration()) {
         bool UseDeviceDeclaration =
-            (M.getTargetTriple().find("amdgcn") != std::string::npos &&
-             Impl.getName().starts_with("__ocml_"));
+            (Triple(M.getTargetTriple()).getArch() == Triple::amdgcn &&
+             Impl.getName().starts_with("__ocml_")) ||
+            Impl.getName().starts_with("air.");
         if (!UseDeviceDeclaration)
           continue;
       }
@@ -4311,7 +5173,11 @@ std::optional<std::string> fixSparse_inner(Instruction *cur, llvm::Function &F,
               if (cmp0->getOperand(1 - i0) == cmp1->getOperand(1 - i1))
                 auto e0 = SE.getSCEV(cmp0->getOperand(i0));
                 auto e1 = SE.getSCEV(cmp1->getOperand(i1));
+#if LLVM_VERSION_MAJOR >= 24
+                auto m = SE.getMinusSCEV(e0, e1, SCEV::FlagsMask);
+#else
                 auto m = SE.getMinusSCEV(e0, e1, SCEV::NoWrapMask);
+#endif
                 if (auto C = dyn_cast<SCEVConstant>(m)) {
                   // if c1 == c2 don't need the and they are equivalent
                   if (C->getValue()->isZero()) {
@@ -4464,9 +5330,11 @@ std::optional<std::string> fixSparse_inner(Instruction *cur, llvm::Function &F,
                 SmallVector<Value *, 1> slice;
                 for (size_t i = 1; i < allOps.size(); i++)
                   slice.push_back(allOps[i]);
-                auto ane = pushcse(B.CreateFCmp(
-                    eq_predicate, pushcse(B.CreateFNeg(allOps[0])),
-                    pushcse(B.CreateCall(getFunctionFromCall(S), slice))));
+                auto sliceCall =
+                    pushcse(B.CreateCall(getFunctionFromCall(S), slice));
+                auto negOp = pushcse(B.CreateFNeg(allOps[0]));
+                auto ane =
+                    pushcse(B.CreateFCmp(eq_predicate, negOp, sliceCall));
                 auto ori = pushcse(B.CreateOr(op_checks, ane));
                 if (predicate == FCmpInst::FCMP_UNE ||
                     predicate == FCmpInst::FCMP_ONE) {
@@ -4688,12 +5556,12 @@ std::optional<std::string> fixSparse_inner(Instruction *cur, llvm::Function &F,
               return "UFCmpToICmp";
             }
             if (auto SI = dyn_cast<SelectInst>(fcmp->getOperand(1 - i))) {
+              auto falseCmp = pushcse(
+                  B.CreateCmp(fcmp->getPredicate(), C, SI->getFalseValue()));
+              auto trueCmp = pushcse(
+                  B.CreateCmp(fcmp->getPredicate(), C, SI->getTrueValue()));
               auto res = pushcse(
-                  B.CreateSelect(SI->getCondition(),
-                                 pushcse(B.CreateCmp(fcmp->getPredicate(), C,
-                                                     SI->getTrueValue())),
-                                 pushcse(B.CreateCmp(fcmp->getPredicate(), C,
-                                                     SI->getFalseValue()))));
+                  B.CreateSelect(SI->getCondition(), trueCmp, falseCmp));
               replaceAndErase(cur, res);
               return "FCmpSelect";
             }
@@ -4726,17 +5594,20 @@ std::optional<std::string> fixSparse_inner(Instruction *cur, llvm::Function &F,
         auto a = fcmp->getOperand(0);
         auto b = fcmp->getOperand(1);
         if (fcmp->getPredicate() == CmpInst::ICMP_EQ) {
-          auto res = pushcse(
-              B.CreateOr(pushcse(B.CreateAnd(a, b)),
-                         pushcse(B.CreateAnd(pushcse(B.CreateNot(a)),
-                                             pushcse(B.CreateNot(b))))));
+          auto notB = pushcse(B.CreateNot(b));
+          auto notA = pushcse(B.CreateNot(a));
+          auto neitherAB = pushcse(B.CreateAnd(notA, notB));
+          auto bothAB = pushcse(B.CreateAnd(a, b));
+          auto res = pushcse(B.CreateOr(bothAB, neitherAB));
           replaceAndErase(cur, res);
           return "CmpI1EQ";
         }
         if (fcmp->getPredicate() == CmpInst::ICMP_NE) {
-          auto res = pushcse(
-              B.CreateOr(pushcse(B.CreateAnd(pushcse(B.CreateNot(a)), b)),
-                         pushcse(B.CreateAnd(a, pushcse(B.CreateNot(b))))));
+          auto notB = pushcse(B.CreateNot(b));
+          auto aNotB = pushcse(B.CreateAnd(a, notB));
+          auto notA = pushcse(B.CreateNot(a));
+          auto notAB = pushcse(B.CreateAnd(notA, b));
+          auto res = pushcse(B.CreateOr(notAB, aNotB));
           replaceAndErase(cur, res);
           return "CmpI1NE";
         }
@@ -4747,7 +5618,8 @@ std::optional<std::string> fixSparse_inner(Instruction *cur, llvm::Function &F,
           if (CI->isZero()) {
             // a + a ?= 0 -> a ?= 0
             if (auto addI = dyn_cast<Instruction>(fcmp->getOperand(1 - i))) {
-              if (addI->getOperand(0) == addI->getOperand(1)) {
+              if (addI->getOpcode() == Instruction::Add &&
+                  addI->getOperand(0) == addI->getOperand(1)) {
                 Value *res = pushcse(
                     B.CreateCmp(fcmp->getPredicate(), addI->getOperand(0), CI));
                 replaceAndErase(cur, res);
@@ -5439,7 +6311,11 @@ std::optional<std::string> fixSparse_inner(Instruction *cur, llvm::Function &F,
                   cmp2->getPredicate() == cmpOp) {
                 auto c1 = SE.getSCEV(cmp1->getOperand(i1));
                 auto c2 = SE.getSCEV(cmp2->getOperand(i2));
+#if LLVM_VERSION_MAJOR >= 24
+                auto m = SE.getMinusSCEV(c1, c2, SCEV::FlagsMask);
+#else
                 auto m = SE.getMinusSCEV(c1, c2, SCEV::NoWrapMask);
+#endif
                 if (auto C = dyn_cast<SCEVConstant>(m)) {
                   // if c1 == c2 don't need the and they are equivalent
                   if (C->getValue()->isZero()) {
@@ -6155,7 +7031,7 @@ std::optional<std::string> fixSparse_inner(Instruction *cur, llvm::Function &F,
     }
 
   if (auto PN = dyn_cast<PHINode>(cur)) {
-    B.SetInsertPoint(PN->getParent()->getFirstNonPHI());
+    B.SetInsertPoint(getFirstNonPHI(PN->getParent()));
     if (SE.isSCEVable(PN->getType())) {
       auto S = SE.getSCEV(PN);
 
@@ -6180,14 +7056,18 @@ std::optional<std::string> fixSparse_inner(Instruction *cur, llvm::Function &F,
         for (auto U : cur->users()) {
           push(U);
         }
-        auto point = PN->getParent()->getFirstNonPHI();
+        auto point = getFirstNonPHI(PN->getParent());
         auto tmp = cast<PHINode>(pushcse(B.CreatePHI(cur->getType(), 1)));
         cur->replaceAllUsesWith(tmp);
         cur->eraseFromParent();
 
         Value *newIV = nullptr;
         {
+#if LLVM_VERSION_MAJOR >= 22
+          SCEVExpander Exp(SE, "sparseenzyme");
+#else
           SCEVExpander Exp(SE, DL, "sparseenzyme");
+#endif
           // We place that at first non phi as it may produce a non-phi
           // instruction and must thus be expanded after all phi's
           newIV = Exp.expandCodeFor(S, tmp->getType(), point);
@@ -6653,11 +7533,13 @@ std::optional<std::string> fixSparse_inner(Instruction *cur, llvm::Function &F,
         if (!DT.dominates(prev, PN->getParent())) {
           continue;
         }
-        auto br = dyn_cast<BranchInst>(prev->getTerminator());
+        auto br = (isAnyBranch(prev->getTerminator())
+                       ? cast<Instruction>(prev->getTerminator())
+                       : nullptr);
         if (!br) {
           continue;
         }
-        if (!br->isConditional()) {
+        if (!isConditionalBranch(br)) {
           continue;
         }
         if (br->getSuccessor(0) != PN->getParent()) {
@@ -6692,10 +7574,10 @@ std::optional<std::string> fixSparse_inner(Instruction *cur, llvm::Function &F,
           continue;
         for (auto iter = toMove.rbegin(), end = toMove.rend(); iter != end;
              iter++) {
-          (*iter)->moveBefore(br);
+          moveBeforeInst(*iter, br);
         }
         auto sel = pushcse(B.CreateSelect(
-            br->getCondition(), PN->getIncomingValueForBlock(prev),
+            getBranchCondition(br), PN->getIncomingValueForBlock(prev),
             PN->getIncomingValueForBlock(br->getSuccessor(1)),
             "tphisel." + cur->getName()));
 
@@ -6850,7 +7732,7 @@ const SCEV *evaluateAtLoopIter(const SCEV *V, ScalarEvolution &SE,
     return V;
   if (auto addrec = dyn_cast<SCEVAddRecExpr>(V)) {
     if (addrec->getLoop() == find) {
-      auto V2 = addrec->evaluateAtIteration(replace, SE);
+      auto V2 = evaluateAtIterationWithoutExt(addrec, replace, SE);
       return evaluateAtLoopIter(V2, SE, find, replace);
     }
   }
@@ -7964,88 +8846,86 @@ void fixSparseIndices(llvm::Function &F, llvm::FunctionAnalysisManager &FAM,
 
   // llvm::errs() << " post fix inner " << F << "\n";
 
-  SmallVector<std::pair<BasicBlock *, BranchInst *>, 1> sparseBlocks;
+  SmallVector<std::pair<BasicBlock *, Instruction *>, 1> sparseBlocks;
   bool legalToSparse = true;
   for (auto &B : F)
-    if (auto br = dyn_cast<BranchInst>(B.getTerminator()))
-      if (br->isConditional())
-        for (int bidx = 0; bidx < 2; bidx++)
-          if (auto uncond_br =
-                  dyn_cast<BranchInst>(br->getSuccessor(bidx)->getTerminator()))
-            if (!uncond_br->isConditional())
-              if (uncond_br->getSuccessor(0) == br->getSuccessor(1 - bidx)) {
-                auto blk = br->getSuccessor(bidx);
-                int countSparse = 0;
-                for (auto &I : *blk) {
-                  if (auto CI = dyn_cast<CallInst>(&I)) {
-                    if (auto F = CI->getCalledFunction()) {
-                      if (F->hasFnAttribute("enzyme_sparse_accumulate")) {
-                        countSparse++;
-                      }
-                    }
+    if (isConditionalBranch(B.getTerminator())) {
+      auto br = B.getTerminator();
+      for (int bidx = 0; bidx < 2; bidx++) {
+        auto uncond_br = br->getSuccessor(bidx)->getTerminator();
+        if (isUnconditionalBranch(uncond_br))
+          if (uncond_br->getSuccessor(0) == br->getSuccessor(1 - bidx)) {
+            auto blk = br->getSuccessor(bidx);
+            int countSparse = 0;
+            for (auto &I : *blk) {
+              if (auto CI = dyn_cast<CallInst>(&I)) {
+                if (auto F = CI->getCalledFunction()) {
+                  if (F->hasFnAttribute("enzyme_sparse_accumulate")) {
+                    countSparse++;
                   }
                 }
-                if (countSparse == 0)
-                  continue;
-                if (countSparse > 1) {
-                  legalToSparse = false;
-                  EmitFailure(
-                      "NoSparsification", br->getDebugLoc(), br, "F: ", F,
-                      "\nMultiple distinct sparse stores in same block: ",
-                      *blk);
-                  break;
-                }
-
-                for (auto &I : *blk) {
-                  if (auto CI = dyn_cast<CallInst>(&I)) {
-                    if (auto F = CI->getCalledFunction()) {
-                      if (F->hasFnAttribute("enzyme_sparse_accumulate")) {
-                        continue;
-                      }
-                    }
-                    if (isReadOnly(CI))
-                      continue;
-                  }
-                  if (!I.mayWriteToMemory())
-                    continue;
-
-                  legalToSparse = false;
-                  EmitFailure(
-                      "NoSparsification", br->getDebugLoc(), br, "F: ", F,
-                      "\nIllegal writing instruction in sparse block: ", I);
-                  break;
-                }
-
-                if (!legalToSparse) {
-                  break;
-                }
-
-                auto L = LI.getLoopFor(blk);
-                if (!L) {
-                  legalToSparse = false;
-                  EmitFailure("NoSparsification", br->getDebugLoc(), br,
-                              "F: ", F, "\nCould not find loop for: ", *blk);
-                  break;
-                }
-                auto idx = L->getCanonicalInductionVariable();
-                if (!idx) {
-                  legalToSparse = false;
-                  EmitFailure("NoSparsification", br->getDebugLoc(), br,
-                              "F: ", F, "\nL:", *L,
-                              "\nCould not find loop index: ", *L->getHeader());
-                  break;
-                }
-                assert(idx);
-                auto preheader = L->getLoopPreheader();
-                if (!preheader) {
-                  legalToSparse = false;
-                  EmitFailure("NoSparsification", br->getDebugLoc(), br,
-                              "F: ", F, "\nL:", *L,
-                              "\nCould not find loop preheader");
-                  break;
-                }
-                sparseBlocks.emplace_back(blk, br);
               }
+            }
+            if (countSparse == 0)
+              continue;
+            if (countSparse > 1) {
+              legalToSparse = false;
+              EmitFailure(
+                  "NoSparsification", br->getDebugLoc(), br, "F: ", F,
+                  "\nMultiple distinct sparse stores in same block: ", *blk);
+              break;
+            }
+
+            for (auto &I : *blk) {
+              if (auto CI = dyn_cast<CallInst>(&I)) {
+                if (auto F = CI->getCalledFunction()) {
+                  if (F->hasFnAttribute("enzyme_sparse_accumulate")) {
+                    continue;
+                  }
+                }
+                if (isReadOnly(CI))
+                  continue;
+              }
+              if (!I.mayWriteToMemory())
+                continue;
+
+              legalToSparse = false;
+              EmitFailure("NoSparsification", br->getDebugLoc(), br, "F: ", F,
+                          "\nIllegal writing instruction in sparse block: ", I);
+              break;
+            }
+
+            if (!legalToSparse) {
+              break;
+            }
+
+            auto L = LI.getLoopFor(blk);
+            if (!L) {
+              legalToSparse = false;
+              EmitFailure("NoSparsification", br->getDebugLoc(), br, "F: ", F,
+                          "\nCould not find loop for: ", *blk);
+              break;
+            }
+            auto idx = L->getCanonicalInductionVariable();
+            if (!idx) {
+              legalToSparse = false;
+              EmitFailure("NoSparsification", br->getDebugLoc(), br, "F: ", F,
+                          "\nL:", *L,
+                          "\nCould not find loop index: ", *L->getHeader());
+              break;
+            }
+            assert(idx);
+            auto preheader = L->getLoopPreheader();
+            if (!preheader) {
+              legalToSparse = false;
+              EmitFailure("NoSparsification", br->getDebugLoc(), br, "F: ", F,
+                          "\nL:", *L, "\nCould not find loop preheader");
+              break;
+            }
+            sparseBlocks.emplace_back(blk, br);
+          }
+      }
+    }
 
   if (!legalToSparse) {
     return;
@@ -8078,7 +8958,7 @@ void fixSparseIndices(llvm::Function &F, llvm::FunctionAnalysisManager &FAM,
 
     // default is condition avoids sparse, negated is condition goes
     // to sparse
-    auto cond = br->getCondition();
+    auto cond = getBranchCondition(br);
     bool negated = br->getSuccessor(0) == blk;
 
     bool legal = true;
@@ -8141,24 +9021,29 @@ void fixSparseIndices(llvm::Function &F, llvm::FunctionAnalysisManager &FAM,
     if (forSparsification.count(L) == 0) {
       {
         IRBuilder<> PB(preheader->getTerminator());
-        forSparsification[L].first =
-            std::make_pair(PB.CreatePHI(idx->getType(), 0, "ph.idx"),
-                           PB.CreatePHI(idx->getType(), 0, "loop.idx"));
+        auto loopIdxPhi = PB.CreatePHI(idx->getType(), 0, "loop.idx");
+        auto phIdxPhi = PB.CreatePHI(idx->getType(), 0, "ph.idx");
+        forSparsification[L].first = std::make_pair(phIdxPhi, loopIdxPhi);
       }
 
       Value *LoopCount = nullptr;
 
-      IRBuilder<> B(L->getHeader()->getFirstNonPHI());
+      IRBuilder<> B(getFirstNonPHI(L->getHeader()));
       {
+#if LLVM_VERSION_MAJOR >= 22
+        SCEVExpander Exp(SE, "sparseenzyme");
+#else
         SCEVExpander Exp(SE, DL, "sparseenzyme");
+#endif
         auto LoopCountS = SE.getBackedgeTakenCount(L);
         LoopCount = B.CreateAdd(
             ConstantInt::get(idx->getType(), 1),
             Exp.expandCodeFor(LoopCountS, idx->getType(), &blk->front()));
       }
-      Value *inbounds = B.CreateAnd(
-          B.CreateICmpSLT(idx, LoopCount),
-          B.CreateICmpSGE(idx, ConstantInt::get(idx->getType(), 0)));
+      Value *nonNegative =
+          B.CreateICmpSGE(idx, ConstantInt::get(idx->getType(), 0));
+      Value *belowCount = B.CreateICmpSLT(idx, LoopCount);
+      Value *inbounds = B.CreateAnd(belowCount, nonNegative);
       Value *args[] = {inbounds, forSparsification[L].first.second};
       B.CreateCall(F.getParent()->getOrInsertFunction(
                        "enzyme.sparse.inbounds", B.getVoidTy(),
@@ -8175,7 +9060,7 @@ void fixSparseIndices(llvm::Function &F, llvm::FunctionAnalysisManager &FAM,
     if (!negated)
       nidx = B.CreateNot(nidx);
 
-    br->setCondition(nidx);
+    setBranchCondition(br, nidx);
     forSparsification[L].second.emplace_back(blk, solutions);
   }
 
@@ -8260,12 +9145,14 @@ void fixSparseIndices(llvm::Function &F, llvm::FunctionAnalysisManager &FAM,
         bool guarded = false;
         if (auto P = B->getSinglePredecessor())
           if (auto S = B->getSingleSuccessor())
-            if (auto BI = dyn_cast<BranchInst>(P->getTerminator()))
-              if (BI->isConditional())
+            if (auto BI = (isAnyBranch(P->getTerminator())
+                               ? cast<Instruction>(P->getTerminator())
+                               : nullptr))
+              if (isConditionalBranch(BI))
                 for (size_t i = 0; i < 2; i++)
                   if (BI->getSuccessor(i) == B &&
                       BI->getSuccessor(1 - i) == S) {
-                    auto val = BI->getCondition();
+                    auto val = getBranchCondition(BI);
                     if (auto xori = dyn_cast<Instruction>(val))
                       if (xori->getOpcode() == Instruction::Xor)
                         val = xori->getOperand(0);
@@ -8311,7 +9198,11 @@ void fixSparseIndices(llvm::Function &F, llvm::FunctionAnalysisManager &FAM,
       auto off = en.index();
       auto &solutions = en.value().second;
       ConstraintContext ctx(SE, L, Assumptions, DT);
+#if LLVM_VERSION_MAJOR >= 22
+      SCEVExpander Exp(SE, "sparseenzyme", /*preservelcssa*/ false);
+#else
       SCEVExpander Exp(SE, DL, "sparseenzyme", /*preservelcssa*/ false);
+#endif
       auto sols = solutions->allSolutions(Exp, idxty, phterm, ctx, B);
       SmallVector<Value *, 1> prevSols;
       for (auto [sol, condition] : sols) {
@@ -8434,17 +9325,7 @@ void replaceToDense(llvm::CallBase *CI, bool replaceAll, llvm::Function *F,
   auto toInt = [&](IRBuilder<> &B, llvm::Value *V) {
     if (auto PT = dyn_cast<PointerType>(V->getType())) {
       if (PT->getAddressSpace() != 0) {
-#if LLVM_VERSION_MAJOR < 17
-        if (CI->getContext().supportsTypedPointers()) {
-          V = B.CreateAddrSpaceCast(
-              V, PointerType::getUnqual(PT->getPointerElementType()));
-        } else {
-          V = B.CreateAddrSpaceCast(V,
-                                    PointerType::getUnqual(PT->getContext()));
-        }
-#else
-        V = B.CreateAddrSpaceCast(V, PointerType::getUnqual(PT->getContext()));
-#endif
+        V = B.CreateAddrSpaceCast(V, changePointerAddrSpace(PT, 0));
       }
       return B.CreatePtrToInt(V, intTy);
     }

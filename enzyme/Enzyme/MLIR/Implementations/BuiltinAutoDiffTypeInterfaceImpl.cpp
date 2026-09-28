@@ -46,15 +46,20 @@ template <typename ConcreteType>
 class FloatTypeInterface : public AutoDiffTypeInterface::ExternalModel<
                                FloatTypeInterface<ConcreteType>, ConcreteType> {
 public:
+  Attribute createNullAttr(Type self) const {
+    auto fltType = cast<ConcreteType>(self);
+    return FloatAttr::get(fltType, APFloat(fltType.getFloatSemantics(), 0));
+  }
+
   Value createNullValue(Type self, OpBuilder &builder, Location loc) const {
     auto fltType = cast<ConcreteType>(self);
-    return builder.create<arith::ConstantFloatOp>(
-        loc, fltType, APFloat(fltType.getFloatSemantics(), 0));
+    return arith::ConstantOp::create(builder, loc, fltType,
+                                     cast<FloatAttr>(createNullAttr(self)));
   }
 
   Value createAddOp(Type self, OpBuilder &builder, Location loc, Value a,
                     Value b) const {
-    return builder.create<arith::AddFOp>(loc, a, b);
+    return setDerivativeFastMath(arith::AddFOp::create(builder, loc, a, b));
   }
   Value createConjOp(Type self, OpBuilder &builder, Location loc,
                      Value a) const {
@@ -89,32 +94,36 @@ class TensorTypeInterface
     : public AutoDiffTypeInterface::ExternalModel<TensorTypeInterface,
                                                   TensorType> {
 public:
-  Value createNullValue(Type self, OpBuilder &builder, Location loc) const {
+  Attribute createNullAttr(Type self) const {
     auto tenType = cast<TensorType>(self);
     auto ET = tenType.getElementType();
 
     if (auto F = dyn_cast<FloatType>(ET)) {
       APFloat apvalue(F.getFloatSemantics(), 0);
-      auto attr = DenseElementsAttr::get(tenType, apvalue);
-      return builder.create<arith::ConstantOp>(loc, tenType, attr);
+      return DenseElementsAttr::get(tenType, apvalue);
     }
     if (auto G = dyn_cast<ComplexType>(ET)) {
       if (auto F = dyn_cast<FloatType>(G.getElementType())) {
         APFloat apvalue(F.getFloatSemantics(), 0);
-        std::complex<APFloat> c(apvalue, apvalue);
-        auto attr = DenseElementsAttr::get(tenType, c);
-        return builder.create<arith::ConstantOp>(loc, tenType, attr);
+        mlir::Complex<APFloat> c(apvalue, apvalue);
+        return DenseElementsAttr::get(tenType, c);
       }
     }
     if (auto IT = dyn_cast<IntegerType>(ET)) {
       APInt apvalue(IT.getWidth(), 0);
-      auto attr = DenseElementsAttr::get(tenType, apvalue);
-      return builder.create<arith::ConstantOp>(loc, tenType, attr);
+      return DenseElementsAttr::get(tenType, apvalue);
     }
     llvm::errs() << " cannot create null value of tensor type: " << tenType
                  << "\n";
     assert(0);
     return nullptr;
+  }
+  Value createNullValue(Type self, OpBuilder &builder, Location loc) const {
+    auto attr = createNullAttr(self);
+    assert(attr);
+    auto tenType = cast<TensorType>(self);
+    return arith::ConstantOp::create(builder, loc, tenType,
+                                     cast<TypedAttr>(attr));
   }
 
   Value createAddOp(Type self, OpBuilder &builder, Location loc, Value a,
@@ -195,16 +204,24 @@ template <typename T>
 class IntegerTypeInterface
     : public AutoDiffTypeInterface::ExternalModel<IntegerTypeInterface<T>, T> {
 public:
+  Attribute createNullAttr(Type self) const {
+    if (isa<IndexType>(self)) {
+      return IntegerAttr::get(self, APInt(64, 0));
+    } else {
+      return IntegerAttr::get(self, APInt(self.getIntOrFloatBitWidth(), 0));
+    }
+  }
+
   Value createNullValue(Type self, OpBuilder &builder, Location loc) const {
     if (isa<IndexType>(self)) {
-      return builder.create<arith::ConstantIndexOp>(loc, 0);
+      return arith::ConstantIndexOp::create(builder, loc, 0);
     }
-    return builder.create<arith::ConstantIntOp>(loc, self, 0);
+    return arith::ConstantIntOp::create(builder, loc, self, 0);
   }
 
   Value createAddOp(Type self, OpBuilder &builder, Location loc, Value a,
                     Value b) const {
-    return builder.create<arith::AddIOp>(loc, a, b);
+    return arith::AddIOp::create(builder, loc, a, b);
   }
 
   Value createConjOp(Type self, OpBuilder &builder, Location loc,
@@ -243,22 +260,25 @@ class ComplexTypeInterface
     : public AutoDiffTypeInterface::ExternalModel<ComplexTypeInterface,
                                                   ComplexType> {
 public:
-  Value createNullValue(Type self, OpBuilder &builder, Location loc) const {
+  Attribute createNullAttr(Type self) const {
     auto fltType = cast<FloatType>(cast<ComplexType>(self).getElementType());
-    mlir::Attribute attrs[2] = {
-        builder.getFloatAttr(fltType, APFloat(fltType.getFloatSemantics(), 0)),
-        builder.getFloatAttr(fltType, APFloat(fltType.getFloatSemantics(), 0))};
-    return builder.create<complex::ConstantOp>(loc, self,
-                                               builder.getArrayAttr(attrs));
+    auto zattr = cast<AutoDiffTypeInterface>(fltType).createNullAttr();
+    mlir::Attribute attrs[2] = {zattr, zattr};
+    return ArrayAttr::get(self.getContext(), attrs);
+  }
+  Value createNullValue(Type self, OpBuilder &builder, Location loc) const {
+    return complex::ConstantOp::create(builder, loc, self,
+                                       cast<ArrayAttr>(createNullAttr(self)));
   }
 
   Value createAddOp(Type self, OpBuilder &builder, Location loc, Value a,
                     Value b) const {
-    return builder.create<complex::AddOp>(loc, a, b)->getResult(0);
+    return setDerivativeFastMath(complex::AddOp::create(builder, loc, a, b))
+        ->getResult(0);
   }
   Value createConjOp(Type self, OpBuilder &builder, Location loc,
                      Value a) const {
-    return builder.create<complex::ConjOp>(loc, a)->getResult(0);
+    return complex::ConjOp::create(builder, loc, a)->getResult(0);
   }
 
   Type getShadowType(Type self, int64_t width) const {

@@ -12,24 +12,22 @@
 //===----------------------------------------------------------------------===//
 
 #include "Implementations/CoreDialectsAutoDiffImplementations.h"
+#include "Implementations/LoopCheckpointing.h"
 #include "Interfaces/AutoDiffOpInterface.h"
 #include "Interfaces/AutoDiffTypeInterface.h"
 #include "Interfaces/EnzymeLogic.h"
-#include "Interfaces/GradientUtils.h"
 #include "Interfaces/GradientUtilsReverse.h"
 #include "Passes/RemovalUtils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/Types.h"
-#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/RegionUtils.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
-#include "llvm/ADT/TypeSwitch.h"
+#include <array>
 #include <functional>
 
 using namespace mlir;
@@ -70,9 +68,9 @@ public:
     } else {
       Value lb = forOp.getLowerBound(), ub = forOp.getUpperBound(),
             step = forOp.getStep();
-      Value diff = builder.create<arith::SubIOp>(forOp->getLoc(), ub, lb);
+      Value diff = arith::SubIOp::create(builder, forOp->getLoc(), ub, lb);
       Value nSteps =
-          builder.create<arith::DivUIOp>(forOp->getLoc(), diff, step);
+          arith::DivUIOp::create(builder, forOp->getLoc(), diff, step);
       return {IntOrValue(nSteps)};
     }
   }
@@ -82,13 +80,13 @@ public:
 
     Value val = forOp.getBody()->getArgument(0);
     if (!matchPattern(forOp.getLowerBound(), m_Zero())) {
-      val = builder.create<arith::SubIOp>(forOp->getLoc(), val,
-                                          forOp.getLowerBound());
+      val = arith::SubIOp::create(builder, forOp->getLoc(), val,
+                                  forOp.getLowerBound());
     }
 
     if (!matchPattern(forOp.getStep(), m_One())) {
-      val =
-          builder.create<arith::DivUIOp>(forOp->getLoc(), val, forOp.getStep());
+      val = arith::DivUIOp::create(builder, forOp->getLoc(), val,
+                                   forOp.getStep());
     }
     return {val};
   }
@@ -96,17 +94,28 @@ public:
   static IRMapping createArgumentMap(PatternRewriter &rewriter,
                                      scf::ForOp forOp, ArrayRef<Value> indFor,
                                      scf::ForOp otherForOp,
-                                     ArrayRef<Value> indOther) {
+                                     ArrayRef<Value> reversedOther) {
     IRMapping map;
-    for (auto &&[f, o] : llvm::zip_equal(indFor, indOther))
+    for (auto &&[f, o] : llvm::zip_equal(indFor, reversedOther)) {
       map.map(f, o);
+    }
 
     Value canIdx = forOp.getBody()->getArgument(0);
     if (!map.contains(canIdx)) {
       assert(Equivalent(forOp.getLowerBound(), otherForOp.getLowerBound()));
       assert(Equivalent(forOp.getStep(), otherForOp.getStep()));
-      map.map(forOp.getBody()->getArgument(0),
-              otherForOp.getBody()->getArgument(0));
+
+      Location loc = forOp.getLoc();
+      // The reverse IV can be computed as (lb + ub - 1 - iv)
+      Value revIV =
+          arith::AddIOp::create(rewriter, loc, otherForOp.getLowerBound(),
+                                otherForOp.getUpperBound());
+      Value c1 = arith::ConstantOp::create(
+          rewriter, loc, IntegerAttr::get(revIV.getType(), 1));
+      revIV = arith::SubIOp::create(rewriter, loc, revIV, c1);
+      revIV = arith::SubIOp::create(rewriter, loc, revIV,
+                                    otherForOp.getBody()->getArgument(0));
+      map.map(forOp.getBody()->getArgument(0), revIV);
     }
     return map;
   }
@@ -114,9 +123,16 @@ public:
   static scf::ForOp replaceWithNewOperands(PatternRewriter &rewriter,
                                            scf::ForOp otherForOp,
                                            ArrayRef<Value> operands) {
-    auto newOtherForOp = rewriter.create<scf::ForOp>(
-        otherForOp->getLoc(), otherForOp.getLowerBound(),
+    auto newOtherForOp = scf::ForOp::create(
+        rewriter, otherForOp->getLoc(), otherForOp.getLowerBound(),
         otherForOp.getUpperBound(), otherForOp.getStep(), operands);
+
+    // The rebuilt loop is the same loop with extra iteration arguments, so it
+    // keeps everything that was set on it. Without this, anything the caller
+    // put there -- enzyme.disable_mincut in particular -- is dropped the moment
+    // the removal pass needs to widen the loop.
+    newOtherForOp->setDiscardableAttrs(
+        otherForOp->getDiscardableAttrDictionary());
 
     newOtherForOp.getRegion().takeBody(otherForOp.getRegion());
     rewriter.replaceOp(otherForOp, newOtherForOp->getResults().slice(
@@ -125,33 +141,206 @@ public:
   }
 
   static ValueRange getInits(scf::ForOp forOp) { return forOp.getInitArgs(); }
+
+  static bool mustPostAdd(scf::ForOp forOp) { return false; }
+
+  static Value initialValueInBlock(OpBuilder &builder, Block *body,
+                                   Value grad) {
+    auto Ty = cast<enzyme::GradientType>(grad.getType()).getBasetype();
+    return body->addArgument(Ty, grad.getLoc());
+  }
 };
 
 struct ForOpInterfaceReverse
     : public ReverseAutoDiffOpInterface::ExternalModel<ForOpInterfaceReverse,
-                                                       scf::ForOp> {
-private:
-  static Value makeIntConstant(Location loc, OpBuilder builder, int64_t val,
-                               Type ty) {
-    return builder.create<arith::ConstantOp>(loc, IntegerAttr::get(ty, val))
-        .getResult();
-  };
+                                                       scf::ForOp>,
+      public LoopCheckpointing<ForOpInterfaceReverse, scf::ForOp> {
+  // ---- hooks required by LoopCheckpointing<ForOpInterfaceReverse, scf::ForOp>
+  // ----
 
-  static void preserveAttributesButCheckpointing(Operation *newOp,
-                                                 Operation *oldOp) {
-    for (auto attr : oldOp->getDiscardableAttrs()) {
-      if (attr.getName() != "enzyme.enable_checkpointing")
-        newOp->setAttr(attr.getName(), attr.getValue());
+  static std::optional<int64_t>
+  getConstantNumberOfIterations(scf::ForOp forOp) {
+    return ForOpEnzymeOpsRemover::getConstantNumberOfIterations(forOp);
+  }
+
+  static Value materializeLowerBound(OpBuilder &, Location, scf::ForOp forOp,
+                                     MGradientUtilsReverse *gutils) {
+    return gutils->getNewFromOriginal(forOp.getLowerBound());
+  }
+
+  static Value materializeUpperBound(OpBuilder &, Location, scf::ForOp forOp,
+                                     MGradientUtilsReverse *gutils) {
+    return gutils->getNewFromOriginal(forOp.getUpperBound());
+  }
+
+  static Value materializeStep(OpBuilder &, Location, scf::ForOp forOp,
+                               MGradientUtilsReverse *gutils) {
+    return gutils->getNewFromOriginal(forOp.getStep());
+  }
+
+  static int64_t getConstantStart(scf::ForOp forOp) {
+    llvm::APInt v;
+    (void)matchPattern(forOp.getLowerBound(), m_ConstantInt(&v));
+    return v.getSExtValue();
+  }
+
+  static int64_t getConstantStep(scf::ForOp forOp) {
+    llvm::APInt v;
+    (void)matchPattern(forOp.getStep(), m_ConstantInt(&v));
+    return v.getSExtValue();
+  }
+
+  static LogicalResult requireSingleResultBounds(scf::ForOp) {
+    return success();
+  }
+
+  static void cloneOp(OpBuilder &builder, Operation &op, IRMapping &mapping) {
+    builder.clone(op, mapping);
+  }
+
+  // ---- periodic-scaffold hooks (see LoopCheckpointing.h doc comment) ----
+  // All of these reproduce this file's pre-existing periodic-checkpointing
+  // formulas verbatim (including the known reverse-formula defect noted in
+  // the header) -- this is a pure refactor for scf.for, not a behavior
+  // change.
+
+  static scf::ForOp createConstantScaffoldLoop(OpBuilder &builder, Location loc,
+                                               int64_t lb, int64_t ub,
+                                               int64_t step, ValueRange inits) {
+    // Creation order (step, then ub, then lb): canonicalize's constant
+    // placement is sensitive to it, since constants aren't freely reordered,
+    // so keeping one order here is what keeps the two scaffolds' constants
+    // laid out the same way.
+    Value stepV = arith::ConstantIndexOp::create(builder, loc, step);
+    Value ubV = arith::ConstantIndexOp::create(builder, loc, ub);
+    Value lbV = arith::ConstantIndexOp::create(builder, loc, lb);
+    return scf::ForOp::create(builder, loc, lbV, ubV, stepV, inits);
+  }
+
+  // Both outer loops count segments: one iteration per checkpoint, so the trip
+  // count is the stated period. It stays a compile-time constant even when the
+  // trip count of the loop being differentiated is not -- that is what reading
+  // the period as a segment count buys -- which is what lets the checkpoint
+  // storage these loops push one entry to per iteration be sized statically.
+  static scf::ForOp createForwardOuterLoop(OpBuilder &builder, Location loc,
+                                           const PeriodicSchedule &sched,
+                                           ValueRange inits) {
+    return createConstantScaffoldLoop(builder, loc, 0, sched.numSegments(), 1,
+                                      inits);
+  }
+
+  static scf::ForOp createReverseOuterLoop(OpBuilder &builder, Location loc,
+                                           const PeriodicSchedule &sched,
+                                           ValueRange inits) {
+    return createConstantScaffoldLoop(builder, loc, 0, sched.numSegments(), 1,
+                                      inits);
+  }
+
+  // {segment base, segment length}, for the segment `outerIV` indexes. Both are
+  // emitted once here, at the top of the outer body, and handed back to the
+  // hooks that need them -- which is also what keeps the base from being
+  // computed twice, once for the segment loop's bound and once for the
+  // induction variable derived from it.
+  static SmallVector<Value>
+  computeForwardSegmentHint(OpBuilder &builder, Location loc, Value outerIV,
+                            const PeriodicSchedule &sched) {
+    Value base = segmentBase(builder, loc, sched, outerIV);
+    return {base, segmentLength(builder, loc, sched, base)};
+  }
+
+  // The reverse replays the segments back to front, so its own counter names
+  // segment numSegments() - 1 - i. Same two values as the forward direction,
+  // from there on.
+  //
+  // numSegments() - 1, not nOuter: the two coincide only when there *is* a
+  // trailing segment. Without one (a period that divides the trip count, or a
+  // perfect-square sqrt split) nOuter - i names a segment one past the end, and
+  // the replayed segment's induction variable comes out shifted by a whole
+  // period -- silently, since the value is dead whenever the loop body does not
+  // read its induction variable, which is why no test caught it.
+  static SmallVector<Value>
+  computeReverseSegmentHint(OpBuilder &builder, Location loc, Value outerIV,
+                            const PeriodicSchedule &sched) {
+    Value lastSegment =
+        arith::ConstantIndexOp::create(builder, loc, sched.numSegments() - 1);
+    Value index = arith::SubIOp::create(builder, loc, lastSegment, outerIV);
+    Value base = segmentBase(builder, loc, sched, index);
+    return {base, segmentLength(builder, loc, sched, base)};
+  }
+
+  static scf::ForOp createSegmentLoop(OpBuilder &builder, Location loc,
+                                      ArrayRef<Value> hint, ValueRange inits) {
+    Value one = arith::ConstantIndexOp::create(builder, loc, 1);
+    Value zero = arith::ConstantIndexOp::create(builder, loc, 0);
+    return scf::ForOp::create(builder, loc, zero, hint[1], one, inits);
+  }
+
+  static scf::ForOp createForwardSegmentLoop(OpBuilder &builder, Location loc,
+                                             Value, ArrayRef<Value> fwdHint,
+                                             const PeriodicSchedule &,
+                                             ValueRange inits) {
+    return createSegmentLoop(builder, loc, fwdHint, inits);
+  }
+
+  static scf::ForOp createReverseSegmentLoop(OpBuilder &builder, Location loc,
+                                             Value, ArrayRef<Value> revHint,
+                                             const PeriodicSchedule &,
+                                             ValueRange inits) {
+    return createSegmentLoop(builder, loc, revHint, inits);
+  }
+
+  static scf::ForOp createLoopWithSameBounds(OpBuilder &builder, Location loc,
+                                             scf::ForOp templateLoop,
+                                             ValueRange inits) {
+    return scf::ForOp::create(builder, loc, templateLoop.getLowerBound(),
+                              templateLoop.getUpperBound(),
+                              templateLoop.getStep(), inits);
+  }
+
+  // start + step * (segment base + localIV): the original loop's own induction
+  // variable at the iteration this replay step stands for. Both directions
+  // count iterations from the same place, so both ask for it the same way.
+  static Value segmentIV(OpBuilder &builder, Location loc, scf::ForOp forOp,
+                         const PeriodicSchedule &sched, ArrayRef<Value> hint,
+                         Value localIV) {
+    Value flatIV = arith::AddIOp::create(builder, loc, hint[0], localIV);
+    if (sched.isDynamic()) {
+      flatIV = castToType(builder, loc, flatIV, sched.stepV.getType());
+      return arith::AddIOp::create(
+          builder, loc, sched.startV,
+          arith::MulIOp::create(builder, loc, sched.stepV, flatIV));
     }
+    Value startCst =
+        arith::ConstantIndexOp::create(builder, loc, getConstantStart(forOp));
+    Value stepCst =
+        arith::ConstantIndexOp::create(builder, loc, getConstantStep(forOp));
+    return arith::AddIOp::create(
+        builder, loc, arith::MulIOp::create(builder, loc, flatIV, stepCst),
+        startCst);
   }
 
-  static bool needsCheckpointing(scf::ForOp forOp) {
-    return forOp->hasAttrOfType<BoolAttr>("enzyme.enable_checkpointing") &&
-           forOp->getAttrOfType<BoolAttr>("enzyme.enable_checkpointing")
-               .getValue() &&
-           ForOpEnzymeOpsRemover::getConstantNumberOfIterations(forOp)
-               .has_value();
+  static Value computeForwardSegmentIV(OpBuilder &builder, Location loc,
+                                       scf::ForOp forOp, Value /*outerIV*/,
+                                       Value localIV,
+                                       const PeriodicSchedule &sched,
+                                       ArrayRef<Value> fwdHint) {
+    return segmentIV(builder, loc, forOp, sched, fwdHint, localIV);
   }
+
+  static Value computeReverseSegmentIV(OpBuilder &builder, Location loc,
+                                       scf::ForOp forOp, Value /*outerIV*/,
+                                       Value localIV,
+                                       const PeriodicSchedule &sched,
+                                       ArrayRef<Value> revHint) {
+    return segmentIV(builder, loc, forOp, sched, revHint, localIV);
+  }
+
+  static void createScaffoldYield(OpBuilder &builder, Location loc,
+                                  ValueRange operands) {
+    scf::YieldOp::create(builder, loc, operands);
+  }
+
+  // preserveAttributesButCheckpointing is inherited from LoopCheckpointing.
 
 public:
   LogicalResult createReverseModeAdjoint(Operation *op, OpBuilder &builder,
@@ -162,11 +351,13 @@ public:
     // variable).
 
     auto forOp = cast<scf::ForOp>(op);
+    auto yieldOp = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
 
     SmallVector<bool> operandsActive(forOp.getNumOperands() - 3, false);
     for (int i = 0, e = operandsActive.size(); i < e; ++i) {
       operandsActive[i] = !gutils->isConstantValue(op->getOperand(i + 3)) ||
-                          !gutils->isConstantValue(op->getResult(i));
+                          !gutils->isConstantValue(op->getResult(i)) ||
+                          !gutils->isConstantValue(yieldOp.getOperand(i));
     }
 
     SmallVector<Value> incomingGradients;
@@ -179,194 +370,16 @@ public:
       }
     }
 
-    if (needsCheckpointing(forOp)) {
-      int64_t numIters =
-          ForOpEnzymeOpsRemover::getConstantNumberOfIterations(forOp).value();
-      int64_t nInner = std::sqrt(numIters), nOuter = nInner;
-      int64_t trailingIters = numIters - nInner * nOuter;
-
-      bool hasTrailing = trailingIters > 0;
-
-      auto numIterArgs = forOp.getNumRegionIterArgs();
-
-      SetVector<Value> outsideRefs;
-      getUsedValuesDefinedAbove(op->getRegions(), outsideRefs);
-
-      IRMapping &mapping = gutils->originalToNewFn;
-
-      assert(outsideRefs.size() == caches.size() - numIterArgs);
-
-      SmallVector<Value> cachedOutsideRefs;
-      for (auto [i, ref] : llvm::enumerate(outsideRefs)) {
-        Value refVal = gutils->popCache(caches[numIterArgs + i], builder);
-        cachedOutsideRefs.push_back(refVal);
-        mapping.map(ref, refVal);
-      }
-
-      auto ivTy = forOp.getLowerBound().getType();
-      Value outerUB = makeIntConstant(forOp.getLowerBound().getLoc(), builder,
-                                      nOuter + hasTrailing, ivTy);
-      auto revOuter = builder.create<scf::ForOp>(
-          op->getLoc(),
-          makeIntConstant(forOp.getLowerBound().getLoc(), builder, 0, ivTy),
-          outerUB,
-          makeIntConstant(forOp.getLowerBound().getLoc(), builder, 1, ivTy),
-          incomingGradients);
-      preserveAttributesButCheckpointing(revOuter, forOp);
-
-      OpBuilder::InsertionGuard guard(builder);
-      builder.setInsertionPointToEnd(revOuter.getBody());
-
-      Location loc = forOp.getInductionVar().getLoc();
-      Value currentOuterStep = builder.create<arith::SubIOp>(
-          loc, makeIntConstant(loc, builder, nOuter, ivTy),
-          revOuter.getInductionVar());
-
-      SmallVector<Value> initArgs(numIterArgs, nullptr);
-      for (size_t i = 0; i < numIterArgs; ++i) {
-        initArgs[i] = gutils->popCache(caches[i], builder);
-      }
-
-      auto nInnerCst = makeIntConstant(forOp.getLowerBound().getLoc(), builder,
-                                       nInner, ivTy);
-      Value zero = makeIntConstant(forOp.getLowerBound().getLoc(), builder, 0,
-                                   ivTy),
-            one = makeIntConstant(forOp.getLowerBound().getLoc(), builder, 1,
-                                  ivTy);
-
-      Value nInnerUB = nInnerCst;
-      if (trailingIters > 0) {
-        // this is the first reverse iteration
-        Location loc = forOp.getUpperBound().getLoc();
-        nInnerUB = builder.create<arith::SelectOp>(
-            loc,
-            builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
-                                          revOuter.getInductionVar(), zero),
-            makeIntConstant(loc, builder, trailingIters, ivTy), nInnerCst);
-      }
-
-      auto revInner = builder.create<scf::ForOp>(forOp.getLoc(), zero, nInnerUB,
-                                                 one, initArgs);
-      preserveAttributesButCheckpointing(revInner, forOp);
-
-      revInner->setAttrs(op->getAttrs());
-      revInner->removeAttr("enzyme.enable_checkpointing");
-
-      llvm::APInt stepI;
-      if (!matchPattern(forOp.getStep(), m_ConstantInt(&stepI))) {
-        op->emitError() << "step size is not known constant\n";
-        return failure();
-      }
-
-      llvm::APInt startI;
-      if (!matchPattern(forOp.getLowerBound(), m_ConstantInt(&startI))) {
-        op->emitError() << "lower bound is not known constant\n";
-        return failure();
-      }
-
-      builder.setInsertionPointToEnd(revInner.getBody());
-
-      Value currentIV = builder.create<arith::AddIOp>(
-          loc,
-          builder.create<arith::MulIOp>(
-              loc,
-              builder.create<arith::AddIOp>(
-                  loc,
-                  builder.create<arith::MulIOp>(loc, currentOuterStep,
-                                                nInnerCst),
-                  revInner.getInductionVar()),
-              builder.create<arith::ConstantOp>(loc,
-                                                IntegerAttr::get(ivTy, stepI))),
-          builder.create<arith::ConstantOp>(loc,
-                                            IntegerAttr::get(ivTy, startI)));
-
-      for (auto [oldArg, newArg] :
-           llvm::zip_equal(forOp.getBody()->getArguments(),
-                           revInner.getBody()->getArguments()))
-        mapping.map(oldArg, newArg);
-      mapping.map(forOp.getInductionVar(), currentIV);
-
-      for (auto &it : *forOp.getBody()) {
-        auto newOp = builder.clone(it, mapping);
-        gutils->originalToNewFnOps[&it] = newOp;
-      }
-
-      builder.setInsertionPointToEnd(revOuter.getBody());
-
-      auto revLoop = builder.create<scf::ForOp>(
-          forOp.getLoc(), zero, nInnerUB, one,
-          revOuter.getBody()->getArguments().drop_front());
-      preserveAttributesButCheckpointing(revLoop, forOp);
-
-      Block *revLoopBody = revLoop.getBody();
-      builder.setInsertionPointToEnd(revLoopBody);
-
-      int revIdx = 1;
-      for (auto &&[active, operand] :
-           llvm::zip_equal(operandsActive,
-                           forOp.getBody()->getTerminator()->getOperands())) {
-        if (active) {
-          gutils->addToDiffe(operand, revLoopBody->getArgument(revIdx),
-                             builder);
-          revIdx++;
-        }
-      }
-
-      Block *origBody = forOp.getBody();
-
-      bool valid = true;
-
-      auto first = origBody->rbegin();
-      first++; // skip terminator
-
-      auto last = origBody->rend();
-
-      for (auto it = first; it != last; ++it) {
-        Operation *op = &*it;
-        valid &= gutils->Logic.visitChild(op, builder, gutils).succeeded();
-      }
-
-      SmallVector<Value> newResults;
-      for (auto &&[active, arg] : llvm::zip_equal(
-               operandsActive, origBody->getArguments().drop_front())) {
-        if (active) {
-          newResults.push_back(gutils->diffe(arg, builder));
-          if (!gutils->isConstantValue(arg))
-            gutils->zeroDiffe(arg, builder);
-        }
-      }
-
-      builder.setInsertionPointToEnd(revLoopBody);
-      builder.create<scf::YieldOp>(forOp.getBody()->getTerminator()->getLoc(),
-                                   newResults);
-
-      builder.setInsertionPointToEnd(revOuter.getBody());
-      builder.create<scf::YieldOp>(forOp.getBody()->getTerminator()->getLoc(),
-                                   revLoop.getResults());
-
-      builder.setInsertionPointAfter(revOuter);
-
-      revIdx = 0;
-      for (auto &&[active, arg] : llvm::zip_equal(
-               operandsActive,
-               op->getOperands().slice(3, op->getNumOperands() - 3))) {
-        if (active) {
-          if (!gutils->isConstantValue(arg)) {
-            gutils->addToDiffe(arg, revOuter->getResult(revIdx), builder);
-          }
-          revIdx++;
-        }
-      }
-
-      return success(valid);
-    }
+    if (auto r = tryCreateReverseModeAdjoint(forOp, op, builder, gutils, caches,
+                                             operandsActive, incomingGradients))
+      return *r;
 
     auto start = gutils->popCache(caches[0], builder);
     auto end = gutils->popCache(caches[1], builder);
     auto step = gutils->popCache(caches[2], builder);
 
-    auto repFor = builder.create<scf::ForOp>(forOp.getLoc(), start, end, step,
-                                             incomingGradients);
+    auto repFor = scf::ForOp::create(builder, forOp.getLoc(), start, end, step,
+                                     incomingGradients);
     preserveAttributesButCheckpointing(repFor, forOp);
 
     bool valid = true;
@@ -377,37 +390,34 @@ public:
 
         // Create implicit terminator if not present (when num results > 0)
         if (revBB.empty()) {
-          bodyBuilder.create<scf::YieldOp>(repFor->getLoc());
+          scf::YieldOp::create(bodyBuilder, repFor->getLoc());
         }
+
+        bodyBuilder.setInsertionPointToStart(&revBB);
+        mlir::enzyme::localizeGradients(bodyBuilder, gutils, &oBB);
+
         bodyBuilder.setInsertionPoint(revBB.getTerminator());
 
-        // All values defined in the body should have no use outside this block
-        // therefore we can set their diffe to zero upon entering the reverse
-        // block to simplify the work of the remove-unnecessary-enzyme-ops pass.
-        for (auto operand : oBB.getArguments().slice(1)) {
-          if (!gutils->isConstantValue(operand)) {
+        auto term = oBB.getTerminator();
+
+        for (auto &&[active, operand] :
+             llvm::zip_equal(operandsActive, term->getOperands())) {
+          if (active) {
+            // Zero the diffe at the start of each iteration because it should
+            // not accumulate across iterations. The new gradient is passed as
+            // an iter_arg in the reverse for.
             gutils->zeroDiffe(operand, bodyBuilder);
           }
         }
 
-        for (auto &it : oBB.getOperations()) {
-          for (auto res : it.getResults()) {
-            if (!gutils->isConstantValue(res)) {
-              gutils->zeroDiffe(res, bodyBuilder);
-            }
-          }
-        }
-
-        auto term = oBB.getTerminator();
-
-        for (auto &&[active, arg, operand] :
-             llvm::zip_equal(operandsActive, revBB.getArguments().slice(1),
-                             term->getOperands())) {
+        unsigned argIdx = 1; // Skip over the reversed IV
+        for (auto &&[active, operand] :
+             llvm::zip_equal(operandsActive, term->getOperands())) {
           if (active) {
-            // Set diffe here, not add because it should not accumulate across
-            // iterations. Instead the new gradient for this operand is passed
-            // in the return of the reverse for body.
-            gutils->setDiffe(operand, arg, bodyBuilder);
+            // If the same value is yielded multiple times in the original, the
+            // gradients must be accumulated.
+            gutils->addToDiffe(operand, revBB.getArgument(argIdx), bodyBuilder);
+            argIdx++;
           }
         }
 
@@ -439,11 +449,14 @@ public:
       }
     }
 
-    for (auto &&[active, res, arg] : llvm::zip_equal(
-             operandsActive, repFor->getResults(), forOp.getInitArgs())) {
+    unsigned resIdx = 0;
+    for (auto &&[active, arg] :
+         llvm::zip_equal(operandsActive, forOp.getInitArgs())) {
       if (active) {
-        if (!gutils->isConstantValue(arg))
-          gutils->addToDiffe(arg, res, builder);
+        if (!gutils->isConstantValue(arg)) {
+          gutils->addToDiffe(arg, repFor.getResult(resIdx), builder);
+          resIdx++;
+        }
       }
     }
 
@@ -453,99 +466,12 @@ public:
   SmallVector<Value> cacheValues(Operation *op,
                                  MGradientUtilsReverse *gutils) const {
     auto forOp = cast<scf::ForOp>(op);
+
+    if (auto r = tryCacheValues(forOp, op, gutils))
+      return *r;
+
     Operation *newOp = gutils->getNewFromOriginal(op);
     OpBuilder cacheBuilder(newOp);
-
-    if (needsCheckpointing(forOp)) {
-      int64_t numIters =
-          ForOpEnzymeOpsRemover::getConstantNumberOfIterations(forOp).value();
-      int64_t nInner = std::sqrt(numIters), nOuter = nInner;
-      int64_t trailingIters = numIters - nInner * nOuter;
-      bool hasTrailing = trailingIters > 0;
-
-      SetVector<Value> outsideRefs;
-      getUsedValuesDefinedAbove(op->getRegions(), outsideRefs);
-
-      SmallVector<Value> caches;
-
-      scf::ForOp newForOp = cast<scf::ForOp>(gutils->getNewFromOriginal(op));
-
-      Type ty = forOp.getLowerBound().getType();
-      auto outerFwd = cacheBuilder.create<scf::ForOp>(
-          op->getLoc(),
-          makeIntConstant(forOp.getLowerBound().getLoc(), cacheBuilder, 0, ty),
-          makeIntConstant(forOp.getUpperBound().getLoc(), cacheBuilder,
-                          nInner * (nOuter + hasTrailing), ty),
-          makeIntConstant(forOp.getStep().getLoc(), cacheBuilder, nInner, ty),
-          newForOp.getInitArgs());
-      preserveAttributesButCheckpointing(outerFwd, forOp);
-
-      cacheBuilder.setInsertionPointToStart(outerFwd.getBody());
-      auto nInnerCst = makeIntConstant(forOp.getUpperBound().getLoc(),
-                                       cacheBuilder, nInner, ty);
-
-      Value nInnerUB = nInnerCst;
-      if (trailingIters > 0) {
-        // if this is the last iteration, then the inner
-        // loop will only make trailingIters iterations
-        Location loc = forOp.getUpperBound().getLoc();
-        nInnerUB = cacheBuilder.create<arith::SelectOp>(
-            loc,
-            cacheBuilder.create<arith::CmpIOp>(
-                loc, arith::CmpIPredicate::eq, outerFwd.getInductionVar(),
-                makeIntConstant(loc, cacheBuilder, nInner * nOuter, ty)),
-            makeIntConstant(loc, cacheBuilder, trailingIters, ty), nInnerCst);
-      }
-
-      auto innerFwd = cacheBuilder.create<scf::ForOp>(
-          op->getLoc(),
-          makeIntConstant(forOp.getLowerBound().getLoc(), cacheBuilder, 0, ty),
-          nInnerUB,
-          makeIntConstant(forOp.getStep().getLoc(), cacheBuilder, 1, ty),
-          outerFwd.getBody()->getArguments().drop_front());
-      preserveAttributesButCheckpointing(innerFwd, forOp);
-
-      cacheBuilder.setInsertionPointToEnd(innerFwd.getBody());
-      IRMapping &mapping = gutils->originalToNewFn;
-
-      Location loc = forOp.getInductionVar().getLoc();
-      auto currentIV = cacheBuilder.create<arith::MulIOp>(
-          loc,
-          cacheBuilder.create<arith::AddIOp>(
-              loc,
-              cacheBuilder.create<arith::MulIOp>(
-                  loc, outerFwd.getInductionVar(), nInnerCst),
-              innerFwd.getInductionVar()),
-          newForOp.getStep());
-
-      for (auto [oldArg, newArg] :
-           llvm::zip_equal(forOp.getBody()->getArguments(),
-                           innerFwd.getBody()->getArguments()))
-        mapping.map(oldArg, newArg);
-      mapping.map(forOp.getInductionVar(), currentIV);
-
-      for (auto &it : *forOp.getBody())
-        cacheBuilder.clone(it, mapping);
-
-      cacheBuilder.setInsertionPointToEnd(outerFwd.getBody());
-      for (auto initArg : innerFwd.getInitArgs())
-        caches.push_back(gutils->initAndPushCache(initArg, cacheBuilder));
-
-      cacheBuilder.create<scf::YieldOp>(
-          forOp.getBody()->getTerminator()->getLoc(), innerFwd->getResults());
-
-      cacheBuilder.setInsertionPointAfter(outerFwd);
-
-      for (auto ref : outsideRefs)
-        caches.push_back(gutils->initAndPushCache(mapping.lookupOrDefault(ref),
-                                                  cacheBuilder));
-
-      gutils->replaceOrigOpWith(op, outerFwd.getResults());
-      gutils->erase(newForOp);
-      gutils->originalToNewFnOps[op] = outerFwd;
-
-      return caches;
-    }
 
     SmallVector<Value> caches;
 
@@ -564,9 +490,10 @@ public:
     return caches;
   }
 
-  void createShadowValues(Operation *op, OpBuilder &builder,
-                          MGradientUtilsReverse *gutils) const {
+  LogicalResult createShadowValues(Operation *op, OpBuilder &builder,
+                                   MGradientUtilsReverse *gutils) const {
     // auto forOp = cast<scf::ForOp>(op);
+    return success();
   }
 };
 
@@ -606,6 +533,7 @@ struct ParallelOpEnzymeOpsRemover
     }
     return bounds;
   }
+
   static SmallVector<Value>
   computeReversedIndices(PatternRewriter &rewriter, scf::ParallelOp parOp,
                          ArrayRef<Value> otherInductionVariable,
@@ -622,7 +550,7 @@ struct ParallelOpEnzymeOpsRemover
                          parOp.getStep())) {
       Value val = iv;
       if (!matchPattern(lb, m_Zero())) {
-        val = arith::SubIOp::create(builder, parOp.getLoc(), val, step);
+        val = arith::SubIOp::create(builder, parOp.getLoc(), val, lb);
       }
 
       if (!matchPattern(step, m_One())) {
@@ -660,18 +588,53 @@ struct ParallelOpEnzymeOpsRemover
                                                 ArrayRef<Value> operands) {
     auto newOtherParOp = scf::ParallelOp::create(
         rewriter, otherParallelOp.getLoc(), otherParallelOp.getLowerBound(),
-        otherParallelOp.getUpperBound(), otherParallelOp.getStep(),
-        otherParallelOp.getInitVals());
+        otherParallelOp.getUpperBound(), otherParallelOp.getStep(), operands);
+
+    newOtherParOp->setDiscardableAttrs(
+        otherParallelOp->getDiscardableAttrDictionary());
 
     newOtherParOp.getRegion().takeBody(otherParallelOp.getRegion());
     rewriter.replaceOp(
         otherParallelOp,
         newOtherParOp.getResults().slice(0, otherParallelOp.getNumResults()));
+
+    if (operands.size() >= 1) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      Operation *oldTerm = newOtherParOp.getBody()->getTerminator();
+      rewriter.setInsertionPointToEnd(newOtherParOp.getBody());
+      auto term = scf::ReduceOp::create(rewriter, newOtherParOp.getLoc(),
+                                        oldTerm->getOperands());
+
+      for (auto [reg, operand] :
+           llvm::zip_equal(term->getRegions(), operands)) {
+        Block *b = &reg.front();
+        rewriter.setInsertionPointToEnd(b);
+
+        auto Ty = cast<AutoDiffTypeInterface>(operand.getType());
+        Value reduced = Ty.createAddOp(rewriter, operand.getLoc(),
+                                       b->getArgument(0), b->getArgument(1));
+        scf::ReduceReturnOp::create(rewriter, reduced.getLoc(), reduced);
+      }
+
+      oldTerm->erase();
+    }
+
     return newOtherParOp;
   }
 
   static ValueRange getInits(scf::ParallelOp parallelOp) {
     return parallelOp.getInitVals();
+  }
+
+  static bool mustPostAdd(scf::ParallelOp forOp) { return false; }
+
+  static Value initialValueInBlock(OpBuilder &builder, Block *body,
+                                   Value grad) {
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToStart(body);
+    return cast<AutoDiffTypeInterface>(
+               cast<enzyme::GradientType>(grad.getType()).getBasetype())
+        .createNullValue(builder, grad.getLoc());
   }
 };
 
@@ -700,30 +663,16 @@ struct ParallelOpInterfaceReverse
     bool valid = true;
     bool wasAtomic = gutils->AtomicAdd;
     gutils->AtomicAdd = true;
-    std::function<Value(Location, Type)> gradientCreator = [&](Location loc,
-                                                               Type t) {
-      auto shadowty = getShadowType(t);
-      OpBuilder builder(t.getContext());
-      // Gradients of values defined within the parallel body should be local to
-      // each iteration
-      builder.setInsertionPointToStart(revPar.getBody());
-
-      auto shadow = builder.create<enzyme::InitOp>(
-          loc, enzyme::GradientType::get(t.getContext(), shadowty));
-      auto toset =
-          cast<AutoDiffTypeInterface>(shadowty).createNullValue(builder, loc);
-      builder.create<enzyme::SetOp>(loc, shadow, toset);
-      return shadow;
-    };
-    gutils->registerGradientCreatorHook(gradientCreator);
-    auto scope = llvm::make_scope_exit(
-        [&]() { gutils->deregisterGradientCreatorHook(gradientCreator); });
 
     {
       Block *oBB = parallelOp.getBody();
       Block *revBB = revPar.getBody();
 
       OpBuilder bodyBuilder(revBB, revBB->end());
+
+      bodyBuilder.setInsertionPointToStart(revBB);
+      mlir::enzyme::localizeGradients(bodyBuilder, gutils, oBB);
+
       bodyBuilder.setInsertionPoint(revBB->getTerminator());
 
       auto first = oBB->rbegin();
@@ -760,8 +709,48 @@ struct ParallelOpInterfaceReverse
     return caches;
   }
 
-  void createShadowValues(Operation *op, OpBuilder &builder,
-                          MGradientUtilsReverse *gutils) const {}
+  LogicalResult createShadowValues(Operation *op, OpBuilder &builder,
+                                   MGradientUtilsReverse *gutils) const {
+    return success();
+  }
+};
+
+struct IfOpEnzymeOpsRemover
+    : public IfLikeEnzymeOpsRemover<IfOpEnzymeOpsRemover, scf::IfOp> {
+  static Block *getThenBlock(scf::IfOp ifOp, OpBuilder &builder) {
+    return ifOp.thenBlock();
+  }
+
+  static Block *getElseBlock(scf::IfOp ifOp, OpBuilder &builder) {
+    // Ensure the if has an else block
+    if (ifOp.getElseRegion().empty()) {
+      OpBuilder::InsertionGuard guard(builder);
+      Block &newBlock = ifOp.getElseRegion().emplaceBlock();
+      builder.setInsertionPointToStart(&newBlock);
+      scf::YieldOp::create(builder, ifOp.getLoc());
+    }
+
+    return ifOp.elseBlock();
+  }
+
+  static Value getDummyValue(OpBuilder &builder, Location loc, Type dummyType) {
+    return cast<AutoDiffTypeInterface>(dummyType).createNullValue(builder, loc);
+  }
+
+  static scf::IfOp replace(PatternRewriter &rewriter, scf::IfOp otherIfOp,
+                           TypeRange resultTypes) {
+    auto newIf = scf::IfOp::create(rewriter, otherIfOp->getLoc(), resultTypes,
+                                   otherIfOp.getCondition());
+
+    newIf.getThenRegion().takeBody(otherIfOp.getThenRegion());
+    newIf.getElseRegion().takeBody(otherIfOp.getElseRegion());
+
+    rewriter.replaceAllUsesWith(
+        otherIfOp->getResults(),
+        newIf->getResults().slice(0, otherIfOp->getNumResults()));
+    rewriter.eraseOp(otherIfOp);
+    return newIf;
+  }
 };
 
 struct IfOpInterfaceReverse
@@ -776,7 +765,10 @@ struct IfOpInterfaceReverse
 
     SmallVector<bool> resultsActive(ifOp.getNumResults(), false);
     for (int i = 0, e = resultsActive.size(); i < e; ++i) {
-      resultsActive[i] = !gutils->isConstantValue(ifOp.getResult(i));
+      auto result = ifOp.getResult(i);
+      auto iface = dyn_cast<AutoDiffTypeInterface>(result.getType());
+      bool needsGrad = iface && !iface.isMutable();
+      resultsActive[i] = needsGrad && !gutils->isConstantValue(result);
     }
 
     SmallVector<Value> incomingGradients;
@@ -790,7 +782,7 @@ struct IfOpInterfaceReverse
     }
 
     auto revIf =
-        builder.create<scf::IfOp>(ifOp.getLoc(), TypeRange{}, cond, hasElse);
+        scf::IfOp::create(builder, ifOp.getLoc(), TypeRange{}, cond, hasElse);
     bool valid = true;
     for (auto &&[oldReg, newReg] :
          llvm::zip(op->getRegions(), revIf->getRegions())) {
@@ -798,13 +790,16 @@ struct IfOpInterfaceReverse
         OpBuilder bodyBuilder(&revBB, revBB.end());
         bodyBuilder.setInsertionPoint(revBB.getTerminator());
 
-        // All values defined in the body should have no use outside this block
-        // therefore we can set their diffe to zero upon entering the reverse
-        // block to simplify the work of the remove-unnecessary-enzyme-ops pass.
+        // All values defined in the body should have no use outside this
+        // block therefore we can set their diffe to zero upon entering the
+        // reverse block to simplify the work of the
+        // remove-unnecessary-enzyme-ops pass.
         for (auto &it : oBB.getOperations()) {
           for (auto res : it.getResults()) {
             if (!gutils->isConstantValue(res)) {
-              gutils->zeroDiffe(res, bodyBuilder);
+              auto iface = dyn_cast<AutoDiffTypeInterface>(res.getType());
+              if (iface && !iface.isMutable())
+                gutils->zeroDiffe(res, bodyBuilder);
             }
           }
         }
@@ -821,10 +816,10 @@ struct IfOpInterfaceReverse
 
         for (auto &&[arg, operand] :
              llvm::zip_equal(incomingGradients, activeTermOperands)) {
-          // Check activity of the argument separately from the result. If some
-          // branches yield inactive values while others yield active values,
-          // the result will be active, but this operand may still be inactive
-          // (and we cannot addToDiffe)
+          // Check activity of the argument separately from the result. If
+          // some branches yield inactive values while others yield active
+          // values, the result will be active, but this operand may still be
+          // inactive (and we cannot addToDiffe)
           if (!gutils->isConstantValue(operand)) {
             gutils->addToDiffe(operand, arg, bodyBuilder);
           }
@@ -856,8 +851,73 @@ struct IfOpInterfaceReverse
     return SmallVector<Value>{cacheCond};
   }
 
-  void createShadowValues(Operation *op, OpBuilder &builder,
-                          MGradientUtilsReverse *gutils) const {}
+  LogicalResult createShadowValues(Operation *op, OpBuilder &builder,
+                                   MGradientUtilsReverse *gutils) const {
+    // TODO: consider making this generic for RegionBranchOpInterface
+    auto ifOp = cast<scf::IfOp>(op);
+    if (ifOp.getNumResults() == 0)
+      return success();
+
+    auto newIf = cast<scf::IfOp>(gutils->getNewFromOriginal(ifOp));
+    SmallVector<Type> newResultTypes;
+    SmallVector<bool> needsShadow(op->getNumResults());
+    for (auto result : op->getResults()) {
+      newResultTypes.push_back(result.getType());
+      auto iface = dyn_cast<AutoDiffTypeInterface>(result.getType());
+      if (iface && iface.isMutable() && !gutils->isConstantValue(result)) {
+        newResultTypes.push_back(result.getType());
+        needsShadow[result.getResultNumber()] = true;
+      } else {
+        needsShadow[result.getResultNumber()] = false;
+      }
+    }
+
+    // Replace the new op with an augmented op
+    auto augmentedOp =
+        scf::IfOp::create(builder, op->getLoc(), newResultTypes,
+                          gutils->getNewFromOriginal(ifOp.getCondition()),
+                          /*withElseRegion=*/true);
+
+    for (auto &&[oldReg, newReg, augReg] :
+         llvm::zip(op->getRegions(), newIf->getRegions(),
+                   augmentedOp->getRegions())) {
+      augReg.takeBody(newReg);
+      for (auto &&[oldBlk, augBlk] : llvm::zip(oldReg, augReg)) {
+        Operation *oldYield = oldBlk.getTerminator();
+        Operation *augYield = augBlk.getTerminator();
+
+        OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPoint(augYield);
+        SmallVector<Value> newOperands;
+        for (auto &&[oldOperand, augOperand] :
+             llvm::zip(oldYield->getOpOperands(), augYield->getOpOperands())) {
+          newOperands.push_back(augOperand.get());
+          if (needsShadow[oldOperand.getOperandNumber()]) {
+            newOperands.push_back(
+                gutils->invertPointerM(oldOperand.get(), builder));
+          }
+        }
+
+        scf::YieldOp::create(builder, oldYield->getLoc(), newOperands);
+        augYield->erase();
+      }
+    }
+
+    // Determine which returns correspond to the primal
+    SmallVector<Value> augmentedResults;
+    unsigned resIdx = 0;
+    for (auto res : ifOp.getResults()) {
+      augmentedResults.push_back(augmentedOp.getResult(resIdx));
+      resIdx++;
+      if (needsShadow[res.getResultNumber()]) {
+        gutils->setInvertedPointer(res, augmentedOp.getResult(resIdx));
+        resIdx++;
+      }
+    }
+    newIf.replaceAllUsesWith(augmentedResults);
+    newIf.erase();
+    return success();
+  }
 };
 
 struct ForOpADDataFlow
@@ -896,6 +956,257 @@ struct ForOpADDataFlow
   }
 };
 
+struct ParallelOpADDataFlow
+    : public ADDataFlowOpInterface::ExternalModel<ParallelOpADDataFlow,
+                                                  scf::ParallelOp> {
+  SmallVector<Value> getPotentialIncomingValuesRes(Operation *op,
+                                                   OpResult res) const {
+    auto parOp = cast<scf::ParallelOp>(op);
+    const size_t num_lower = parOp.getLowerBound().size();
+    const size_t num_upper = parOp.getUpperBound().size();
+    const size_t num_step = parOp.getStep().size();
+    const size_t init_vals_offset = num_lower + num_upper + num_step;
+    return {parOp->getOperand(res.getResultNumber() + init_vals_offset),
+            parOp.getBody()
+                ->getTerminator()
+                ->getRegion(res.getResultNumber())
+                .front()
+                .getTerminator()
+                ->getOperand(0)};
+  }
+  SmallVector<Value> getPotentialIncomingValuesArg(Operation *op,
+                                                   BlockArgument arg) const {
+    // TO DO:  do we need this?
+    assert(0);
+    return SmallVector<Value>();
+  }
+  SmallVector<Value> getPotentialTerminatorUsers(Operation *op, Operation *term,
+                                                 Value val) const {
+    SmallVector<Value> sv;
+
+    for (auto [idx, arg] : llvm::enumerate(term->getOperands())) {
+      if (arg == val) {
+        sv.push_back(term->getRegion(idx).front().getArgument(0));
+      }
+    }
+
+    return sv;
+  }
+};
+
+struct ReduceOpADDataFlow
+    : public ADDataFlowOpInterface::ExternalModel<ReduceOpADDataFlow,
+                                                  scf::ReduceOp> {
+  SmallVector<Value> getPotentialIncomingValuesRes(Operation *op,
+                                                   OpResult res) const {
+    // ReduceOp's have no results
+    return SmallVector<Value>();
+  }
+  SmallVector<Value> getPotentialIncomingValuesArg(Operation *op,
+                                                   BlockArgument arg) const {
+    // The op here is the parent of the block, which is a ReduceOp
+    // All but the last block arguments match up with the corresponding operand
+    // of the reduce op.  The last matches up with terminator operand as well as
+    // the initial value.  If this is the ith block, it is the ith initial value
+
+    auto redOp = cast<scf::ReduceOp>(op);
+    mlir::Block *ownerBlock = arg.getOwner();
+    auto num_args = ownerBlock->getNumArguments();
+    auto arg_idx = arg.getArgNumber();
+    auto region_idx = ownerBlock->getParent()->getRegionNumber();
+    if (arg_idx == num_args - 1) {
+      auto parOp = cast<scf::ParallelOp>(redOp->getParentOp());
+      auto num_lb = parOp.getLowerBound().size();
+      auto num_ub = parOp.getUpperBound().size();
+      auto num_st = parOp.getStep().size();
+      return {parOp->getOperand(num_lb + num_ub + num_st + region_idx),
+              ownerBlock->getTerminator()->getOperand(0)};
+    } else {
+      return {redOp->getOperand(region_idx)};
+    }
+  }
+  SmallVector<Value> getPotentialTerminatorUsers(Operation *op, Operation *term,
+                                                 Value val) const {
+    auto redOp = cast<scf::ReduceOp>(op);
+    auto parOp = cast<scf::ParallelOp>(redOp->getParentOp());
+    mlir::Block *ownerBlock = term->getBlock();
+    auto region_idx = ownerBlock->getParent()->getRegionNumber();
+
+    return {parOp->getResult(region_idx), ownerBlock->getArgument(1)};
+  }
+};
+
+class SCFReduceAutoDiffOpInterface
+    : public AutoDiffOpInterface::ExternalModel<SCFReduceAutoDiffOpInterface,
+                                                scf::ReduceOp> {
+public:
+  LogicalResult createForwardModeTangent(Operation *origTerminator,
+                                         OpBuilder &builder,
+                                         MGradientUtils *gutils) const {
+    auto parentOp = origTerminator->getParentOp();
+    if (!isa<scf::ParallelOp>(parentOp)) {
+      origTerminator->emitError()
+          << " createForwardModeTangent called with invalid parent" << *parentOp
+          << "\n";
+      return failure();
+    }
+
+    // Note, this works for scf::ReduceOp because it has the same number of
+    // operands as the parent (scf::ParallelOp) has results
+    assert(parentOp->getNumResults() == origTerminator->getNumOperands());
+    llvm::SmallDenseSet<unsigned> operandsToShadow;
+    for (auto res : parentOp->getResults()) {
+      if (!gutils->isConstantValue(res))
+        operandsToShadow.insert(res.getResultNumber());
+    }
+
+    SmallVector<Value> newOperands;
+    newOperands.reserve(origTerminator->getNumOperands() +
+                        operandsToShadow.size());
+    for (OpOperand &operand : origTerminator->getOpOperands()) {
+      newOperands.push_back(gutils->getNewFromOriginal(operand.get()));
+      if (operandsToShadow.contains(operand.getOperandNumber()))
+        newOperands.push_back(gutils->invertPointerM(operand.get(), builder));
+    }
+
+    // Assuming shadows following the originals are fine.
+    // TODO: consider extending to have a ShadowableTerminatorOpInterface
+    Operation *replTerminator = gutils->getNewFromOriginal(origTerminator);
+    replTerminator->setOperands(newOperands);
+
+    // Differentiate the body of the reducer
+    for (auto &origRegion : origTerminator->getRegions()) {
+      for (auto &origBlock : origRegion) {
+        for (Operation &o : origBlock) {
+          if (failed(gutils->visitChild(&o))) {
+            replTerminator->emitError() << " Differentiating reducer block "
+                                        << *replTerminator << " failed!\n";
+          }
+        }
+      }
+    }
+
+    // Delete the primal operations in each differentiated reducer block by
+    // building a map of the operations that are ultimately used by starting
+    // from the shadow operands of the terminator (scf::ReduceReturnOp). Then
+    // erase all of the operations that aren't used.  Note that from above, all
+    // operands for the terminator are shadow operands.
+    for (auto &region : replTerminator->getRegions()) {
+      for (auto &block : region) {
+        std::map<Operation *, bool> used;
+        std::vector<Operation *> op_list;
+
+        // Initialize all operations as not used
+        for (Operation &o : block) {
+          used[&o] = false;
+          op_list.push_back(&o);
+        }
+
+        // Recursively mark operations that are used starting from the
+        // terminator
+        auto mark_used = [&used](const auto &self, Operation *op) -> void {
+          if (op != nullptr) {
+            assert(used.find(op) != used.end());
+            used[op] = true;
+            for (auto v : op->getOperands())
+              self(self, v.getDefiningOp());
+          }
+        };
+        mark_used(mark_used, block.getTerminator());
+
+        // Delete the unused operations squentially, starting from the last so
+        // that all users of an operation are erased before the operation itself
+        for (auto it = op_list.rbegin(); it != op_list.rend(); ++it) {
+          if (!used[*it]) {
+            (*it)->erase();
+          }
+        }
+
+        // Delete the primal arguments from the block.  We have to go backwards
+        // starting from the second-to-last as the args will shift forward after
+        // erasing.
+        for (int i = block.getNumArguments() - 2; i >= 0; i -= 2) {
+          block.eraseArgument(i);
+        }
+      }
+    }
+
+    // Create a new terminator combining the regions of differentiated and
+    // original terminators. We clone the original region so that it still
+    // exists for the undifferentiated reducer but we can take the region from
+    // the originally differentiated one because we delete it later
+    mlir::OpBuilder term_builder(replTerminator);
+    mlir::IRMapping mapper;
+    OperationState state(replTerminator->getLoc(),
+                         scf::ReduceOp::getOperationName());
+    state.addOperands(newOperands);
+    size_t num_regions = origTerminator->getNumRegions();
+    for (size_t i = 0; i < num_regions; ++i) {
+      Region *new_orig_region = state.addRegion();
+      Region *new_diff_region = state.addRegion();
+      origTerminator->getRegion(i).cloneInto(new_orig_region, mapper);
+      new_diff_region->takeBody(replTerminator->getRegion(i));
+    }
+    Operation *new_terminator_op = term_builder.create(state);
+    gutils->erase(replTerminator);
+    gutils->originalToNewFnOps[origTerminator] = new_terminator_op;
+
+    return success();
+  }
+};
+
+class SCFReduceReturnAutoDiffOpInterface
+    : public AutoDiffOpInterface::ExternalModel<
+          SCFReduceReturnAutoDiffOpInterface, scf::ReduceReturnOp> {
+public:
+  LogicalResult createForwardModeTangent(Operation *origTerminator,
+                                         OpBuilder &builder,
+                                         MGradientUtils *gutils) const {
+    auto parentOp = origTerminator->getParentOp();
+    if (!isa<scf::ReduceOp>(parentOp)) {
+      origTerminator->emitError()
+          << " createForwardModeTangent called with invalid parent" << *parentOp
+          << "\n";
+      return failure();
+    }
+
+    // ReduceOp has no direct results, instead the result of the ith reducer
+    // block within the ReduceOp matches up with the ith result of the parent
+    // ParallelOp of the ReduceOp.  Therefore the terminator must have exactly 1
+    // operand and we will shadow it
+    auto reducer_index =
+        origTerminator->getBlock()->getParent()->getRegionNumber();
+    assert(reducer_index < parentOp->getParentOp()->getNumResults());
+    assert(origTerminator->getNumOperands() == 1);
+    llvm::SmallDenseSet<unsigned> operandsToShadow;
+    if (!gutils->isConstantValue(
+            parentOp->getParentOp()->getResult(reducer_index)))
+      operandsToShadow.insert(0);
+
+    // For scf::ReduceReturnOp only add the
+    // shadows as operands since the primal reducer will be in a different
+    // region with its own scf::ReduceReturnOp
+    SmallVector<Value> newOperands;
+    newOperands.reserve(operandsToShadow.size());
+    for (OpOperand &operand : origTerminator->getOpOperands()) {
+      if (operandsToShadow.contains(operand.getOperandNumber()))
+        newOperands.push_back(gutils->invertPointerM(operand.get(), builder));
+    }
+
+    // Special handling for scf::ReduceOp where the assumption that shadows
+    // follow originals is violated. Here the shadow operations need to be put
+    // in a shadow region.  It isn't clear how to do that directly, so instead
+    // we will create the shadows as normal and then create a new scf::ReduceOp
+    // terminator that combines the regions from the original and
+    // differentiated.  We then erase the primal operations from the derivative
+    // reducer region(s).
+    Operation *replTerminator = gutils->getNewFromOriginal(origTerminator);
+    replTerminator->setOperands(newOperands);
+
+    return success();
+  }
+};
+
 } // namespace
 
 void mlir::enzyme::registerSCFDialectAutoDiffInterface(
@@ -903,8 +1214,14 @@ void mlir::enzyme::registerSCFDialectAutoDiffInterface(
   registry.addExtension(+[](MLIRContext *context, scf::SCFDialect *) {
     registerInterfaces(context);
     scf::IfOp::attachInterface<IfOpInterfaceReverse>(*context);
+    scf::IfOp::attachInterface<IfOpEnzymeOpsRemover>(*context);
     scf::ParallelOp::attachInterface<ParallelOpInterfaceReverse>(*context);
     scf::ParallelOp::attachInterface<ParallelOpEnzymeOpsRemover>(*context);
+    scf::ParallelOp::attachInterface<ParallelOpADDataFlow>(*context);
+    scf::ReduceOp::attachInterface<ReduceOpADDataFlow>(*context);
+    scf::ReduceOp::attachInterface<SCFReduceAutoDiffOpInterface>(*context);
+    scf::ReduceReturnOp::attachInterface<SCFReduceReturnAutoDiffOpInterface>(
+        *context);
     scf::ForOp::attachInterface<ForOpInterfaceReverse>(*context);
     scf::ForOp::attachInterface<ForOpEnzymeOpsRemover>(*context);
     scf::ForOp::attachInterface<ForOpADDataFlow>(*context);

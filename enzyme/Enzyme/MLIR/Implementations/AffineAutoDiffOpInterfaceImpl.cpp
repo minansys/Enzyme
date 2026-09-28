@@ -11,28 +11,37 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "Dialect/Ops.h"
 #include "Implementations/CoreDialectsAutoDiffImplementations.h"
+#include "Implementations/LoopCheckpointing.h"
 #include "Interfaces/AutoDiffOpInterface.h"
 #include "Interfaces/GradientUtilsReverse.h"
+#include "Interfaces/Utils.h"
 #include "Passes/RemovalUtils.h"
+#include "Passes/Utils.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Affine/Utils.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IntegerSet.h"
+#include "llvm/ADT/ScopeExit.h"
+
+#include <array>
 
 using namespace mlir;
 using namespace mlir::enzyme;
 using namespace mlir::affine;
 
 namespace {
+
 affine::AffineForOp
 createAffineForWithShadows(Operation *op, OpBuilder &builder,
                            MGradientUtils *gutils, Operation *original,
                            ValueRange remappedOperands, TypeRange rettys) {
   affine::AffineForOpAdaptor adaptor(remappedOperands,
                                      cast<affine::AffineForOp>(original));
-  auto repFor = builder.create<affine::AffineForOp>(
-      original->getLoc(), adaptor.getLowerBoundOperands(),
+  auto repFor = affine::AffineForOp::create(
+      builder, original->getLoc(), adaptor.getLowerBoundOperands(),
       adaptor.getLowerBoundMap(), adaptor.getUpperBoundOperands(),
       adaptor.getUpperBoundMap(), adaptor.getStep().getZExtValue(),
       // This dance is necessary because the adaptor accessors are based on the
@@ -53,14 +62,524 @@ affine::AffineIfOp createAffineIfWithShadows(Operation *op, OpBuilder &builder,
                                              ValueRange remappedOperands,
                                              TypeRange rettys) {
   affine::AffineIfOpAdaptor adaptor(remappedOperands, original);
-  return builder.create<affine::AffineIfOp>(
-      original->getLoc(), rettys, original.getIntegerSet(),
+  return affine::AffineIfOp::create(
+      builder, original->getLoc(), rettys, original.getIntegerSet(),
       adaptor.getOperands(), !original.getElseRegion().empty());
+}
+
+struct AffineIfOpInterfaceReverse
+    : public ReverseAutoDiffOpInterface::ExternalModel<
+          AffineIfOpInterfaceReverse, affine::AffineIfOp> {
+  LogicalResult createReverseModeAdjoint(Operation *op, OpBuilder &builder,
+                                         MGradientUtilsReverse *gutils,
+                                         SmallVector<Value> caches) const {
+    auto ifOp = cast<affine::AffineIfOp>(op);
+    bool hasElse = ifOp.hasElse();
+    Value cond = gutils->popCache(caches[0], builder);
+
+    SmallVector<bool> resultsActive(ifOp.getNumResults(), false);
+    for (int i = 0, e = resultsActive.size(); i < e; ++i) {
+      auto result = ifOp.getResult(i);
+      auto iface = dyn_cast<AutoDiffTypeInterface>(result.getType());
+      bool needsGrad = iface && !iface.isMutable();
+      resultsActive[i] = needsGrad && !gutils->isConstantValue(result);
+    }
+
+    SmallVector<Value> incomingGradients;
+    for (auto &&[active, res] :
+         llvm::zip_equal(resultsActive, ifOp.getResults())) {
+      if (active) {
+        incomingGradients.push_back(gutils->diffe(res, builder));
+        if (!gutils->isConstantValue(res))
+          gutils->zeroDiffe(res, builder);
+      }
+    }
+
+    auto revIf =
+        scf::IfOp::create(builder, ifOp.getLoc(), TypeRange{}, cond, hasElse);
+
+    bool valid = true;
+    for (auto &&[oldReg, newReg] :
+         llvm::zip(op->getRegions(), revIf->getRegions())) {
+      for (auto &&[oBB, revBB] : llvm::zip(oldReg, newReg)) {
+        OpBuilder bodyBuilder(&revBB, revBB.end());
+        bodyBuilder.setInsertionPoint(revBB.getTerminator());
+
+        // All values defined in the body should have no use outside this
+        // block therefore we can set their diffe to zero upon entering the
+        // reverse block to simplify the work of the
+        // remove-unnecessary-enzyme-ops pass.
+        for (auto &it : oBB.getOperations()) {
+          for (auto res : it.getResults()) {
+            if (!gutils->isConstantValue(res)) {
+              auto iface = dyn_cast<AutoDiffTypeInterface>(res.getType());
+              if (iface && !iface.isMutable())
+                gutils->zeroDiffe(res, bodyBuilder);
+            }
+          }
+        }
+
+        auto term = oBB.getTerminator();
+        // Align incomingGradients with their corresponding yield operands.
+        SmallVector<Value> activeTermOperands;
+        activeTermOperands.reserve(incomingGradients.size());
+        for (auto &&[resultActive, operand] :
+             llvm::zip_equal(resultsActive, term->getOperands())) {
+          if (resultActive)
+            activeTermOperands.push_back(operand);
+        }
+
+        for (auto &&[arg, operand] :
+             llvm::zip_equal(incomingGradients, activeTermOperands)) {
+          // Check activity of the argument separately from the result. If
+          // some branches yield inactive values while others yield active
+          // values, the result will be active, but this operand may still be
+          // inactive (and we cannot addToDiffe)
+          if (!gutils->isConstantValue(operand)) {
+            gutils->addToDiffe(operand, arg, bodyBuilder);
+          }
+        }
+
+        auto first = oBB.rbegin();
+        first++; // skip terminator
+
+        auto last = oBB.rend();
+
+        for (auto it = first; it != last; ++it) {
+          Operation *op = &*it;
+          valid &=
+              gutils->Logic.visitChild(op, bodyBuilder, gutils).succeeded();
+        }
+      }
+    }
+    return success(valid);
+  }
+
+  SmallVector<Value> cacheValues(Operation *op,
+                                 MGradientUtilsReverse *gutils) const {
+    auto ifOp = cast<affine::AffineIfOp>(op);
+    auto is = ifOp.getCondition();
+
+    auto newOp = gutils->getNewFromOriginal(op);
+    OpBuilder cacheBuilder(newOp);
+
+    Value cond = nullptr;
+
+    Value zero = arith::ConstantIndexOp::create(cacheBuilder, ifOp.getLoc(), 0);
+
+    auto getNewFromOriginal = [&](Value v) {
+      return gutils->getNewFromOriginal(v);
+    };
+
+    SmallVector<Value> dims = llvm::map_to_vector(
+        ifOp->getOperands().take_front(is.getNumDims()), getNewFromOriginal);
+    SmallVector<Value> symbols = llvm::map_to_vector(
+        ifOp->getOperands().drop_front(is.getNumDims()), getNewFromOriginal);
+
+    for (auto [eq, E] : llvm::zip_equal(is.getEqFlags(), is.getConstraints())) {
+      Value lhs = affine::expandAffineExpr(cacheBuilder, ifOp.getLoc(), E, dims,
+                                           symbols);
+      Value constraintCond = arith::CmpIOp::create(
+          cacheBuilder, ifOp.getLoc(),
+          eq ? arith::CmpIPredicate::eq : arith::CmpIPredicate::sge, lhs, zero);
+
+      if (cond) {
+        cond = arith::AndIOp::create(cacheBuilder, ifOp.getLoc(),
+                                     constraintCond, cond);
+      } else {
+        cond = constraintCond;
+      }
+    }
+
+    cond = cond ? cond
+                : arith::ConstantIntOp::create(cacheBuilder, ifOp.getLoc(),
+                                               cacheBuilder.getI1Type(),
+                                               /*value=*/1);
+
+    return {gutils->initAndPushCache(cond, cacheBuilder)};
+  }
+
+  LogicalResult createShadowValues(Operation *op, OpBuilder &builder,
+                                   MGradientUtilsReverse *gutils) const {
+    return success();
+  }
+};
+
+// The reverse of an affine.if is an scf.if (see AffineIfOpInterfaceReverse
+// above), so the reverse if op searched for by the min-cut cache logic below
+// is an scf::IfOp rather than an affine::AffineIfOp.
+struct AffineIfOpEnzymeOpsRemover
+    : public IfLikeEnzymeOpsRemover<AffineIfOpEnzymeOpsRemover,
+                                    affine::AffineIfOp, scf::IfOp> {
+  static Block *getThenBlock(affine::AffineIfOp ifOp, OpBuilder &builder) {
+    return ifOp.getThenBlock();
+  }
+
+  static Block *getElseBlock(affine::AffineIfOp ifOp, OpBuilder &builder) {
+    // Ensure the if has an else block
+    if (ifOp.getElseRegion().empty()) {
+      OpBuilder::InsertionGuard guard(builder);
+      Block &newBlock = ifOp.getElseRegion().emplaceBlock();
+      builder.setInsertionPointToStart(&newBlock);
+      affine::AffineYieldOp::create(builder, ifOp.getLoc());
+    }
+
+    return ifOp.getElseBlock();
+  }
+
+  static Block *getThenBlock(scf::IfOp ifOp, OpBuilder &builder) {
+    return ifOp.thenBlock();
+  }
+
+  static Block *getElseBlock(scf::IfOp ifOp, OpBuilder &builder) {
+    // Ensure the if has an else block
+    if (ifOp.getElseRegion().empty()) {
+      OpBuilder::InsertionGuard guard(builder);
+      Block &newBlock = ifOp.getElseRegion().emplaceBlock();
+      builder.setInsertionPointToStart(&newBlock);
+      scf::YieldOp::create(builder, ifOp.getLoc());
+    }
+
+    return ifOp.elseBlock();
+  }
+
+  static Value getDummyValue(OpBuilder &builder, Location loc, Type dummyType) {
+    return cast<AutoDiffTypeInterface>(dummyType).createNullValue(builder, loc);
+  }
+
+  static affine::AffineIfOp replace(PatternRewriter &rewriter,
+                                    affine::AffineIfOp otherIfOp,
+                                    TypeRange resultTypes) {
+    auto newIf = affine::AffineIfOp::create(
+        rewriter, otherIfOp->getLoc(), resultTypes, otherIfOp.getIntegerSet(),
+        otherIfOp->getOperands(), /*withElseRegion=*/true);
+
+    newIf.getThenRegion().takeBody(otherIfOp.getThenRegion());
+    newIf.getElseRegion().takeBody(otherIfOp.getElseRegion());
+
+    rewriter.replaceAllUsesWith(
+        otherIfOp->getResults(),
+        newIf->getResults().slice(0, otherIfOp->getNumResults()));
+    rewriter.eraseOp(otherIfOp);
+    return newIf;
+  }
+};
+
+affine::AffineParallelOp
+createAffineParallelWithShadows(Operation *op, OpBuilder &builder,
+                                MGradientUtils *gutils,
+                                affine::AffineParallelOp original,
+                                ValueRange remappedOperands, TypeRange rettys) {
+  // A result of an affine.parallel is a reduction, and a reduction of the
+  // tangents is the derivative of a sum. Anything else needs its own rule,
+  // which reverse mode does not have either.
+  SmallVector<Attribute> reductions;
+  for (auto &&[reduction, result] :
+       llvm::zip_equal(original.getReductions(), original.getResults())) {
+    reductions.push_back(reduction);
+    if (gutils->isConstantValue(result))
+      continue;
+    auto kind = cast<arith::AtomicRMWKindAttr>(reduction).getValue();
+    if (kind != arith::AtomicRMWKind::addf &&
+        kind != arith::AtomicRMWKind::addi)
+      original.emitError() << "forward mode of an active "
+                           << stringifyEnum(kind)
+                           << " reduction is not yet implemented";
+    reductions.push_back(reduction);
+  }
+  auto reductionsAttr = builder.getArrayAttr(reductions);
+  return affine::AffineParallelOp::create(
+      builder, original->getLoc(), rettys, reductionsAttr,
+      original.getLowerBoundsMapAttr(), original.getLowerBoundsGroupsAttr(),
+      original.getUpperBoundsMapAttr(), original.getUpperBoundsGroupsAttr(),
+      original.getStepsAttr(), remappedOperands);
 }
 
 struct AffineForOpInterfaceReverse
     : public ReverseAutoDiffOpInterface::ExternalModel<
-          AffineForOpInterfaceReverse, affine::AffineForOp> {
+          AffineForOpInterfaceReverse, affine::AffineForOp>,
+      public LoopCheckpointing<AffineForOpInterfaceReverse,
+                               affine::AffineForOp> {
+  // ---- hooks required by LoopCheckpointing<AffineForOpInterfaceReverse,
+  //      affine::AffineForOp> ----
+
+  static std::optional<int64_t>
+  getConstantNumberOfIterations(affine::AffineForOp forOp) {
+    if (!forOp.hasConstantLowerBound())
+      return std::nullopt;
+    if (!forOp.hasConstantUpperBound())
+      return std::nullopt;
+    return (forOp.getConstantUpperBound() - forOp.getConstantLowerBound()) /
+           forOp.getStepAsInt();
+  }
+
+  static Value materializeLowerBound(OpBuilder &builder, Location loc,
+                                     affine::AffineForOp forOp,
+                                     MGradientUtilsReverse *gutils) {
+    SmallVector<Value> ops =
+        llvm::map_to_vector(forOp.getLowerBoundOperands(), [&](Value v) {
+          return gutils->getNewFromOriginal(v);
+        });
+    return affine::AffineApplyOp::create(builder, loc, forOp.getLowerBoundMap(),
+                                         ops);
+  }
+
+  static Value materializeUpperBound(OpBuilder &builder, Location loc,
+                                     affine::AffineForOp forOp,
+                                     MGradientUtilsReverse *gutils) {
+    SmallVector<Value> ops =
+        llvm::map_to_vector(forOp.getUpperBoundOperands(), [&](Value v) {
+          return gutils->getNewFromOriginal(v);
+        });
+    return affine::AffineApplyOp::create(builder, loc, forOp.getUpperBoundMap(),
+                                         ops);
+  }
+
+  static Value materializeStep(OpBuilder &builder, Location loc,
+                               affine::AffineForOp forOp,
+                               MGradientUtilsReverse *) {
+    return arith::ConstantIndexOp::create(builder, loc, forOp.getStepAsInt());
+  }
+
+  static int64_t getConstantStart(affine::AffineForOp forOp) {
+    return forOp.getConstantLowerBound();
+  }
+
+  static int64_t getConstantStep(affine::AffineForOp forOp) {
+    return forOp.getStepAsInt();
+  }
+
+  static LogicalResult requireSingleResultBounds(affine::AffineForOp forOp) {
+    if (forOp.getLowerBound().getMap().getNumResults() != 1 ||
+        forOp.getUpperBound().getMap().getNumResults() != 1)
+      return forOp->emitError()
+             << "cannot differentiate loop with minmax bounds yet";
+    return success();
+  }
+
+  // The checkpointing scaffold substitutes a generically-computed index
+  // Value for the loop's own induction variable, which is not a valid
+  // affine dimension/symbol (it isn't the IV of an affine.for/parallel, nor
+  // a top-level value). Cloning an affine.load/affine.store that indexes
+  // through it verbatim would fail the verifier ("operand cannot be used as
+  // a dimension id"), so instead expand its index map into plain arithmetic
+  // (valid for any index Value, affine or not) via affine::expandAffineMap
+  // -- the same primitive the upstream -lower-affine pass uses -- and emit
+  // memref.load/memref.store. Every other op clones as-is.
+  static void cloneOp(OpBuilder &builder, Operation &op, IRMapping &mapping) {
+    if (auto loadOp = dyn_cast<affine::AffineLoadOp>(&op)) {
+      SmallVector<Value> operands =
+          llvm::map_to_vector(loadOp.getIndices(), [&](Value v) {
+            return mapping.lookupOrDefault(v);
+          });
+      auto indices = affine::expandAffineMap(builder, loadOp.getLoc(),
+                                             loadOp.getAffineMap(), operands);
+      assert(indices && "failed to expand affine.load's index map");
+      Value memref = mapping.lookupOrDefault(loadOp.getMemref());
+      auto newLoadOp =
+          memref::LoadOp::create(builder, loadOp.getLoc(), memref, *indices);
+      newLoadOp.setAlignmentAttr(
+          loadOp->getAttrOfType<IntegerAttr>("alignment"));
+      Operation *newLoad = newLoadOp;
+      mapping.map(loadOp.getResult(), newLoad->getResult(0));
+      // IRMapping tracks an operation map alongside its value map (populated
+      // automatically by builder.clone, which this bypasses); callers such
+      // as publishClonedStep/publishClonedOps and, later,
+      // gutils->getNewFromOriginal(originalLoadOp) (used by
+      // AffineLoadOpInterfaceReverse::cacheValues) all key off it, so it must
+      // be registered explicitly here.
+      mapping.map(&op, newLoad);
+      return;
+    }
+    if (auto storeOp = dyn_cast<affine::AffineStoreOp>(&op)) {
+      SmallVector<Value> operands =
+          llvm::map_to_vector(storeOp.getIndices(), [&](Value v) {
+            return mapping.lookupOrDefault(v);
+          });
+      auto indices = affine::expandAffineMap(builder, storeOp.getLoc(),
+                                             storeOp.getAffineMap(), operands);
+      assert(indices && "failed to expand affine.store's index map");
+      Value memref = mapping.lookupOrDefault(storeOp.getMemref());
+      Value value = mapping.lookupOrDefault(storeOp.getValue());
+      auto newStoreOp = memref::StoreOp::create(builder, storeOp.getLoc(),
+                                                value, memref, *indices);
+      newStoreOp.setAlignmentAttr(
+          storeOp->getAttrOfType<IntegerAttr>("alignment"));
+      Operation *newStore = newStoreOp;
+      mapping.map(&op, newStore);
+      return;
+    }
+    builder.clone(op, mapping);
+  }
+
+  // ---- periodic-scaffold hooks (see LoopCheckpointing.h doc comment) ----
+  // Unlike binomial, periodic's decomposition is entirely compile-time
+  // constant, so its scaffold can be built as genuine affine.for -- keeping
+  // any affine.load/affine.store cloned into it valid without needing
+  // cloneOp's memref-lowering fallback.
+
+  // An affine.for's bounds are AffineMaps, i.e. compile-time constants plus
+  // dimensions valid in the enclosing affine scope; a runtime trip count is
+  // neither, so a dynamic loop falls back to the plain reverse path.
+  static bool supportsDynamicPeriodic() { return false; }
+
+  static affine::AffineForOp
+  createConstantScaffoldLoop(OpBuilder &builder, Location loc, int64_t lb,
+                             int64_t ub, int64_t step, ValueRange inits) {
+    return affine::AffineForOp::create(builder, loc, lb, ub, step, inits);
+  }
+
+  // Both outer loops count segments: one iteration per checkpoint, so the trip
+  // count is the stated period. Every bound and index below is an affine
+  // expression in that segment index.
+  static affine::AffineForOp
+  createForwardOuterLoop(OpBuilder &builder, Location loc,
+                         const PeriodicSchedule &sched, ValueRange inits) {
+    return createConstantScaffoldLoop(builder, loc, 0, sched.numSegments(), 1,
+                                      inits);
+  }
+
+  static affine::AffineForOp
+  createReverseOuterLoop(OpBuilder &builder, Location loc,
+                         const PeriodicSchedule &sched, ValueRange inits) {
+    return createConstantScaffoldLoop(builder, loc, 0, sched.numSegments(), 1,
+                                      inits);
+  }
+
+  static void materializeSegmentValues(OpBuilder &, Location,
+                                       PeriodicSchedule &sched) {
+    assert(!sched.isDynamic() &&
+           "affine.for has no dynamic periodic path -- see "
+           "supportsDynamicPeriodic");
+  }
+
+  static SmallVector<Value>
+  computeForwardSegmentHint(OpBuilder &, Location, Value,
+                            const PeriodicSchedule &) {
+    return {};
+  }
+
+  // Bound = min(nInner, numIters - nInner * j), for segment index j: the
+  // standard affine-tiling idiom for a boundary tile, expressed as a
+  // multi-result upper-bound map (the "min" keyword documented on affine.for).
+  // Equivalent to scf.for's cmpi+select formula in every case: the two only
+  // disagree where neither formula's boundary case is active.
+  static affine::AffineForOp
+  createForwardSegmentLoop(OpBuilder &builder, Location loc, Value outerIV,
+                           ArrayRef<Value> /*fwdHint*/,
+                           const PeriodicSchedule &sched, ValueRange inits) {
+    int64_t nInner = sched.nInner, nOuter = sched.nOuter,
+            trailingIters = sched.trailingIters;
+    int64_t numIters = nInner * nOuter + trailingIters;
+    MLIRContext *ctx = builder.getContext();
+    AffineExpr j = builder.getAffineDimExpr(0);
+    AffineExpr nInnerExpr = builder.getAffineConstantExpr(nInner);
+    AffineExpr remainingExpr =
+        builder.getAffineConstantExpr(numIters) - nInnerExpr * j;
+    AffineMap ubMap = AffineMap::get(1, 0, {nInnerExpr, remainingExpr}, ctx);
+    return affine::AffineForOp::create(
+        builder, loc, /*lbOperands=*/ValueRange{},
+        AffineMap::getConstantMap(0, ctx), ValueRange{outerIV}, ubMap,
+        /*step=*/1, inits);
+  }
+
+  // Reverse counterpart. `outerIV` (call it j) is the reverse outer loop's own
+  // segment counter, so the forward segment being replayed is
+  // k = (numSegments - 1) - j, its base is segmentBase = k * nInner, and the
+  // bound is min(nInner, numIters - segmentBase), expanded into one affine map
+  // of j.
+  //
+  // A min bound cannot express a trailing segment longer than nInner -- it
+  // would clamp it to nInner and leave the tail of the loop unreplayed -- which
+  // is why getStaticPeriodicSchedule keeps the remainder the shorter part of
+  // the split.
+  static affine::AffineForOp
+  createReverseSegmentLoop(OpBuilder &builder, Location loc, Value outerIV,
+                           ArrayRef<Value> /*revHint*/,
+                           const PeriodicSchedule &sched, ValueRange inits) {
+    int64_t nInner = sched.nInner, nOuter = sched.nOuter,
+            trailingIters = sched.trailingIters;
+    int64_t numIters = nInner * nOuter + trailingIters;
+    int64_t s = nOuter + (trailingIters > 0 ? 1 : 0);
+    // numIters - segmentBase, segmentBase = ((s-1) - j) * nInner
+    //   = numIters - (s-1)*nInner + nInner*j = constOffset + nInner*j
+    int64_t constOffset = numIters - (s - 1) * nInner;
+    MLIRContext *ctx = builder.getContext();
+    AffineExpr j = builder.getAffineDimExpr(0);
+    AffineExpr nInnerExpr = builder.getAffineConstantExpr(nInner);
+    AffineExpr remainingExpr =
+        builder.getAffineConstantExpr(constOffset) + nInnerExpr * j;
+    AffineMap ubMap = AffineMap::get(1, 0, {nInnerExpr, remainingExpr}, ctx);
+    return affine::AffineForOp::create(
+        builder, loc, /*lbOperands=*/ValueRange{},
+        AffineMap::getConstantMap(0, ctx), ValueRange{outerIV}, ubMap,
+        /*step=*/1, inits);
+  }
+
+  static affine::AffineForOp
+  createLoopWithSameBounds(OpBuilder &builder, Location loc,
+                           affine::AffineForOp templateLoop, ValueRange inits) {
+    return affine::AffineForOp::create(
+        builder, loc, templateLoop.getLowerBoundOperands(),
+        templateLoop.getLowerBoundMap(), templateLoop.getUpperBoundOperands(),
+        templateLoop.getUpperBoundMap(), templateLoop.getStepAsInt(), inits);
+  }
+
+  // (nInner * j + localIV) * step + start, as one affine.apply -- the whole
+  // chain must be built as a single affine expression (not the generic
+  // arith ops scf.for's implementation uses) so the result is itself a valid
+  // affine dimension, usable as an index by any affine.load/affine.store
+  // cloned with it substituted in for forOp's own induction variable.
+  static Value computeForwardSegmentIV(OpBuilder &builder, Location loc,
+                                       affine::AffineForOp forOp, Value outerIV,
+                                       Value localIV,
+                                       const PeriodicSchedule &sched,
+                                       ArrayRef<Value> /*fwdHint*/) {
+    int64_t step = getConstantStep(forOp);
+    int64_t start = getConstantStart(forOp);
+    MLIRContext *ctx = builder.getContext();
+    AffineExpr j = builder.getAffineDimExpr(0),
+               localIdx = builder.getAffineDimExpr(1);
+    AffineExpr expr = (j * sched.nInner + localIdx) * step + start;
+    AffineMap map = AffineMap::get(2, 0, {expr}, ctx);
+    return affine::AffineApplyOp::create(builder, loc, map,
+                                         ValueRange{outerIV, localIV});
+  }
+
+  // (segmentBase + localIV) * step + start, with segmentBase = nInner *
+  // ((numSegments - 1) - j) -- see createReverseSegmentLoop.
+  static SmallVector<Value>
+  computeReverseSegmentHint(OpBuilder &builder, Location loc, Value outerIV,
+                            const PeriodicSchedule &) {
+    return {};
+  }
+
+  static Value computeReverseSegmentIV(OpBuilder &builder, Location loc,
+                                       affine::AffineForOp forOp, Value outerIV,
+                                       Value localIV,
+                                       const PeriodicSchedule &sched,
+                                       ArrayRef<Value> /*revHint*/) {
+    int64_t nInner = sched.nInner;
+    int64_t s = sched.nOuter + (sched.trailingIters > 0 ? 1 : 0);
+    int64_t lastSegmentBase = (s - 1) * nInner;
+    int64_t step = getConstantStep(forOp);
+    int64_t start = getConstantStart(forOp);
+    MLIRContext *ctx = builder.getContext();
+    AffineExpr j = builder.getAffineDimExpr(0),
+               localIdx = builder.getAffineDimExpr(1);
+    AffineExpr segmentBase = lastSegmentBase - j * nInner;
+    AffineExpr flatIV = segmentBase + localIdx;
+    AffineExpr expr = flatIV * step + start;
+    AffineMap map = AffineMap::get(2, 0, {expr}, ctx);
+    return affine::AffineApplyOp::create(builder, loc, map,
+                                         ValueRange{outerIV, localIV});
+  }
+
+  static void createScaffoldYield(OpBuilder &builder, Location loc,
+                                  ValueRange operands) {
+    affine::AffineYieldOp::create(builder, loc, operands);
+  }
+
   LogicalResult createReverseModeAdjoint(Operation *op, OpBuilder &builder,
                                          MGradientUtilsReverse *gutils,
                                          SmallVector<Value> caches) const {
@@ -84,6 +603,29 @@ struct AffineForOpInterfaceReverse
                                !gutils->isConstantValue(result));
     }
 
+    // Checkpointing dispatch happens before touching `caches` at all: the
+    // checkpointed schemes cached a completely different layout (see
+    // LoopCheckpointing::cacheBinomial/cachePeriodic) than the plain-loop
+    // path below, so caches[i] must not be popped as a control operand
+    // unless we already know the plain path is the one that applies.
+    if (needsBinomialCheckpointing(forOp) || needsCheckpointing(forOp)) {
+      SmallVector<Value> incomingGradients;
+      for (auto &&[active, res] :
+           llvm::zip_equal(operandsActive, op->getResults())) {
+        if (active) {
+          incomingGradients.push_back(gutils->diffe(res, builder));
+          if (!gutils->isConstantValue(res))
+            gutils->zeroDiffe(res, builder);
+        }
+      }
+      if (auto r =
+              tryCreateReverseModeAdjoint(forOp, op, builder, gutils, caches,
+                                          operandsActive, incomingGradients))
+        return *r;
+    }
+
+    // ---- plain (non-checkpointed) reverse path, unchanged ----
+
     SmallVector<Value> revLBOperands, revUBOperands, incomingGradients;
 
     for (int i = 0, e = lb.getNumOperands(); i < e; ++i) {
@@ -104,9 +646,10 @@ struct AffineForOpInterfaceReverse
       }
     }
 
-    auto revFor = builder.create<affine::AffineForOp>(
-        op->getLoc(), revLBOperands, lb.getMap(), revUBOperands, ub.getMap(),
-        forOp.getStepAsInt(), incomingGradients);
+    auto revFor = affine::AffineForOp::create(
+        builder, op->getLoc(), revLBOperands, lb.getMap(), revUBOperands,
+        ub.getMap(), forOp.getStepAsInt(), incomingGradients);
+    preserveAttributesButCheckpointing(revFor, op);
 
     bool valid = true;
     for (auto &&[oldReg, newReg] :
@@ -116,7 +659,7 @@ struct AffineForOpInterfaceReverse
 
         // Create implicit terminator if not present (when num results > 0)
         if (revBB.empty()) {
-          bodyBuilder.create<affine::AffineYieldOp>(revFor->getLoc());
+          affine::AffineYieldOp::create(bodyBuilder, revFor->getLoc());
         }
         bodyBuilder.setInsertionPoint(revBB.getTerminator());
 
@@ -132,21 +675,24 @@ struct AffineForOpInterfaceReverse
         for (auto &it : oBB.getOperations()) {
           for (auto res : it.getResults()) {
             if (!gutils->isConstantValue(res)) {
-              gutils->zeroDiffe(res, bodyBuilder);
+              auto iface = dyn_cast<AutoDiffTypeInterface>(res.getType());
+              if (iface && !iface.isMutable())
+                gutils->zeroDiffe(res, bodyBuilder);
             }
           }
         }
 
         auto term = oBB.getTerminator();
 
-        for (auto &&[active, arg, operand] :
-             llvm::zip_equal(operandsActive, revBB.getArguments().slice(1),
-                             term->getOperands())) {
+        unsigned argIdx = 1; // Skip over the reversed IV
+        for (auto &&[active, operand] :
+             llvm::zip_equal(operandsActive, term->getOperands())) {
           if (active) {
             // Set diffe here, not add because it should not accumulate across
             // iterations. Instead the new gradient for this operand is passed
             // in the return of the reverse for body.
-            gutils->setDiffe(operand, arg, bodyBuilder);
+            gutils->setDiffe(operand, revBB.getArgument(argIdx), bodyBuilder);
+            argIdx++;
           }
         }
 
@@ -178,11 +724,14 @@ struct AffineForOpInterfaceReverse
       }
     }
 
-    for (auto &&[active, res, arg] : llvm::zip_equal(
-             operandsActive, revFor->getResults(), forOp.getInits())) {
+    unsigned resIdx = 0;
+    for (auto &&[active, arg] :
+         llvm::zip_equal(operandsActive, forOp.getInits())) {
       if (active) {
-        if (!gutils->isConstantValue(arg))
-          gutils->addToDiffe(arg, res, builder);
+        if (!gutils->isConstantValue(arg)) {
+          gutils->addToDiffe(arg, revFor.getResult(resIdx), builder);
+          resIdx++;
+        }
       }
     }
 
@@ -192,6 +741,9 @@ struct AffineForOpInterfaceReverse
   SmallVector<Value> cacheValues(Operation *op,
                                  MGradientUtilsReverse *gutils) const {
     auto forOp = cast<affine::AffineForOp>(op);
+
+    if (auto r = tryCacheValues(forOp, op, gutils))
+      return *r;
 
     SmallVector<Value> caches;
     OpBuilder cacheBuilder(gutils->getNewFromOriginal(op));
@@ -203,8 +755,288 @@ struct AffineForOpInterfaceReverse
     return caches;
   }
 
-  void createShadowValues(Operation *op, OpBuilder &builder,
-                          MGradientUtilsReverse *gutils) const {}
+  LogicalResult createShadowValues(Operation *op, OpBuilder &builder,
+                                   MGradientUtilsReverse *gutils) const {
+    return success();
+  }
+};
+
+struct AffineParallelOpInterfaceReverse
+    : public ReverseAutoDiffOpInterface::ExternalModel<
+          AffineParallelOpInterfaceReverse, affine::AffineParallelOp> {
+  LogicalResult createReverseModeAdjoint(Operation *op, OpBuilder &builder,
+                                         MGradientUtilsReverse *gutils,
+                                         SmallVector<Value> caches) const {
+    auto parOp = cast<affine::AffineParallelOp>(op);
+    if (!parOp.getReductions().empty()) {
+      return parOp.emitError() << "parallel reductions not yet implemented";
+    }
+    if (parOp.hasMinMaxBounds()) {
+      return parOp.emitError() << "minmax bounds not yet supported";
+    }
+
+    SmallVector<Value> bounds = llvm::map_to_vector(
+        caches, [&](Value cache) { return gutils->popCache(cache, builder); });
+    auto revPar = affine::AffineParallelOp::create(
+        builder, op->getLoc(), parOp.getResultTypes(), parOp.getReductions(),
+        parOp.getLowerBoundsMap(), parOp.getLowerBoundsGroups(),
+        parOp.getUpperBoundsMap(), parOp.getUpperBoundsGroups(),
+        parOp.getSteps(), bounds);
+
+    // Create the body block and terminator
+    OpBuilder::InsertionGuard guard(builder);
+    SmallVector<Type> ivTypes(parOp.getIVs().size(), builder.getIndexType());
+    SmallVector<Location> ivLocs(parOp.getIVs().size(), parOp.getLoc());
+    builder.createBlock(&revPar.getBodyRegion(), revPar.getBodyRegion().begin(),
+                        ivTypes, ivLocs);
+    affine::AffineYieldOp::create(builder, parOp.getLoc());
+
+    bool valid = true;
+    bool wasAtomic = gutils->AtomicAdd;
+    gutils->AtomicAdd = true;
+
+    {
+      Block *oBB = parOp.getBody();
+      Block *rBB = revPar.getBody();
+
+      OpBuilder bodyBuilder = revPar.getBodyBuilder();
+
+      bodyBuilder.setInsertionPointToStart(revPar.getBody());
+      mlir::enzyme::localizeGradients(bodyBuilder, gutils, oBB);
+
+      bodyBuilder.setInsertionPoint(rBB->getTerminator());
+
+      auto first = oBB->rbegin();
+      first++; // skip terminator
+
+      auto last = oBB->rend();
+
+      for (auto it = first; it != last; ++it) {
+        Operation *op = &*it;
+        valid &= gutils->Logic.visitChild(op, bodyBuilder, gutils).succeeded();
+      }
+    }
+
+    gutils->AtomicAdd = wasAtomic;
+    return success(valid);
+  }
+
+  SmallVector<Value> cacheValues(Operation *op,
+                                 MGradientUtilsReverse *gutils) const {
+    auto parOp = cast<affine::AffineParallelOp>(op);
+
+    SmallVector<Value> caches;
+    OpBuilder cacheBuilder(gutils->getNewFromOriginal(op));
+    for (auto operand : parOp.getMapOperands()) {
+      caches.push_back(gutils->initAndPushCache(
+          gutils->getNewFromOriginal(operand), cacheBuilder));
+    }
+    return caches;
+  }
+
+  LogicalResult createShadowValues(Operation *op, OpBuilder &builder,
+                                   MGradientUtilsReverse *gutils) const {
+    return success();
+  }
+};
+
+struct AffineParallelOpEnzymeOpsRemover
+    : public ForLikeEnzymeOpsRemover<AffineParallelOpEnzymeOpsRemover,
+                                     affine::AffineParallelOp> {
+  static SmallVector<IntOrValue, 1>
+  getDimensionBounds(OpBuilder &builder, affine::AffineParallelOp parOp) {
+    SmallVector<IntOrValue, 1> bounds;
+    auto ranges = parOp.getConstantRanges();
+    if (ranges) {
+      for (auto &&[r, step] : llvm::zip(*ranges, parOp.getSteps())) {
+        bounds.push_back(r / step);
+      }
+    } else {
+      for (auto &&[dim, step] : llvm::enumerate(parOp.getSteps())) {
+        auto lb = AffineApplyOp::create(builder, parOp.getLoc(),
+                                        parOp.getLowerBoundMap(dim),
+                                        parOp.getLowerBoundsOperands());
+        auto ub = AffineApplyOp::create(builder, parOp.getLoc(),
+                                        parOp.getUpperBoundMap(dim),
+                                        parOp.getUpperBoundsOperands());
+        Value diff = arith::SubIOp::create(builder, parOp.getLoc(), ub, lb);
+        if (step != 1) {
+          Value stepVal =
+              arith::ConstantIndexOp::create(builder, parOp.getLoc(), step);
+          diff = arith::DivUIOp::create(builder, parOp.getLoc(), diff, stepVal);
+        }
+        bounds.push_back(diff);
+      }
+    }
+    return bounds;
+  }
+
+  static SmallVector<Value> computeReversedIndices(
+      PatternRewriter &rewriter, affine::AffineParallelOp parOp,
+      ArrayRef<Value> otherInductionVariable, ArrayRef<IntOrValue> bounds) {
+    return SmallVector<Value>(otherInductionVariable);
+  }
+
+  static SmallVector<Value>
+  getCanonicalLoopIVs(OpBuilder &builder, affine::AffineParallelOp parOp) {
+    SmallVector<Value> ivs(parOp.getIVs());
+    for (auto &&[dim, step] : llvm::enumerate(parOp.getSteps())) {
+      Value iv = ivs[dim];
+      auto lbMap = parOp.getLowerBoundMap(dim);
+      if (!(lbMap.isSingleConstant() && lbMap.getSingleConstantResult() == 0)) {
+        auto lb = AffineApplyOp::create(builder, parOp.getLoc(), lbMap,
+                                        parOp.getLowerBoundsOperands());
+        iv = arith::SubIOp::create(builder, parOp.getLoc(), iv, lb);
+      }
+
+      if (step != 1) {
+        auto stepVal =
+            arith::ConstantIndexOp::create(builder, parOp.getLoc(), step);
+        iv = arith::DivUIOp::create(builder, parOp.getLoc(), iv, stepVal);
+      }
+
+      ivs[dim] = iv;
+    }
+    return ivs;
+  }
+
+  static IRMapping createArgumentMap(PatternRewriter &rewriter,
+                                     affine::AffineParallelOp parOp,
+                                     ArrayRef<Value> indPar,
+                                     affine::AffineParallelOp otherParOp,
+                                     ArrayRef<Value> indOther) {
+    IRMapping map;
+    for (auto &&[f, o] : llvm::zip_equal(indPar, indOther))
+      map.map(f, o);
+
+    for (auto &&[fiv, oiv] :
+         llvm::zip_equal(parOp.getIVs(), otherParOp.getIVs())) {
+      if (!map.contains(fiv)) {
+        assert(parOp.getLowerBoundsMap() == otherParOp.getLowerBoundsMap());
+        for (auto &&[f, o] :
+             llvm::zip_equal(parOp.getLowerBoundsOperands(),
+                             otherParOp.getLowerBoundsOperands())) {
+          (void)f;
+          (void)o;
+          assert(Equivalent(f, o));
+        }
+        for (auto [fstep, ostep] :
+             llvm::zip_equal(parOp.getSteps(), otherParOp.getSteps())) {
+          (void)fstep;
+          (void)ostep;
+          assert(fstep == ostep);
+        }
+        map.map(fiv, oiv);
+      }
+    }
+    return map;
+  }
+
+  static affine::AffineParallelOp
+  replaceWithNewOperands(PatternRewriter &rewriter,
+                         affine::AffineParallelOp otherParOp,
+                         ArrayRef<Value> operands) {
+    SmallVector<mlir::Attribute> reductionKinds(
+        otherParOp.getReductions().begin(), otherParOp.getReductions().end());
+
+    for (unsigned i = otherParOp->getNumOperands(); i < operands.size(); i++) {
+      reductionKinds.push_back(arith::AtomicRMWKindAttr::get(
+          otherParOp.getContext(), arith::AtomicRMWKind::addf));
+    }
+
+    ValueRange operands_(operands);
+    auto newOtherParOp = affine::AffineParallelOp::create(
+        rewriter, otherParOp.getLoc(), operands_.getTypes(),
+        ArrayAttr::get(otherParOp.getContext(), reductionKinds),
+        otherParOp.getLowerBoundsMap(), otherParOp.getLowerBoundsGroups(),
+        otherParOp.getUpperBoundsMap(), otherParOp.getUpperBoundsGroups(),
+        otherParOp.getSteps(), otherParOp.getMapOperands());
+
+    newOtherParOp->setDiscardableAttrs(
+        otherParOp->getDiscardableAttrDictionary());
+
+    newOtherParOp.getRegion().takeBody(otherParOp.getRegion());
+    rewriter.replaceOp(otherParOp, newOtherParOp->getResults().slice(
+                                       0, otherParOp->getNumResults()));
+    return newOtherParOp;
+  }
+
+  static ValueRange getInits(affine::AffineParallelOp parOp) {
+    return parOp.getInits();
+  }
+
+  static bool mustPostAdd(affine::AffineParallelOp forOp) { return true; }
+
+  static Value initialValueInBlock(OpBuilder &builder, Block *body,
+                                   Value grad) {
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToStart(body);
+    return cast<AutoDiffTypeInterface>(
+               cast<enzyme::GradientType>(grad.getType()).getBasetype())
+        .createNullValue(builder, grad.getLoc());
+  }
+};
+
+struct AffineParallelRegionBranchOpInterface
+    : public mlir::RegionBranchOpInterface::FallbackModel<
+          AffineParallelRegionBranchOpInterface> {
+  OperandRange getEntrySuccessorOperands(Operation *op,
+                                         RegionSuccessor successor) const {
+    return cast<AffineParallelOp>(op).getInits();
+  }
+
+  void getEntrySuccessorRegions(
+      Operation *op, ::llvm::ArrayRef<::mlir::Attribute> operands,
+      ::llvm::SmallVectorImpl<::mlir::RegionSuccessor> &regions) const {
+    getSuccessorRegions(op, RegionBranchPoint::parent(), regions);
+  }
+
+  void getSuccessorRegions(
+      Operation *op, RegionBranchPoint point,
+      ::llvm::SmallVectorImpl<::mlir::RegionSuccessor> &regions) const {
+    // Both the operation itself and the region may be branching into the body
+    // or back into the operation itself. It is possible for the loop to not
+    // enter the body.
+    regions.push_back(RegionSuccessor(&cast<AffineParallelOp>(op).getRegion()));
+    regions.push_back(RegionSuccessor(op));
+  }
+
+  void getSuccessorRegions(
+      Operation *op, ::mlir::Region &region,
+      ::llvm::SmallVectorImpl<::mlir::RegionSuccessor> &regions) const {
+    for (::mlir::Block &block : region) {
+      if (block.empty())
+        continue;
+      if (auto terminator =
+              dyn_cast<RegionBranchTerminatorOpInterface>(block.back()))
+        getSuccessorRegions(op, RegionBranchPoint(terminator), regions);
+    }
+  }
+
+  void getRegionInvocationBounds(
+      Operation *op, ArrayRef<Attribute> operands,
+      SmallVectorImpl<InvocationBounds> &invocationBounds) const {
+    invocationBounds.append(op->getNumRegions(),
+                            InvocationBounds::getUnknown());
+  }
+
+  bool areTypesCompatible(Operation *op, Type lhs, Type rhs) const {
+    return lhs == rhs;
+  }
+
+  ValueRange getSuccessorInputs(Operation *op,
+                                RegionSuccessor successor) const {
+    auto parOp = cast<affine::AffineParallelOp>(op);
+    return successor.isOperation() ? ValueRange(parOp.getResults())
+                                   : ValueRange(parOp.getRegionIterArgs());
+  }
+
+  void getPredecessorValues(Operation *op, RegionSuccessor successor, int index,
+                            SmallVectorImpl<Value> &predecessorValues) const {}
+
+  void getPredecessors(Operation *op, RegionSuccessor successor,
+                       SmallVectorImpl<RegionBranchPoint> &predecessors) const {
+  }
 };
 
 struct AffineLoadOpInterfaceReverse
@@ -217,46 +1049,73 @@ struct AffineLoadOpInterfaceReverse
     Value memref = loadOp.getMemref();
 
     if (auto iface = dyn_cast<AutoDiffTypeInterface>(loadOp.getType())) {
+      // A mutable type's derivative is a shadow, not a value to add into: there
+      // is nothing to accumulate here, the same way the store adjoint has
+      // nothing to take back out. Loading a pointer is the case in hand.
       if (!gutils->isConstantValue(loadOp) &&
-          !gutils->isConstantValue(memref)) {
+          !gutils->isConstantValue(memref) && !iface.isMutable()) {
         Value gradient = gutils->diffe(loadOp, builder);
-        Value memrefGradient = gutils->invertPointerM(memref, builder);
+        Value memrefGradient = gutils->popCache(caches.front(), builder);
 
         SmallVector<Value> retrievedArguments;
-        for (Value cache : caches) {
+        for (Value cache : ValueRange(caches).drop_front(1)) {
           Value retrievedValue = gutils->popCache(cache, builder);
           retrievedArguments.push_back(retrievedValue);
         }
 
         if (!gutils->AtomicAdd) {
+          auto alignAttr = loadOp->getAttrOfType<IntegerAttr>("alignment");
           bool hasIndex = loadOp.getAffineMap().getNumDims() > 0;
           // if index had to be cached, the pop is not necessarily a valid index
           if (hasIndex) {
-            auto idx = builder.create<affine::AffineApplyOp>(
-                loadOp.getLoc(), loadOp.getAffineMap(), retrievedArguments);
+            SmallVector<Value> indices;
+            computeAffineIndices(builder, loadOp.getLoc(),
+                                 loadOp.getAffineMap(), retrievedArguments,
+                                 indices);
 
-            Value loadedGradient = builder.create<memref::LoadOp>(
-                loadOp.getLoc(), memrefGradient, idx->getResults());
+            auto loadedGradientOp = memref::LoadOp::create(
+                builder, loadOp.getLoc(), memrefGradient, indices);
+            loadedGradientOp.setAlignmentAttr(alignAttr);
             Value addedGradient = iface.createAddOp(builder, loadOp.getLoc(),
-                                                    loadedGradient, gradient);
-            builder.create<memref::StoreOp>(loadOp.getLoc(), addedGradient,
-                                            memrefGradient, idx->getResults());
+                                                    loadedGradientOp, gradient);
+            auto storeGradientOp =
+                memref::StoreOp::create(builder, loadOp.getLoc(), addedGradient,
+                                        memrefGradient, indices);
+            storeGradientOp.setAlignmentAttr(alignAttr);
           } else {
-            Value loadedGradient = builder.create<affine::AffineLoadOp>(
-                loadOp.getLoc(), memrefGradient, loadOp.getAffineMap(),
+            auto loadedGradientOp = affine::AffineLoadOp::create(
+                builder, loadOp.getLoc(), memrefGradient, loadOp.getAffineMap(),
                 ArrayRef<Value>(retrievedArguments));
+            if (alignAttr)
+              loadedGradientOp->setAttr("alignment", alignAttr);
             Value addedGradient = iface.createAddOp(builder, loadOp.getLoc(),
-                                                    loadedGradient, gradient);
-            builder.create<affine::AffineStoreOp>(
-                loadOp.getLoc(), addedGradient, memrefGradient,
+                                                    loadedGradientOp, gradient);
+            auto storeGradientOp = affine::AffineStoreOp::create(
+                builder, loadOp.getLoc(), addedGradient, memrefGradient,
                 loadOp.getAffineMap(), ArrayRef<Value>(retrievedArguments));
+            if (alignAttr)
+              storeGradientOp->setAttr("alignment", alignAttr);
           }
         } else {
-          auto idx = builder.create<affine::AffineApplyOp>(
-              loadOp.getLoc(), loadOp.getAffineMap(), retrievedArguments);
-          builder.create<memref::AtomicRMWOp>(
-              loadOp.getLoc(), arith::AtomicRMWKind::addf, gradient,
-              memrefGradient, idx->getResults());
+          bool hasIndex = loadOp.getAffineMap().getNumDims() > 0;
+          auto alignAttr = loadOp->getAttrOfType<IntegerAttr>("alignment");
+          // if index had to be cached, the pop is not necessarily a valid index
+          if (hasIndex) {
+            SmallVector<Value> indices;
+            computeAffineIndices(builder, loadOp.getLoc(),
+                                 loadOp.getAffineMap(), retrievedArguments,
+                                 indices);
+            setDerivativeFastMath(enzyme::AtomicRMWOp::create(
+                builder, loadOp.getLoc(), gradient.getType(),
+                arith::AtomicRMWKind::addf, Ordering::monotonic, gradient,
+                memrefGradient, indices, alignAttr));
+          } else {
+            setDerivativeFastMath(enzyme::AffineAtomicRMWOp::create(
+                builder, loadOp.getLoc(), gradient.getType(),
+                arith::AtomicRMWKind::addf, Ordering::monotonic, gradient,
+                memrefGradient, retrievedArguments, loadOp.getAffineMap(),
+                alignAttr));
+          }
         }
       }
     }
@@ -273,6 +1132,8 @@ struct AffineLoadOpInterfaceReverse
           !gutils->isConstantValue(memref)) {
         OpBuilder cacheBuilder(gutils->getNewFromOriginal(op));
         SmallVector<Value> caches;
+        caches.push_back(gutils->initAndPushCache(
+            gutils->invertPointerM(memref, cacheBuilder), cacheBuilder));
         for (Value v : indices) {
           caches.push_back(gutils->initAndPushCache(
               gutils->getNewFromOriginal(v), cacheBuilder));
@@ -283,12 +1144,52 @@ struct AffineLoadOpInterfaceReverse
     return SmallVector<Value>();
   }
 
-  void createShadowValues(Operation *op, OpBuilder &builder,
-                          MGradientUtilsReverse *gutils) const {
-    // auto loadOp = cast<memref::LoadOp>(op);
-    // Value memref = loadOp.getMemref();
-    // Value shadow = gutils->getShadowValue(memref);
-    // Do nothing yet. In the future support memref<memref<...>>
+  LogicalResult createShadowValues(Operation *op, OpBuilder &builder,
+                                   MGradientUtilsReverse *gutils) const {
+    auto loadOp = cast<affine::AffineLoadOp>(op);
+    Value memref = loadOp.getMemref();
+    auto iface = dyn_cast<AutoDiffTypeInterface>(loadOp.getType());
+    // What a load of a mutable type reads is itself a handle on active memory,
+    // so what stands for it is the handle held at the same place in the shadow:
+    // the same load, off the shadow memref. Reading it out is the whole of the
+    // derivative -- see the adjoint above, which leaves it alone.
+    if (!iface)
+      return op->emitError()
+             << "could not compute the shadow of a load of a type without "
+                "autodiff semantics "
+             << *op;
+    // An immutable load's derivative is the adjoint's to accumulate.
+    if (!iface.isMutable())
+      return success();
+    if (gutils->isConstantValue(loadOp))
+      return success();
+    // Cannot load a non-constant value out of a constant memref: there is no
+    // shadow to read the handle from, so the claimed activity cannot be
+    // honored.
+    if (gutils->isConstantValue(memref))
+      return op->emitError()
+             << "cannot load a non-constant value out of a constant memref "
+             << *op;
+    Value memrefShadow = gutils->invertPointerM(memref, builder);
+    auto newLoad = cast<affine::AffineLoadOp>(gutils->getNewFromOriginal(op));
+    auto shadowLoad = cast<affine::AffineLoadOp>(builder.clone(*newLoad));
+    shadowLoad.getMemrefMutable().assign(memrefShadow);
+    gutils->setInvertedPointer(loadOp.getResult(), shadowLoad.getResult());
+    return success();
+  }
+};
+
+// Lets activity analysis treat affine.store generically via StoreLikeInterface.
+// getStoredPointer returns the base memref; the affine map indices apply within
+// the op.
+struct AffineStoreLike
+    : public StoreLikeInterface::ExternalModel<AffineStoreLike,
+                                               affine::AffineStoreOp> {
+  Value getStoredValue(Operation *op) const {
+    return cast<affine::AffineStoreOp>(op).getValueToStore();
+  }
+  Value getStoredPointer(Operation *op) const {
+    return cast<affine::AffineStoreOp>(op).getMemRef();
   }
 };
 
@@ -308,28 +1209,36 @@ struct AffineStoreOpInterfaceReverse
     if (!gutils->isConstantValue(memref)) {
       OpBuilder cacheBuilder(gutils->getNewFromOriginal(op));
 
-      Value memrefGradient = gutils->invertPointerM(memref, builder);
+      Value memrefGradient = gutils->popCache(caches.front(), builder);
 
       SmallVector<Value> retrievedArguments;
-      for (Value cache : caches) {
+      for (Value cache : ValueRange(caches).drop_front(1)) {
         Value retrievedValue = gutils->popCache(cache, builder);
         retrievedArguments.push_back(retrievedValue);
       }
 
       bool hasIndex = storeOp.getAffineMap().getNumDims() > 0;
+      auto alignAttr = storeOp->getAttrOfType<IntegerAttr>("alignment");
 
       if (!iface.isMutable()) {
         if (!gutils->isConstantValue(val)) {
           Value loadedGradient;
           if (hasIndex) {
-            auto idx = builder.create<affine::AffineApplyOp>(
-                storeOp.getLoc(), storeOp.getAffineMap(), retrievedArguments);
-            loadedGradient = builder.create<memref::LoadOp>(
-                storeOp.getLoc(), memrefGradient, idx->getResults());
+            SmallVector<Value> indices;
+            computeAffineIndices(builder, storeOp.getLoc(),
+                                 storeOp.getAffineMap(), retrievedArguments,
+                                 indices);
+            auto loadedGradientOp = memref::LoadOp::create(
+                builder, storeOp.getLoc(), memrefGradient, indices);
+            loadedGradientOp.setAlignmentAttr(alignAttr);
+            loadedGradient = loadedGradientOp;
           } else {
-            loadedGradient = builder.create<affine::AffineLoadOp>(
-                storeOp.getLoc(), memrefGradient, storeOp.getAffineMap(),
-                ArrayRef<Value>(retrievedArguments));
+            auto loadedGradientOp = affine::AffineLoadOp::create(
+                builder, storeOp.getLoc(), memrefGradient,
+                storeOp.getAffineMap(), ArrayRef<Value>(retrievedArguments));
+            if (alignAttr)
+              loadedGradientOp->setAttr("alignment", alignAttr);
+            loadedGradient = loadedGradientOp;
           }
           gutils->addToDiffe(val, loadedGradient, builder);
         }
@@ -340,16 +1249,27 @@ struct AffineStoreOpInterfaceReverse
 
         // if index had to be cached, the pop is not necessarily a valid index
         if (hasIndex) {
-          auto idx = builder.create<affine::AffineApplyOp>(
-              storeOp.getLoc(), storeOp.getAffineMap(), retrievedArguments);
-          builder.create<memref::StoreOp>(storeOp.getLoc(), zero,
-                                          memrefGradient, idx->getResults());
+          SmallVector<Value> indices;
+          computeAffineIndices(builder, storeOp.getLoc(),
+                               storeOp.getAffineMap(), retrievedArguments,
+                               indices);
+          auto zeroStoreOp = memref::StoreOp::create(
+              builder, storeOp.getLoc(), zero, memrefGradient, indices);
+          zeroStoreOp.setAlignmentAttr(alignAttr);
         } else {
-          builder.create<affine::AffineStoreOp>(
-              storeOp.getLoc(), zero, memrefGradient, storeOp.getAffineMap(),
-              ArrayRef<Value>(retrievedArguments));
+          auto zeroStoreOp = affine::AffineStoreOp::create(
+              builder, storeOp.getLoc(), zero, memrefGradient,
+              storeOp.getAffineMap(), ArrayRef<Value>(retrievedArguments));
+          if (alignAttr)
+            zeroStoreOp->setAttr("alignment", alignAttr);
         }
       }
+
+      // A store into memory whose primal contents the caller declared
+      // unneeded (enzyme_dupnoneed) need not happen in the augmented
+      // forward pass either.
+      if (gutils->primalStoreElidable(storeOp.getMemref()))
+        gutils->erase(gutils->getNewFromOriginal(op));
     }
     return success();
   }
@@ -364,6 +1284,8 @@ struct AffineStoreOpInterfaceReverse
       if (!gutils->isConstantValue(memref)) {
         OpBuilder cacheBuilder(gutils->getNewFromOriginal(op));
         SmallVector<Value> caches;
+        caches.push_back(gutils->initAndPushCache(
+            gutils->invertPointerM(memref, cacheBuilder), cacheBuilder));
         for (Value v : indices) {
           caches.push_back(gutils->initAndPushCache(
               gutils->getNewFromOriginal(v), cacheBuilder));
@@ -374,12 +1296,36 @@ struct AffineStoreOpInterfaceReverse
     return SmallVector<Value>();
   }
 
-  void createShadowValues(Operation *op, OpBuilder &builder,
-                          MGradientUtilsReverse *gutils) const {
-    // auto storeOp = cast<memref::StoreOp>(op);
-    // Value memref = storeOp.getMemref();
-    // Value shadow = gutils->getShadowValue(memref);
-    // Do nothing yet. In the future support memref<memref<...>>
+  // Same structural story as memref.store: a stored mutable value's shadow
+  // must land at the same affine position in the shadow memref.
+  LogicalResult createShadowValues(Operation *op, OpBuilder &builder,
+                                   MGradientUtilsReverse *gutils) const {
+    auto storeOp = cast<affine::AffineStoreOp>(op);
+    Value val = storeOp.getValue();
+    Value memref = storeOp.getMemref();
+    auto iface = dyn_cast<AutoDiffTypeInterface>(val.getType());
+    if (!iface)
+      return op->emitError()
+             << "could not compute the shadow of a store of a type without "
+                "autodiff semantics "
+             << *op;
+    if (gutils->isConstantValue(memref))
+      return success();
+    // Immutable values' shadows live in the reverse sweep's adjoint, which
+    // accumulates and zeroes the slot; only mutable values need the forward
+    // sweep to place their shadow.
+    if (!iface.isMutable())
+      return success();
+    Value memrefShadow = gutils->invertPointerM(memref, builder);
+    Value valShadow =
+        gutils->isConstantValue(val)
+            ? oputils::inactiveStoredValueShadow(op, *gutils, val, builder)
+            : gutils->invertPointerM(val, builder);
+    auto newOp = cast<affine::AffineStoreOp>(gutils->getNewFromOriginal(op));
+    auto shadowOp = cast<affine::AffineStoreOp>(builder.clone(*newOp));
+    shadowOp.getValueMutable().assign(valShadow);
+    shadowOp.getMemrefMutable().assign(memrefShadow);
+    return success();
   }
 };
 
@@ -436,24 +1382,45 @@ public:
            forOp.getStepAsInt();
   }
 
+  // A bound map with several results is a min (upper bound) or a max (lower
+  // bound) -- affine.for's own reading of one, and the shape the periodic
+  // checkpointing scaffold gives a segment that may be short:
+  // `min(nInner, remaining)`. affine.apply cannot express it, since it requires
+  // a single-result map, so materialize it with the op that can.
+  static Value materializeBound(OpBuilder &builder, Location loc, AffineMap map,
+                                ValueRange operands, bool isUpper) {
+    if (map.getNumResults() == 1)
+      return AffineApplyOp::create(builder, loc, map, operands);
+    if (isUpper)
+      return affine::AffineMinOp::create(builder, loc, map, operands);
+    return affine::AffineMaxOp::create(builder, loc, map, operands);
+  }
+
   static SmallVector<IntOrValue, 1>
   getDimensionBounds(OpBuilder &builder, affine::AffineForOp forOp) {
     auto iters = getConstantNumberOfIterations(forOp);
     if (iters) {
       return {IntOrValue(*iters)};
     } else {
-      auto lb = builder.create<AffineApplyOp>(forOp.getLoc(),
-                                              forOp.getLowerBoundMap(),
-                                              forOp.getLowerBoundOperands());
-      auto ub = builder.create<AffineApplyOp>(forOp.getLoc(),
-                                              forOp.getUpperBoundMap(),
-                                              forOp.getUpperBoundOperands());
+      Value lb =
+          materializeBound(builder, forOp.getLoc(), forOp.getLowerBoundMap(),
+                           forOp.getLowerBoundOperands(),
+                           /*isUpper=*/false);
+      Value ub =
+          materializeBound(builder, forOp.getLoc(), forOp.getUpperBoundMap(),
+                           forOp.getUpperBoundOperands(),
+                           /*isUpper=*/true);
 
-      Value diff = builder.create<arith::SubIOp>(forOp->getLoc(), ub, lb);
+      Value diff = arith::SubIOp::create(builder, forOp->getLoc(), ub, lb);
       if (forOp.getStepAsInt() != 1) {
-        auto step = builder.create<arith::ConstantIntOp>(
-            forOp->getLoc(), diff.getType(), forOp.getStepAsInt());
-        diff = builder.create<arith::DivUIOp>(forOp->getLoc(), diff, step);
+        // arith::ConstantIntOp requires an IntegerType; diff's type here is
+        // always index (the result of an affine.apply), which
+        // arith::ConstantOp + IntegerAttr handles uniformly (unlike
+        // ConstantIntOp, which asserts on IndexType).
+        auto step = arith::ConstantOp::create(
+            builder, forOp->getLoc(),
+            IntegerAttr::get(diff.getType(), forOp.getStepAsInt()));
+        diff = arith::DivUIOp::create(builder, forOp->getLoc(), diff, step);
       }
       return {IntOrValue(diff)};
     }
@@ -463,16 +1430,21 @@ public:
                                                 affine::AffineForOp forOp) {
     Value val = forOp.getBody()->getArgument(0);
     if (!forOp.hasConstantLowerBound() || forOp.getConstantLowerBound() != 0) {
-      auto lb = builder.create<AffineApplyOp>(forOp.getLoc(),
-                                              forOp.getLowerBoundMap(),
-                                              forOp.getLowerBoundOperands());
-      val = builder.create<arith::SubIOp>(forOp->getLoc(), val, lb);
+      Value lb =
+          materializeBound(builder, forOp.getLoc(), forOp.getLowerBoundMap(),
+                           forOp.getLowerBoundOperands(),
+                           /*isUpper=*/false);
+      val = arith::SubIOp::create(builder, forOp->getLoc(), val, lb);
     }
 
     if (forOp.getStepAsInt() != 1) {
-      auto step = builder.create<arith::ConstantIntOp>(
-          forOp->getLoc(), val.getType(), forOp.getStepAsInt());
-      val = builder.create<arith::DivUIOp>(forOp->getLoc(), val, step);
+      // See the identical note in getDimensionBounds above: val's type here
+      // is always index, which needs arith::ConstantOp + IntegerAttr rather
+      // than arith::ConstantIntOp (IntegerType-only).
+      auto step = arith::ConstantOp::create(
+          builder, forOp->getLoc(),
+          IntegerAttr::get(val.getType(), forOp.getStepAsInt()));
+      val = arith::DivUIOp::create(builder, forOp->getLoc(), val, step);
     }
     return {val};
   }
@@ -489,9 +1461,13 @@ public:
     Value canIdx = forOp.getBody()->getArgument(0);
     if (!map.contains(canIdx)) {
       assert(forOp.getLowerBoundMap() == otherForOp.getLowerBoundMap());
-      for (auto &&[f, o] : llvm::zip_equal(forOp.getLowerBoundOperands(),
-                                           otherForOp.getLowerBoundOperands()))
+      for (auto &&[f, o] :
+           llvm::zip_equal(forOp.getLowerBoundOperands(),
+                           otherForOp.getLowerBoundOperands())) {
+        (void)f;
+        (void)o;
         assert(Equivalent(f, o));
+      }
       assert(forOp.getStep() == otherForOp.getStep());
       map.map(forOp.getBody()->getArgument(0),
               otherForOp.getBody()->getArgument(0));
@@ -503,10 +1479,14 @@ public:
   replaceWithNewOperands(PatternRewriter &rewriter,
                          affine::AffineForOp otherForOp,
                          ArrayRef<Value> operands) {
-    auto newOtherForOp = rewriter.create<affine::AffineForOp>(
-        otherForOp->getLoc(), otherForOp.getLowerBoundOperands(),
+    auto newOtherForOp = affine::AffineForOp::create(
+        rewriter, otherForOp->getLoc(), otherForOp.getLowerBoundOperands(),
         otherForOp.getLowerBoundMap(), otherForOp.getUpperBoundOperands(),
         otherForOp.getUpperBoundMap(), otherForOp.getStepAsInt(), operands);
+
+    // Same loop, more iteration arguments: it keeps what was set on it.
+    newOtherForOp->setDiscardableAttrs(
+        otherForOp->getDiscardableAttrDictionary());
 
     newOtherForOp.getRegion().takeBody(otherForOp.getRegion());
     rewriter.replaceOp(otherForOp, newOtherForOp->getResults().slice(
@@ -517,6 +1497,14 @@ public:
   static ValueRange getInits(affine::AffineForOp forOp) {
     return forOp.getInits();
   }
+
+  static bool mustPostAdd(affine::AffineForOp forOp) { return false; }
+
+  static Value initialValueInBlock(OpBuilder &builder, Block *body,
+                                   Value grad) {
+    auto Ty = cast<enzyme::GradientType>(grad.getType()).getBasetype();
+    return body->addArgument(Ty, grad.getLoc());
+  }
 };
 
 #include "Implementations/AffineDerivatives.inc"
@@ -525,13 +1513,27 @@ public:
 void mlir::enzyme::registerAffineDialectAutoDiffInterface(
     DialectRegistry &registry) {
   registry.addExtension(+[](MLIRContext *context, affine::AffineDialect *) {
+    // Binomial checkpointing's scaffold loops are always plain scf ops,
+    // even when checkpointing an affine.for -- load scf here rather than
+    // relying on whatever pass happens to run this interface to have
+    // declared it as a dependent dialect.
+    context->getOrLoadDialect<scf::SCFDialect>();
     registerInterfaces(context);
     affine::AffineLoadOp::attachInterface<AffineLoadOpInterfaceReverse>(
         *context);
+    affine::AffineStoreOp::attachInterface<AffineStoreLike>(*context);
     affine::AffineStoreOp::attachInterface<AffineStoreOpInterfaceReverse>(
         *context);
     affine::AffineForOp::attachInterface<AffineForOpInterfaceReverse>(*context);
     affine::AffineForOp::attachInterface<AffineForOpEnzymeOpsRemover>(*context);
     affine::AffineForOp::attachInterface<AffineForOpADDataFlow>(*context);
+    affine::AffineParallelOp::attachInterface<AffineParallelOpInterfaceReverse>(
+        *context);
+    affine::AffineParallelOp::attachInterface<AffineParallelOpEnzymeOpsRemover>(
+        *context);
+    affine::AffineParallelOp::attachInterface<
+        AffineParallelRegionBranchOpInterface>(*context);
+    affine::AffineIfOp::attachInterface<AffineIfOpInterfaceReverse>(*context);
+    affine::AffineIfOp::attachInterface<AffineIfOpEnzymeOpsRemover>(*context);
   });
 }

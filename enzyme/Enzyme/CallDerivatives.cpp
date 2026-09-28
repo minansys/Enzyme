@@ -33,6 +33,19 @@ void (*EnzymeShadowAllocRewrite)(LLVMValueRef, void *, LLVMValueRef, uint64_t,
                                  LLVMValueRef, uint8_t) = nullptr;
 }
 
+/// Whether \p Begin has exactly one llvm.julia.gc_preserve_end outside the
+/// abort-only blocks the reverse pass drops, as reversing the region requires;
+/// CanonicalizeGCPreserveEnds merges them where it can.
+static bool hasSingleGCPreserveEnd(CallInst *Begin, GradientUtils *gutils) {
+  unsigned Ends = 0;
+  for (auto U : Begin->users())
+    if (auto CI = dyn_cast<CallInst>(U))
+      if (getFuncNameFromCall(CI) == "llvm.julia.gc_preserve_end" &&
+          !gutils->notForAnalysis.count(CI->getParent()))
+        ++Ends;
+  return Ends == 1;
+}
+
 void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
                                  llvm::StringRef funcName) {
   using namespace llvm;
@@ -54,7 +67,7 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
         Value *d_req = gutils->invertPointerM(call.getOperand(6), BuilderZ);
         if (d_req->getType()->isIntegerTy()) {
           d_req = BuilderZ.CreateIntToPtr(
-              d_req, PointerType::getUnqual(getInt8PtrTy(call.getContext())));
+              d_req, getUnqual(getInt8PtrTy(call.getContext())));
         }
 
         auto i64 = Type::getInt64Ty(call.getContext());
@@ -64,8 +77,7 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
             CreateAllocation(BuilderZ, impi, ConstantInt::get(i64, 1));
         BuilderZ.SetInsertPoint(gutils->getNewFromOriginal(&call));
 
-        d_req = BuilderZ.CreateBitCast(
-            d_req, PointerType::getUnqual(impialloc->getType()));
+        d_req = BuilderZ.CreateBitCast(d_req, getUnqual(impialloc->getType()));
         Value *d_req_prev = BuilderZ.CreateLoad(impialloc->getType(), d_req);
         BuilderZ.CreateStore(
             BuilderZ.CreatePointerCast(d_req_prev,
@@ -76,7 +88,7 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
         if (funcName == "MPI_Isend" || funcName == "PMPI_Isend") {
           Value *tysize =
               MPI_TYPE_SIZE(gutils->getNewFromOriginal(call.getOperand(2)),
-                            BuilderZ, call.getType());
+                            BuilderZ, call.getType(), called);
 
           auto len_arg = BuilderZ.CreateZExtOrTrunc(
               gutils->getNewFromOriginal(call.getOperand(1)),
@@ -150,13 +162,8 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
 
         Type *statusType = nullptr;
 #if LLVM_VERSION_MAJOR < 17
-        if (Function *recvfn = called->getParent()->getFunction("PMPI_Wait")) {
-          auto statusArg = recvfn->arg_end();
-          statusArg--;
-          if (auto PT = dyn_cast<PointerType>(statusArg->getType()))
-            statusType = PT->getPointerElementType();
-        }
-        if (Function *recvfn = called->getParent()->getFunction("MPI_Wait")) {
+        if (Function *recvfn = called->getParent()->getFunction(
+                getRenamedPerCallingConv(called->getName(), "MPI_Wait"))) {
           auto statusArg = recvfn->arg_end();
           statusArg--;
           if (auto PT = dyn_cast<PointerType>(statusArg->getType()))
@@ -177,9 +184,8 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
               Builder2.CreateIntToPtr(d_req, getInt8PtrTy(call.getContext()));
         }
         auto impi = getMPIHelper(call.getContext());
-        Type *helperTy = llvm::PointerType::getUnqual(impi);
-        Value *helper =
-            Builder2.CreatePointerCast(d_req, PointerType::getUnqual(helperTy));
+        Type *helperTy = getUnqual(impi);
+        Value *helper = Builder2.CreatePointerCast(d_req, getUnqual(helperTy));
         helper = Builder2.CreateLoad(helperTy, helper);
 
         auto i64 = Type::getInt64Ty(call.getContext());
@@ -211,21 +217,23 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
             getInt8PtrTy(call.getContext()),
             getMPIMemberPtr<MPI_Elem::Old>(Builder2, helper, impi));
 
-        Builder2.CreateStore(
-            prev, Builder2.CreatePointerCast(
-                      d_req, PointerType::getUnqual(prev->getType())));
+        Builder2.CreateStore(prev, Builder2.CreatePointerCast(
+                                       d_req, getUnqual(prev->getType())));
 
         assert(shouldFree());
 
         assert(tysize);
-        tysize = MPI_TYPE_SIZE(tysize, Builder2, call.getType());
+        tysize = MPI_TYPE_SIZE(tysize, Builder2, call.getType(), called);
 
         Value *args[] = {/*req*/ req,
                          /*status*/ IRBuilder<>(gutils->inversionAllocs)
                              .CreateAlloca(statusType)};
         FunctionCallee waitFunc = nullptr;
-        for (auto name : {"PMPI_Wait", "MPI_Wait"})
-          if (Function *recvfn = called->getParent()->getFunction(name)) {
+        for (auto name : {
+                 "MPI_Wait",
+             })
+          if (Function *recvfn = called->getParent()->getFunction(
+                  getRenamedPerCallingConv(called->getName(), name))) {
             auto statusArg = recvfn->arg_end();
             statusArg--;
             if (statusArg->getType()->isIntegerTy())
@@ -240,7 +248,8 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
           for (size_t i = 0; i < sizeof(args) / sizeof(*args); i++)
             types[i] = args[i]->getType();
           FunctionType *FT = FunctionType::get(call.getType(), types, false);
-          waitFunc = called->getParent()->getOrInsertFunction("MPI_Wait", FT);
+          waitFunc = called->getParent()->getOrInsertFunction(
+              getRenamedPerCallingConv(called->getName(), "MPI_Wait"), FT);
         }
         assert(waitFunc);
 
@@ -353,27 +362,25 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
 
       if (req->getType()->isIntegerTy()) {
         req = BuilderZ.CreateIntToPtr(
-            req, PointerType::getUnqual(getInt8PtrTy(call.getContext())));
+            req, getUnqual(getInt8PtrTy(call.getContext())));
       }
 
       Value *isNull = nullptr;
       if (auto GV = gutils->newFunc->getParent()->getNamedValue(
               "ompi_request_null")) {
-        Value *reql = BuilderZ.CreatePointerCast(
-            req, PointerType::getUnqual(GV->getType()));
+        Value *reql = BuilderZ.CreatePointerCast(req, getUnqual(GV->getType()));
         reql = BuilderZ.CreateLoad(GV->getType(), reql);
         isNull = BuilderZ.CreateICmpEQ(reql, GV);
       }
 
       if (d_req->getType()->isIntegerTy()) {
         d_req = BuilderZ.CreateIntToPtr(
-            d_req, PointerType::getUnqual(getInt8PtrTy(call.getContext())));
+            d_req, getUnqual(getInt8PtrTy(call.getContext())));
       }
 
       d_reqp = BuilderZ.CreateLoad(
-          PointerType::getUnqual(impi),
-          BuilderZ.CreatePointerCast(
-              d_req, PointerType::getUnqual(PointerType::getUnqual(impi))));
+          getUnqual(impi),
+          BuilderZ.CreatePointerCast(d_req, getUnqual(getUnqual(impi))));
       if (isNull)
         d_reqp =
             CreateSelect(BuilderZ, isNull,
@@ -393,7 +400,7 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
           lookup(gutils->getNewFromOriginal(call.getOperand(0)), Builder2);
 
       if (Mode != DerivativeMode::ReverseModeCombined) {
-        d_reqp = BuilderZ.CreatePHI(PointerType::getUnqual(impi), 0);
+        d_reqp = BuilderZ.CreatePHI(getUnqual(impi), 0);
         d_reqp = gutils->cacheForReverse(
             BuilderZ, d_reqp, getIndex(&call, CacheType::Tape, BuilderZ));
       } else
@@ -428,7 +435,8 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
       for (size_t i = 0; i < sizeof(args) / sizeof(*args) - 1; i++)
         types[i] = args[i]->getType();
       Function *dwait = getOrInsertDifferentialMPI_Wait(
-          *called->getParent(), types, call.getOperand(0)->getType());
+          *called->getParent(), types, call.getOperand(0)->getType(),
+          called->getName());
 
       // Need to preserve the shadow Request (operand 0 in wait).
       // However, this doesn't end up preserving
@@ -461,11 +469,6 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
       Value *request = gutils->invertPointerM(call.getArgOperand(0), Builder2);
       Value *status = gutils->invertPointerM(call.getArgOperand(1), Builder2);
 
-      if (request->getType()->isIntegerTy()) {
-        request = Builder2.CreateIntToPtr(
-            request, PointerType::getUnqual(getInt8PtrTy(call.getContext())));
-      }
-
       Value *args[] = {/*request*/ request,
                        /*status*/ status};
 
@@ -486,7 +489,7 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
   if (funcName == "MPI_Waitall" || funcName == "PMPI_Waitall") {
     Value *d_reqp = nullptr;
     auto impi = getMPIHelper(call.getContext());
-    PointerType *reqType = PointerType::getUnqual(impi);
+    PointerType *reqType = getUnqual(impi);
     if (Mode == DerivativeMode::ReverseModePrimal ||
         Mode == DerivativeMode::ReverseModeCombined) {
       Value *count = gutils->getNewFromOriginal(call.getOperand(0));
@@ -495,12 +498,12 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
 
       if (req->getType()->isIntegerTy()) {
         req = BuilderZ.CreateIntToPtr(
-            req, PointerType::getUnqual(getInt8PtrTy(call.getContext())));
+            req, getUnqual(getInt8PtrTy(call.getContext())));
       }
 
       if (d_req->getType()->isIntegerTy()) {
         d_req = BuilderZ.CreateIntToPtr(
-            d_req, PointerType::getUnqual(getInt8PtrTy(call.getContext())));
+            d_req, getUnqual(getInt8PtrTy(call.getContext())));
       }
 
       Function *dsave = getOrInsertDifferentialWaitallSave(
@@ -526,7 +529,7 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
           lookup(gutils->getNewFromOriginal(call.getOperand(1)), Builder2);
 
       if (Mode != DerivativeMode::ReverseModeCombined) {
-        d_reqp = BuilderZ.CreatePHI(PointerType::getUnqual(reqType), 0);
+        d_reqp = BuilderZ.CreatePHI(getUnqual(reqType), 0);
         d_reqp = gutils->cacheForReverse(
             BuilderZ, d_reqp, getIndex(&call, CacheType::Tape, BuilderZ));
       }
@@ -562,9 +565,8 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
       Value *d_req = Builder2.CreateInBoundsGEP(reqType, d_reqp, idxs);
 
       d_req = Builder2.CreateLoad(
-          PointerType::getUnqual(impi),
-          Builder2.CreatePointerCast(
-              d_req, PointerType::getUnqual(PointerType::getUnqual(impi))));
+          getUnqual(impi),
+          Builder2.CreatePointerCast(d_req, getUnqual(getUnqual(impi))));
 
       Value *isNull = Builder2.CreateICmpEQ(
           d_req, Constant::getNullValue(d_req->getType()));
@@ -586,8 +588,8 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
       Type *types[sizeof(args) / sizeof(*args) - 1];
       for (size_t i = 0; i < sizeof(args) / sizeof(*args) - 1; i++)
         types[i] = args[i]->getType();
-      Function *dwait = getOrInsertDifferentialMPI_Wait(*called->getParent(),
-                                                        types, req->getType());
+      Function *dwait = getOrInsertDifferentialMPI_Wait(
+          *called->getParent(), types, req->getType(), called->getName());
       // Need to preserve the shadow Request (operand 6 in isend/irecv), which
       // becomes operand 0 for iwait. However, this doesn't end up preserving
       // the underlying buffers for the adjoint. To remedy, force inline the
@@ -631,8 +633,7 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
           gutils->invertPointerM(call.getOperand(1), Builder2);
       if (array_of_requests->getType()->isIntegerTy()) {
         array_of_requests = Builder2.CreateIntToPtr(
-            array_of_requests,
-            PointerType::getUnqual(getInt8PtrTy(call.getContext())));
+            array_of_requests, getUnqual(getInt8PtrTy(call.getContext())));
       }
 
       Value *args[] = {
@@ -677,6 +678,7 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
       Value *shadow = gutils->invertPointerM(call.getOperand(0), Builder2);
       if (!forwardMode)
         shadow = lookup(shadow, Builder2);
+      Value *shadowOrig = shadow;
       if (shadow->getType()->isIntegerTy())
         shadow =
             Builder2.CreateIntToPtr(shadow, getInt8PtrTy(call.getContext()));
@@ -684,13 +686,8 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
       Type *statusType = nullptr;
 #if LLVM_VERSION_MAJOR < 17
       if (called->getContext().supportsTypedPointers()) {
-        if (Function *recvfn = called->getParent()->getFunction("MPI_Recv")) {
-          auto statusArg = recvfn->arg_end();
-          statusArg--;
-          if (auto PT = dyn_cast<PointerType>(statusArg->getType()))
-            statusType = PT->getPointerElementType();
-        } else if (Function *recvfn =
-                       called->getParent()->getFunction("PMPI_Recv")) {
+        if (Function *recvfn = called->getParent()->getFunction(
+                getRenamedPerCallingConv(called->getName(), "MPI_Recv"))) {
           auto statusArg = recvfn->arg_end();
           statusArg--;
           if (auto PT = dyn_cast<PointerType>(statusArg->getType()))
@@ -726,7 +723,7 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
 
       if (forwardMode) {
         Value *args[] = {
-            /*buf*/ shadow,
+            /*buf*/ shadowOrig,
             /*count*/ count,
             /*datatype*/ datatype,
             /*dest*/ src,
@@ -755,7 +752,7 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
           /*status*/
           IRBuilder<>(gutils->inversionAllocs).CreateAlloca(statusType)};
 
-      Value *tysize = MPI_TYPE_SIZE(datatype, Builder2, call.getType());
+      Value *tysize = MPI_TYPE_SIZE(datatype, Builder2, call.getType(), called);
 
       auto len_arg = Builder2.CreateZExtOrTrunc(
           args[1], Type::getInt64Ty(call.getContext()));
@@ -784,7 +781,9 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
           Builder2, /*lookup*/ true);
 
       auto fcall = Builder2.CreateCall(
-          called->getParent()->getOrInsertFunction("MPI_Recv", FT), args);
+          called->getParent()->getOrInsertFunction(
+              getRenamedPerCallingConv(called->getName(), "MPI_Recv"), FT),
+          args);
       fcall->setCallingConv(call.getCallingConv());
 
       DifferentiableMemCopyFloats(call, call.getOperand(0), firstallocation,
@@ -801,7 +800,9 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
 
   if (funcName == "MPI_Recv" || funcName == "PMPI_Recv") {
     if (Mode == DerivativeMode::ReverseModeGradient ||
-        Mode == DerivativeMode::ReverseModeCombined) {
+        Mode == DerivativeMode::ReverseModeCombined ||
+        Mode == DerivativeMode::ForwardMode ||
+        Mode == DerivativeMode::ForwardModeError) {
       bool forwardMode = Mode == DerivativeMode::ForwardMode ||
                          Mode == DerivativeMode::ForwardModeError;
 
@@ -817,9 +818,6 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
       Value *shadow = gutils->invertPointerM(call.getOperand(0), Builder2);
       if (!forwardMode)
         shadow = lookup(shadow, Builder2);
-      if (shadow->getType()->isIntegerTy())
-        shadow =
-            Builder2.CreateIntToPtr(shadow, getInt8PtrTy(call.getContext()));
 
       Value *count = gutils->getNewFromOriginal(call.getOperand(1));
       if (!forwardMode)
@@ -841,9 +839,24 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
       if (!forwardMode)
         comm = lookup(comm, Builder2);
 
-      Value *args[] = {
-          shadow, count, datatype, source, tag, comm,
-      };
+      if (forwardMode) {
+        Value *status = gutils->getNewFromOriginal(call.getOperand(6));
+        Value *args[] = {shadow, count, datatype, source, tag, comm, status};
+
+        auto Defs = gutils->getInvertedBundles(
+            &call,
+            {ValueType::Shadow, ValueType::Primal, ValueType::Primal,
+             ValueType::Primal, ValueType::Primal, ValueType::Primal,
+             ValueType::None},
+            Builder2, /*lookup*/ !forwardMode);
+
+        auto callval = call.getCalledOperand();
+
+        Builder2.CreateCall(call.getFunctionType(), callval, args, Defs);
+        return;
+      }
+
+      Value *args[] = {shadow, count, datatype, source, tag, comm};
 
       auto Defs = gutils->getInvertedBundles(
           &call,
@@ -852,20 +865,15 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
            ValueType::None},
           Builder2, /*lookup*/ !forwardMode);
 
-      if (forwardMode) {
-        auto callval = call.getCalledOperand();
-
-        Builder2.CreateCall(call.getFunctionType(), callval, args, Defs);
-        return;
-      }
-
       Type *types[sizeof(args) / sizeof(*args)];
       for (size_t i = 0; i < sizeof(args) / sizeof(*args); i++)
         types[i] = args[i]->getType();
       FunctionType *FT = FunctionType::get(call.getType(), types, false);
 
       auto fcall = Builder2.CreateCall(
-          called->getParent()->getOrInsertFunction("MPI_Send", FT), args, Defs);
+          called->getParent()->getOrInsertFunction(
+              getRenamedPerCallingConv(called->getName(), "MPI_Send"), FT),
+          args, Defs);
       fcall->setCallingConv(call.getCallingConv());
 
       auto dst_arg =
@@ -873,7 +881,7 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
       auto val_arg = ConstantInt::get(Type::getInt8Ty(call.getContext()), 0);
       auto len_arg = Builder2.CreateZExtOrTrunc(
           args[1], Type::getInt64Ty(call.getContext()));
-      auto tysize = MPI_TYPE_SIZE(datatype, Builder2, call.getType());
+      auto tysize = MPI_TYPE_SIZE(datatype, Builder2, call.getType(), called);
       len_arg =
           Builder2.CreateMul(len_arg,
                              Builder2.CreateZExtOrTrunc(
@@ -906,7 +914,7 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
   // 2. reduce sum diff(buffer) into intermediate
   // 3. if root, set shadow(buffer) = intermediate [memcpy] then free
   // 3-e. else, set shadow(buffer) = 0 [memset]
-  if (funcName == "MPI_Bcast") {
+  if (funcName == "MPI_Bcast" || funcName == "PMPI_Bcast") {
     if (Mode == DerivativeMode::ReverseModeGradient ||
         Mode == DerivativeMode::ReverseModeCombined ||
         Mode == DerivativeMode::ForwardMode ||
@@ -930,9 +938,10 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
         shadow =
             Builder2.CreateIntToPtr(shadow, getInt8PtrTy(call.getContext()));
 
-      ConcreteType CT = TR.firstPointer(1, call.getOperand(0), &call);
+      ConcreteType CT =
+          TR.firstPointer(1, call.getOperand(0), &call, gutils, &Builder2);
       auto MPI_OP_type = getInt8PtrTy(call.getContext());
-      Type *MPI_OP_Ptr_type = PointerType::getUnqual(MPI_OP_type);
+      Type *MPI_OP_Ptr_type = getUnqual(MPI_OP_type);
 
       Value *count = gutils->getNewFromOriginal(call.getOperand(1));
       if (!forwardMode)
@@ -968,8 +977,8 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
         return;
       }
 
-      Value *rank = MPI_COMM_RANK(comm, Builder2, root->getType());
-      Value *tysize = MPI_TYPE_SIZE(datatype, Builder2, call.getType());
+      Value *rank = MPI_COMM_RANK(comm, Builder2, root->getType(), called);
+      Value *tysize = MPI_TYPE_SIZE(datatype, Builder2, call.getType(), called);
 
       auto len_arg = Builder2.CreateZExtOrTrunc(
           count, Type::getInt64Ty(call.getContext()));
@@ -1024,7 +1033,7 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
             /*count*/ count,
             /*datatype*/ datatype,
             /*op (MPI_SUM)*/
-            getOrInsertOpFloatSum(*gutils->newFunc->getParent(),
+            getOrInsertOpFloatSum(*gutils->newFunc->getParent(), called,
                                   MPI_OP_Ptr_type, MPI_OP_type, CT,
                                   root->getType(), Builder2),
             /*int root*/ root,
@@ -1037,8 +1046,9 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
         FunctionType *FT = FunctionType::get(call.getType(), types, false);
 
         Builder2.CreateCall(
-            called->getParent()->getOrInsertFunction("MPI_Reduce", FT), args,
-            BufferDefs);
+            called->getParent()->getOrInsertFunction(
+                getRenamedPerCallingConv(called->getName(), "MPI_Reduce"), FT),
+            args, BufferDefs);
       }
 
       // 3. if root, set shadow(buffer) = intermediate [memcpy]
@@ -1109,7 +1119,9 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
   // MPI_Datatype datatype,
   //                      MPI_Op op, int root, MPI_Comm comm)
 
-  if (funcName == "MPI_Reduce" || funcName == "PMPI_Reduce") {
+  llvm::StringRef canonMPIName = canonicalizeMPIName(funcName);
+
+  if (canonMPIName == "MPI_Reduce") {
     if (Mode == DerivativeMode::ReverseModeGradient ||
         Mode == DerivativeMode::ReverseModeCombined ||
         Mode == DerivativeMode::ForwardMode ||
@@ -1128,7 +1140,7 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
         getReverseBuilder(Builder2);
       }
 
-      // Get the operations from MPI_Receive
+      // Get the operations from MPI_Reduce
       Value *orig_sendbuf = call.getOperand(0);
       Value *orig_recvbuf = call.getOperand(1);
       Value *orig_count = call.getOperand(2);
@@ -1136,6 +1148,10 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
       Value *orig_op = call.getOperand(4);
       Value *orig_root = call.getOperand(5);
       Value *orig_comm = call.getOperand(6);
+
+      // The Fortran MPI ABI ("mpi_reduce_", "mpi_reduce__", ...) passes all
+      // arguments by reference and appends an `ierr` argument.
+      bool fortranABI = isFortranMPICall(called->getName());
 
       bool isSum = false;
       if (Constant *C = dyn_cast<Constant>(orig_op)) {
@@ -1145,22 +1161,60 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
         if (auto GV = dyn_cast<GlobalVariable>(C)) {
           if (GV->getName() == "ompi_mpi_op_sum") {
             isSum = true;
+          } else if (fortranABI && GV->isConstant() &&
+                     GV->hasDefinitiveInitializer()) {
+            // The Fortran ABI passes the operator as a reference to an
+            // integer handle
+            if (auto *CI = dyn_cast<ConstantInt>(GV->getInitializer())) {
+              // MPICH native ABI (also covers the MPICH ABI Compatibility
+              // Initiative: Intel MPI, MVAPICH, Cray MPICH)
+              if (CI->getValue() == 1476395011) {
+                isSum = true;
+              }
+              // MPI 5.0 standard ABI (Chapter 20), where predefined op
+              // handles are fixed compile-time constants, identical in C
+              // and Fortran: MPI_SUM == 33.
+              if (CI->getValue() == 33) {
+                isSum = true;
+              }
+            }
           }
         }
-        // MPICH
+        // MPICH native ABI
         if (ConstantInt *CI = dyn_cast<ConstantInt>(C)) {
           if (CI->getValue() == 1476395011) {
             isSum = true;
           }
         }
+        // MPI 5.0 standard ABI: predefined op handles are small-integer
+        // pointer constants (inttoptr), with MPI_SUM == 33.
+        if (ConstantInt *CI = dyn_cast<ConstantInt>(C)) {
+          if (CI->getValue() == 33) {
+            isSum = true;
+          }
+        }
       }
       if (!isSum) {
-        std::string s;
-        llvm::raw_string_ostream ss(s);
-        ss << " call: " << call << "\n";
-        ss << " unhandled mpi_reduce op: " << *orig_op << "\n";
-        EmitNoDerivativeError(ss.str(), call, gutils, BuilderZ);
-        return;
+        if (fortranABI) {
+          // Integer MPI operator handles of a native Fortran ABI are
+          // implementation-defined and cannot be mapped portably at compile
+          // time; warn and assume the common case of MPI_SUM. This remains
+          // true with MPI 5.0: although its standard ABI (Chapter 20) does
+          // fix handle values as portable compile-time constants (MPI_SUM
+          // == 33, recognized above), supporting that ABI is optional and
+          // neither Open MPI nor MPICH use it by default, so code compiled
+          // against the default/native ABIs still carries
+          // implementation-defined handle values.
+          llvm::errs() << "warning: cannot determine MPI op used in `" << call
+                       << "`, assuming MPI_SUM\n";
+        } else {
+          std::string s;
+          llvm::raw_string_ostream ss(s);
+          ss << " call: " << call << "\n";
+          ss << " unhandled mpi_reduce op: " << *orig_op << "\n";
+          EmitNoDerivativeError(ss.str(), call, gutils, BuilderZ);
+          return;
+        }
       }
 
       Value *shadow_recvbuf = gutils->invertPointerM(orig_recvbuf, Builder2);
@@ -1177,13 +1231,16 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
         shadow_sendbuf = Builder2.CreateIntToPtr(
             shadow_sendbuf, getInt8PtrTy(call.getContext()));
 
-      // Need to preserve the shadow send/recv buffers.
-      auto BufferDefs = gutils->getInvertedBundles(
-          &call,
-          {ValueType::Shadow, ValueType::Shadow, ValueType::Primal,
-           ValueType::Primal, ValueType::Primal, ValueType::Primal,
-           ValueType::Primal},
-          Builder2, /*lookup*/ !forwardMode);
+      // Need to preserve the shadow send/recv buffers. The Fortran ABI call
+      // has an extra `ierr` argument, so build the bundle to match the actual
+      // call arity: shadow send/recv buffers, primal everything else.
+      std::vector<ValueType> BufferBundleTypes(call.arg_size(),
+                                               ValueType::Primal);
+      BufferBundleTypes[0] = ValueType::Shadow;
+      BufferBundleTypes[1] = ValueType::Shadow;
+      auto BufferDefs =
+          gutils->getInvertedBundles(&call, BufferBundleTypes, Builder2,
+                                     /*lookup*/ !forwardMode);
 
       Value *count = gutils->getNewFromOriginal(orig_count);
       if (!forwardMode)
@@ -1205,36 +1262,38 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
       if (!forwardMode)
         comm = lookup(comm, Builder2);
 
-      Value *rank = MPI_COMM_RANK(comm, Builder2, root->getType());
+      // The Fortran ABI passes the count and root arguments by reference;
+      // load them where their value is needed.
+      Type *i32Ty = Type::getInt32Ty(call.getContext());
+      Value *countVal = fortranABI ? Builder2.CreateLoad(i32Ty, count) : count;
+      Value *rootVal = fortranABI ? Builder2.CreateLoad(i32Ty, root) : root;
+
+      Value *rank = MPI_COMM_RANK(comm, Builder2, rootVal->getType(), called);
 
       if (forwardMode) {
-        Value *args[] = {
+        SmallVector<Value *, 8> args = {
             /*sendbuf*/ shadow_sendbuf,
             /*recvbuf*/ shadow_recvbuf,
-            /*count*/ count,
-            /*datatype*/ datatype,
-            /*op*/ op,
-            /*root*/ root,
-            /*comm*/ comm,
         };
+        for (size_t i = 2, e = call.arg_size(); i < e; i++)
+          args.push_back(gutils->getNewFromOriginal(call.getArgOperand(i)));
 
-        auto Defs = gutils->getInvertedBundles(
-            &call,
-            {ValueType::Shadow, ValueType::Shadow, ValueType::Primal,
-             ValueType::Primal, ValueType::Primal, ValueType::Primal,
-             ValueType::Primal},
-            Builder2, /*lookup*/ false);
+        std::vector<ValueType> BundleTypes(call.arg_size(), ValueType::Primal);
+        BundleTypes[0] = ValueType::Shadow;
+        BundleTypes[1] = ValueType::Shadow;
+        auto Defs = gutils->getInvertedBundles(&call, BundleTypes, Builder2,
+                                               /*lookup*/ false);
 
         auto callval = call.getCalledOperand();
         Builder2.CreateCall(call.getFunctionType(), callval, args, Defs);
         return;
       }
 
-      Value *tysize = MPI_TYPE_SIZE(datatype, Builder2, call.getType());
+      Value *tysize = MPI_TYPE_SIZE(datatype, Builder2, call.getType(), called);
 
       // Get the length for the allocation of the intermediate buffer
       auto len_arg = Builder2.CreateZExtOrTrunc(
-          count, Type::getInt64Ty(call.getContext()));
+          countVal, Type::getInt64Ty(call.getContext()));
       len_arg =
           Builder2.CreateMul(len_arg,
                              Builder2.CreateZExtOrTrunc(
@@ -1255,7 +1314,7 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
         BasicBlock *mergeBlock = gutils->addReverseBlock(
             rootBlock, currentBlock->getName() + "_post", gutils->newFunc);
 
-        Builder2.CreateCondBr(Builder2.CreateICmpEQ(rank, root), rootBlock,
+        Builder2.CreateCondBr(Builder2.CreateICmpEQ(rank, rootVal), rootBlock,
                               mergeBlock);
 
         Builder2.SetInsertPoint(rootBlock);
@@ -1284,21 +1343,31 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
         // int MPI_Bcast( void *buffer, int count, MPI_Datatype datatype, int
         // root,
         //     MPI_Comm comm )
-        Value *args[] = {
+        // The Fortran ABI passes count/datatype/root/comm by reference (as
+        // held here) and appends an `ierr` argument.
+        SmallVector<Value *, 8> args = {
             /*buf*/ buf,
             /*count*/ count,
             /*datatype*/ datatype,
             /*int root*/ root,
             /*comm*/ comm,
         };
-        Type *types[sizeof(args) / sizeof(*args)];
-        for (size_t i = 0; i < sizeof(args) / sizeof(*args); i++)
-          types[i] = args[i]->getType();
+        if (fortranABI) {
+          args.push_back(IRBuilder<>(gutils->inversionAllocs)
+                             .CreateAlloca(i32Ty, nullptr, "enzyme_mpi_ierr"));
+        }
+        SmallVector<Type *, 8> types;
+        for (auto *arg : args) {
+          types.push_back(arg->getType());
+        }
 
-        FunctionType *FT = FunctionType::get(call.getType(), types, false);
+        FunctionType *FT = FunctionType::get(
+            fortranABI ? Type::getVoidTy(call.getContext()) : call.getType(),
+            types, false);
         Builder2.CreateCall(
-            called->getParent()->getOrInsertFunction("MPI_Bcast", FT), args,
-            BufferDefs);
+            called->getParent()->getOrInsertFunction(
+                getRenamedPerCallingConv(called->getName(), "MPI_Bcast"), FT),
+            args, BufferDefs);
       }
 
       // 3. if root, Zero diff(recvbuffer) [memset to 0]
@@ -1309,7 +1378,7 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
         BasicBlock *mergeBlock = gutils->addReverseBlock(
             rootBlock, currentBlock->getName() + "_post", gutils->newFunc);
 
-        Builder2.CreateCondBr(Builder2.CreateICmpEQ(rank, root), rootBlock,
+        Builder2.CreateCondBr(Builder2.CreateICmpEQ(rank, rootVal), rootBlock,
                               mergeBlock);
 
         Builder2.SetInsertPoint(rootBlock);
@@ -1352,7 +1421,7 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
   // int MPI_Allreduce(const void *sendbuf, void *recvbuf, int count,
   //              MPI_Datatype datatype, MPI_Op op, MPI_Comm comm)
 
-  if (funcName == "MPI_Allreduce") {
+  if (canonMPIName == "MPI_Allreduce") {
     if (Mode == DerivativeMode::ReverseModeGradient ||
         Mode == DerivativeMode::ReverseModeCombined ||
         Mode == DerivativeMode::ForwardMode ||
@@ -1371,13 +1440,17 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
         getReverseBuilder(Builder2);
       }
 
-      // Get the operations from MPI_Receive
+      // Get the operations from MPI_Allreduce
       Value *orig_sendbuf = call.getOperand(0);
       Value *orig_recvbuf = call.getOperand(1);
       Value *orig_count = call.getOperand(2);
       Value *orig_datatype = call.getOperand(3);
       Value *orig_op = call.getOperand(4);
       Value *orig_comm = call.getOperand(5);
+
+      // The Fortran MPI ABI ("mpi_allreduce_", "mpi_allreduce__", ...) passes
+      // all arguments by reference and appends an `ierr` argument.
+      bool fortranABI = isFortranMPICall(called->getName());
 
       bool isSum = false;
       if (Constant *C = dyn_cast<Constant>(orig_op)) {
@@ -1387,22 +1460,60 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
         if (auto GV = dyn_cast<GlobalVariable>(C)) {
           if (GV->getName() == "ompi_mpi_op_sum") {
             isSum = true;
+          } else if (fortranABI && GV->isConstant() &&
+                     GV->hasDefinitiveInitializer()) {
+            // The Fortran ABI passes the operator as a reference to an
+            // integer handle
+            if (auto *CI = dyn_cast<ConstantInt>(GV->getInitializer())) {
+              // MPICH native ABI (also covers the MPICH ABI Compatibility
+              // Initiative: Intel MPI, MVAPICH, Cray MPICH)
+              if (CI->getValue() == 1476395011) {
+                isSum = true;
+              }
+              // MPI 5.0 standard ABI (Chapter 20), where predefined op
+              // handles are fixed compile-time constants, identical in C
+              // and Fortran: MPI_SUM == 33.
+              if (CI->getValue() == 33) {
+                isSum = true;
+              }
+            }
           }
         }
-        // MPICH
+        // MPICH native ABI
         if (ConstantInt *CI = dyn_cast<ConstantInt>(C)) {
           if (CI->getValue() == 1476395011) {
             isSum = true;
           }
         }
+        // MPI 5.0 standard ABI: predefined op handles are small-integer
+        // pointer constants (inttoptr), with MPI_SUM == 33.
+        if (ConstantInt *CI = dyn_cast<ConstantInt>(C)) {
+          if (CI->getValue() == 33) {
+            isSum = true;
+          }
+        }
       }
       if (!isSum) {
-        std::string s;
-        llvm::raw_string_ostream ss(s);
-        ss << " call: " << call << "\n";
-        ss << " unhandled mpi_allreduce op: " << *orig_op << "\n";
-        EmitNoDerivativeError(ss.str(), call, gutils, BuilderZ);
-        return;
+        if (fortranABI) {
+          // Integer MPI operator handles of a native Fortran ABI are
+          // implementation-defined and cannot be mapped portably at compile
+          // time; warn and assume the common case of MPI_SUM. This remains
+          // true with MPI 5.0: although its standard ABI (Chapter 20) does
+          // fix handle values as portable compile-time constants (MPI_SUM
+          // == 33, recognized above), supporting that ABI is optional and
+          // neither Open MPI nor MPICH use it by default, so code compiled
+          // against the default/native ABIs still carries
+          // implementation-defined handle values.
+          llvm::errs() << "warning: cannot determine MPI op used in `" << call
+                       << "`, assuming MPI_SUM\n";
+        } else {
+          std::string s;
+          llvm::raw_string_ostream ss(s);
+          ss << " call: " << call << "\n";
+          ss << " unhandled mpi_allreduce op: " << *orig_op << "\n";
+          EmitNoDerivativeError(ss.str(), call, gutils, BuilderZ);
+          return;
+        }
       }
 
       Value *shadow_recvbuf = gutils->invertPointerM(orig_recvbuf, Builder2);
@@ -1419,12 +1530,16 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
         shadow_sendbuf = Builder2.CreateIntToPtr(
             shadow_sendbuf, getInt8PtrTy(call.getContext()));
 
-      // Need to preserve the shadow send/recv buffers.
-      auto BufferDefs = gutils->getInvertedBundles(
-          &call,
-          {ValueType::Shadow, ValueType::Shadow, ValueType::Primal,
-           ValueType::Primal, ValueType::Primal, ValueType::Primal},
-          Builder2, /*lookup*/ !forwardMode);
+      // Need to preserve the shadow send/recv buffers. The Fortran ABI call
+      // has an extra `ierr` argument, so build the bundle to match the actual
+      // call arity: shadow send/recv buffers, primal everything else.
+      std::vector<ValueType> BufferBundleTypes(call.arg_size(),
+                                               ValueType::Primal);
+      BufferBundleTypes[0] = ValueType::Shadow;
+      BufferBundleTypes[1] = ValueType::Shadow;
+      auto BufferDefs =
+          gutils->getInvertedBundles(&call, BufferBundleTypes, Builder2,
+                                     /*lookup*/ !forwardMode);
 
       Value *count = gutils->getNewFromOriginal(orig_count);
       if (!forwardMode)
@@ -1442,27 +1557,36 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
       if (!forwardMode)
         op = lookup(op, Builder2);
 
+      // The Fortran ABI passes the count argument by reference; load it
+      // where its value is needed.
+      Type *i32Ty = Type::getInt32Ty(call.getContext());
+      Value *countVal = fortranABI ? Builder2.CreateLoad(i32Ty, count) : count;
+
       if (forwardMode) {
-        Value *args[] = {
+        SmallVector<Value *, 8> args = {
             /*sendbuf*/ shadow_sendbuf,
             /*recvbuf*/ shadow_recvbuf,
-            /*count*/ count,
-            /*datatype*/ datatype,
-            /*op*/ op,
-            /*comm*/ comm,
         };
+        for (size_t i = 2, e = call.arg_size(); i < e; i++)
+          args.push_back(gutils->getNewFromOriginal(call.getArgOperand(i)));
+
+        std::vector<ValueType> BundleTypes(call.arg_size(), ValueType::Primal);
+        BundleTypes[0] = ValueType::Shadow;
+        BundleTypes[1] = ValueType::Shadow;
+        auto Defs = gutils->getInvertedBundles(&call, BundleTypes, Builder2,
+                                               /*lookup*/ false);
 
         auto callval = call.getCalledOperand();
-        Builder2.CreateCall(call.getFunctionType(), callval, args, BufferDefs);
+        Builder2.CreateCall(call.getFunctionType(), callval, args, Defs);
 
         return;
       }
 
-      Value *tysize = MPI_TYPE_SIZE(datatype, Builder2, call.getType());
+      Value *tysize = MPI_TYPE_SIZE(datatype, Builder2, call.getType(), called);
 
       // Get the length for the allocation of the intermediate buffer
       auto len_arg = Builder2.CreateZExtOrTrunc(
-          count, Type::getInt64Ty(call.getContext()));
+          countVal, Type::getInt64Ty(call.getContext()));
       len_arg =
           Builder2.CreateMul(len_arg,
                              Builder2.CreateZExtOrTrunc(
@@ -1478,7 +1602,9 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
       {
         // int MPI_Allreduce(const void *sendbuf, void *recvbuf, int count,
         //              MPI_Datatype datatype, MPI_Op op, MPI_Comm comm)
-        Value *args[] = {
+        // The Fortran ABI passes count/datatype/op/comm by reference (as
+        // held here) and appends an `ierr` argument.
+        SmallVector<Value *, 8> args = {
             /*sendbuf*/ shadow_recvbuf,
             /*recvbuf*/ buf,
             /*count*/ count,
@@ -1486,14 +1612,22 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
             /*op*/ op,
             /*comm*/ comm,
         };
-        Type *types[sizeof(args) / sizeof(*args)];
-        for (size_t i = 0; i < sizeof(args) / sizeof(*args); i++)
-          types[i] = args[i]->getType();
+        if (fortranABI) {
+          args.push_back(IRBuilder<>(gutils->inversionAllocs)
+                             .CreateAlloca(i32Ty, nullptr, "enzyme_mpi_ierr"));
+        }
+        SmallVector<Type *, 8> types;
+        for (auto *arg : args)
+          types.push_back(arg->getType());
 
-        FunctionType *FT = FunctionType::get(call.getType(), types, false);
+        FunctionType *FT = FunctionType::get(
+            fortranABI ? Type::getVoidTy(call.getContext()) : call.getType(),
+            types, false);
         Builder2.CreateCall(
-            called->getParent()->getOrInsertFunction("MPI_Allreduce", FT), args,
-            BufferDefs);
+            called->getParent()->getOrInsertFunction(
+                getRenamedPerCallingConv(called->getName(), "MPI_Allreduce"),
+                FT),
+            args, BufferDefs);
       }
 
       // 3. Zero diff(recvbuffer) [memset to 0]
@@ -1532,7 +1666,7 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
   //           void *recvbuf, int recvcount, MPI_Datatype recvtype,
   //           int root, MPI_Comm comm)
 
-  if (funcName == "MPI_Gather") {
+  if (funcName == "MPI_Gather" || funcName == "PMPI_Gather") {
     if (Mode == DerivativeMode::ReverseModeGradient ||
         Mode == DerivativeMode::ReverseModeCombined ||
         Mode == DerivativeMode::ForwardMode ||
@@ -1588,6 +1722,8 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
       if (!forwardMode)
         sendtype = lookup(sendtype, Builder2);
 
+      bool fortranABI = isFortranMPICall(called->getName());
+
       Value *root = gutils->getNewFromOriginal(orig_root);
       if (!forwardMode)
         root = lookup(root, Builder2);
@@ -1596,49 +1732,60 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
       if (!forwardMode)
         comm = lookup(comm, Builder2);
 
-      Value *rank = MPI_COMM_RANK(comm, Builder2, root->getType());
-      Value *tysize = MPI_TYPE_SIZE(sendtype, Builder2, call.getType());
+      Type *i32Ty = Type::getInt32Ty(call.getContext());
+      Value *sendcountVal =
+          fortranABI ? Builder2.CreateLoad(i32Ty, sendcount) : sendcount;
+      Value *recvcountVal =
+          fortranABI ? Builder2.CreateLoad(i32Ty, recvcount) : recvcount;
+      Value *rootVal = fortranABI ? Builder2.CreateLoad(i32Ty, root) : root;
+
+      Value *rank = MPI_COMM_RANK(comm, Builder2, rootVal->getType(), called);
+      Value *tysize = MPI_TYPE_SIZE(sendtype, Builder2, call.getType(), called);
 
       if (forwardMode) {
-        Value *args[] = {
+        // Account for extra `ierr` argument in Fortran ABI
+        SmallVector<Value *, 8> args_vec = {
             /*sendbuf*/ shadow_sendbuf,
-            /*sendcount*/ sendcount,
+            /*sendcount*/ gutils->getNewFromOriginal(orig_sendcount),
             /*sendtype*/ sendtype,
             /*recvbuf*/ shadow_recvbuf,
-            /*recvcount*/ recvcount,
+            /*recvcount*/ gutils->getNewFromOriginal(orig_recvcount),
             /*recvtype*/ recvtype,
-            /*root*/ root,
+            /*root*/ gutils->getNewFromOriginal(orig_root),
             /*comm*/ comm,
         };
+        for (size_t i = 8, e = call.arg_size(); i < e; i++)
+          args_vec.push_back(gutils->getNewFromOriginal(call.getArgOperand(i)));
 
-        auto Defs = gutils->getInvertedBundles(
-            &call,
-            {ValueType::Shadow, ValueType::Primal, ValueType::Primal,
-             ValueType::Shadow, ValueType::Primal, ValueType::Primal,
-             ValueType::Primal, ValueType::Primal},
-            Builder2, /*lookup*/ false);
+        std::vector<ValueType> BundleTypes(call.arg_size(), ValueType::Primal);
+        BundleTypes[0] = ValueType::Shadow;
+        BundleTypes[3] = ValueType::Shadow;
+        auto Defs = gutils->getInvertedBundles(&call, BundleTypes, Builder2,
+                                               /*lookup*/ false);
 
         auto callval = call.getCalledOperand();
-        Builder2.CreateCall(call.getFunctionType(), callval, args, Defs);
+        Builder2.CreateCall(call.getFunctionType(), callval, args_vec, Defs);
         return;
       }
 
       // Get the length for the allocation of the intermediate buffer
       auto sendlen_arg = Builder2.CreateZExtOrTrunc(
-          sendcount, Type::getInt64Ty(call.getContext()));
+          sendcountVal, Type::getInt64Ty(call.getContext()));
       sendlen_arg =
           Builder2.CreateMul(sendlen_arg,
                              Builder2.CreateZExtOrTrunc(
                                  tysize, Type::getInt64Ty(call.getContext())),
                              "", true, true);
 
-      // Need to preserve the shadow send/recv buffers.
-      auto BufferDefs = gutils->getInvertedBundles(
-          &call,
-          {ValueType::Shadow, ValueType::Primal, ValueType::Primal,
-           ValueType::Shadow, ValueType::Primal, ValueType::Primal,
-           ValueType::Primal, ValueType::Primal},
-          Builder2, /*lookup*/ true);
+      // Need to preserve the shadow send/recv buffers. The Fortran ABI call
+      // has an extra `ierr` argument, so size the bundle to match the actual
+      // call arity: shadow send/recv buffers, primal everything else.
+      std::vector<ValueType> BufferBundleTypes(call.arg_size(),
+                                               ValueType::Primal);
+      BufferBundleTypes[0] = ValueType::Shadow;
+      BufferBundleTypes[3] = ValueType::Shadow;
+      auto BufferDefs = gutils->getInvertedBundles(&call, BufferBundleTypes,
+                                                   Builder2, /*lookup*/ true);
 
       // 1. Alloc intermediate buffer
       Value *buf =
@@ -1651,24 +1798,30 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
         // sendtype,
         //     void *recvbuf, int recvcount, MPI_Datatype recvtype, int root,
         //     MPI_Comm comm)
-        Value *args[] = {
-            /*sendbuf*/ shadow_recvbuf,
-            /*sendcount*/ recvcount,
-            /*sendtype*/ recvtype,
-            /*recvbuf*/ buf,
-            /*recvcount*/ sendcount,
-            /*recvtype*/ sendtype,
-            /*op*/ root,
-            /*comm*/ comm,
-        };
-        Type *types[sizeof(args) / sizeof(*args)];
-        for (size_t i = 0; i < sizeof(args) / sizeof(*args); i++)
-          types[i] = args[i]->getType();
+        //
+        // The Fortran MPI ABI passes all arguments by reference and appends
+        // an `ierr` argument, so the generated call must match the convention
+        // of the caller.
+        SmallVector<Value *, 10> args;
+        if (fortranABI) {
+          args = {shadow_recvbuf, recvcount, recvtype, buf,
+                  sendcount,      sendtype,  root,     comm};
+          for (size_t i = 8, e = call.arg_size(); i < e; i++)
+            args.push_back(lookup(
+                gutils->getNewFromOriginal(call.getArgOperand(i)), Builder2));
+        } else {
+          args = {shadow_recvbuf, recvcountVal, recvtype, buf,
+                  sendcountVal,   sendtype,     rootVal,  comm};
+        }
+        SmallVector<Type *, 10> types;
+        for (auto *arg : args)
+          types.push_back(arg->getType());
 
         FunctionType *FT = FunctionType::get(call.getType(), types, false);
         Builder2.CreateCall(
-            called->getParent()->getOrInsertFunction("MPI_Scatter", FT), args,
-            BufferDefs);
+            called->getParent()->getOrInsertFunction(
+                getRenamedPerCallingConv(called->getName(), "MPI_Scatter"), FT),
+            args, BufferDefs);
       }
 
       // 3. if root, Zero diff(recvbuffer) [memset to 0]
@@ -1680,12 +1833,12 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
         BasicBlock *mergeBlock = gutils->addReverseBlock(
             rootBlock, currentBlock->getName() + "_post", gutils->newFunc);
 
-        Builder2.CreateCondBr(Builder2.CreateICmpEQ(rank, root), rootBlock,
+        Builder2.CreateCondBr(Builder2.CreateICmpEQ(rank, rootVal), rootBlock,
                               mergeBlock);
 
         Builder2.SetInsertPoint(rootBlock);
         auto recvlen_arg = Builder2.CreateZExtOrTrunc(
-            recvcount, Type::getInt64Ty(call.getContext()));
+            recvcountVal, Type::getInt64Ty(call.getContext()));
         recvlen_arg =
             Builder2.CreateMul(recvlen_arg,
                                Builder2.CreateZExtOrTrunc(
@@ -1694,7 +1847,7 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
         recvlen_arg = Builder2.CreateMul(
             recvlen_arg,
             Builder2.CreateZExtOrTrunc(
-                MPI_COMM_SIZE(comm, Builder2, root->getType()),
+                MPI_COMM_SIZE(comm, Builder2, rootVal->getType(), called),
                 Type::getInt64Ty(call.getContext())),
             "", true, true);
 
@@ -1737,7 +1890,7 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
   // sendtype,
   //           void *recvbuf, int recvcount, MPI_Datatype recvtype, int root,
   //           MPI_Comm comm)
-  if (funcName == "MPI_Scatter") {
+  if (canonMPIName == "MPI_Scatter") {
     if (Mode == DerivativeMode::ReverseModeGradient ||
         Mode == DerivativeMode::ReverseModeCombined ||
         Mode == DerivativeMode::ForwardMode ||
@@ -1801,48 +1954,61 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
       if (!forwardMode)
         comm = lookup(comm, Builder2);
 
-      Value *rank = MPI_COMM_RANK(comm, Builder2, root->getType());
-      Value *tysize = MPI_TYPE_SIZE(sendtype, Builder2, call.getType());
+      bool fortranABI = isFortranMPICall(called->getName());
+
+      Type *i32Ty = Type::getInt32Ty(call.getContext());
+      Value *sendcountVal =
+          fortranABI ? Builder2.CreateLoad(i32Ty, sendcount) : sendcount;
+      Value *recvcountVal =
+          fortranABI ? Builder2.CreateLoad(i32Ty, recvcount) : recvcount;
+      Value *rootVal = fortranABI ? Builder2.CreateLoad(i32Ty, root) : root;
+
+      Value *rank = MPI_COMM_RANK(comm, Builder2, rootVal->getType(), called);
+      Value *tysize = MPI_TYPE_SIZE(sendtype, Builder2, call.getType(), called);
 
       if (forwardMode) {
-        Value *args[] = {
+        // Account for extra `ierr` argument in Fortran ABI
+        SmallVector<Value *, 8> args_vec = {
             /*sendbuf*/ shadow_sendbuf,
-            /*sendcount*/ sendcount,
+            /*sendcount*/ gutils->getNewFromOriginal(orig_sendcount),
             /*sendtype*/ sendtype,
             /*recvbuf*/ shadow_recvbuf,
-            /*recvcount*/ recvcount,
+            /*recvcount*/ gutils->getNewFromOriginal(orig_recvcount),
             /*recvtype*/ recvtype,
-            /*root*/ root,
+            /*root*/ gutils->getNewFromOriginal(orig_root),
             /*comm*/ comm,
         };
+        for (size_t i = 8, e = call.arg_size(); i < e; i++)
+          args_vec.push_back(gutils->getNewFromOriginal(call.getArgOperand(i)));
 
-        auto Defs = gutils->getInvertedBundles(
-            &call,
-            {ValueType::Shadow, ValueType::Primal, ValueType::Primal,
-             ValueType::Shadow, ValueType::Primal, ValueType::Primal,
-             ValueType::Primal, ValueType::Primal},
-            Builder2, /*lookup*/ false);
+        std::vector<ValueType> BundleTypes(call.arg_size(), ValueType::Primal);
+        BundleTypes[0] = ValueType::Shadow;
+        BundleTypes[3] = ValueType::Shadow;
+        auto Defs = gutils->getInvertedBundles(&call, BundleTypes, Builder2,
+                                               /*lookup*/ false);
 
         auto callval = call.getCalledOperand();
-        Builder2.CreateCall(call.getFunctionType(), callval, args, Defs);
+        Builder2.CreateCall(call.getFunctionType(), callval, args_vec, Defs);
         return;
       }
       // Get the length for the allocation of the intermediate buffer
       auto recvlen_arg = Builder2.CreateZExtOrTrunc(
-          recvcount, Type::getInt64Ty(call.getContext()));
+          recvcountVal, Type::getInt64Ty(call.getContext()));
       recvlen_arg =
           Builder2.CreateMul(recvlen_arg,
                              Builder2.CreateZExtOrTrunc(
                                  tysize, Type::getInt64Ty(call.getContext())),
                              "", true, true);
 
-      // Need to preserve the shadow send/recv buffers.
-      auto BufferDefs = gutils->getInvertedBundles(
-          &call,
-          {ValueType::Shadow, ValueType::Primal, ValueType::Primal,
-           ValueType::Shadow, ValueType::Primal, ValueType::Primal,
-           ValueType::Primal, ValueType::Primal},
-          Builder2, /*lookup*/ true);
+      // Need to preserve the shadow send/recv buffers. The Fortran ABI call
+      // has an extra `ierr` argument, so size the bundle to match the actual
+      // call arity: shadow send/recv buffers, primal everything else.
+      std::vector<ValueType> BufferBundleTypes(call.arg_size(),
+                                               ValueType::Primal);
+      BufferBundleTypes[0] = ValueType::Shadow;
+      BufferBundleTypes[3] = ValueType::Shadow;
+      auto BufferDefs = gutils->getInvertedBundles(&call, BufferBundleTypes,
+                                                   Builder2, /*lookup*/ true);
 
       // 1. if root, malloc intermediate buffer, else undef
       PHINode *buf;
@@ -1855,13 +2021,13 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
         BasicBlock *mergeBlock = gutils->addReverseBlock(
             rootBlock, currentBlock->getName() + "_post", gutils->newFunc);
 
-        Builder2.CreateCondBr(Builder2.CreateICmpEQ(rank, root), rootBlock,
+        Builder2.CreateCondBr(Builder2.CreateICmpEQ(rank, rootVal), rootBlock,
                               mergeBlock);
 
         Builder2.SetInsertPoint(rootBlock);
 
         auto sendlen_arg = Builder2.CreateZExtOrTrunc(
-            sendcount, Type::getInt64Ty(call.getContext()));
+            sendcountVal, Type::getInt64Ty(call.getContext()));
         sendlen_arg =
             Builder2.CreateMul(sendlen_arg,
                                Builder2.CreateZExtOrTrunc(
@@ -1870,7 +2036,7 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
         sendlen_arg = Builder2.CreateMul(
             sendlen_arg,
             Builder2.CreateZExtOrTrunc(
-                MPI_COMM_SIZE(comm, Builder2, root->getType()),
+                MPI_COMM_SIZE(comm, Builder2, rootVal->getType(), called),
                 Type::getInt64Ty(call.getContext())),
             "", true, true);
 
@@ -1898,24 +2064,30 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
         // sendtype,
         //     void *recvbuf, int recvcount, MPI_Datatype recvtype,
         //     int root, MPI_Comm comm)
-        Value *args[] = {
-            /*sendbuf*/ shadow_recvbuf,
-            /*sendcount*/ recvcount,
-            /*sendtype*/ recvtype,
-            /*recvbuf*/ buf,
-            /*recvcount*/ sendcount,
-            /*recvtype*/ sendtype,
-            /*root*/ root,
-            /*comm*/ comm,
-        };
-        Type *types[sizeof(args) / sizeof(*args)];
-        for (size_t i = 0; i < sizeof(args) / sizeof(*args); i++)
-          types[i] = args[i]->getType();
+        //
+        // The Fortran MPI ABI passes all arguments by reference and appends
+        // an `ierr` argument, so the generated call must match the convention
+        // of the caller.
+        SmallVector<Value *, 10> args;
+        if (fortranABI) {
+          args = {shadow_recvbuf, recvcount, recvtype, buf,
+                  sendcount,      sendtype,  root,     comm};
+          for (size_t i = 8, e = call.arg_size(); i < e; i++)
+            args.push_back(lookup(
+                gutils->getNewFromOriginal(call.getArgOperand(i)), Builder2));
+        } else {
+          args = {shadow_recvbuf, recvcountVal, recvtype, buf,
+                  sendcountVal,   sendtype,     rootVal,  comm};
+        }
+        SmallVector<Type *, 10> types;
+        for (auto *arg : args)
+          types.push_back(arg->getType());
 
         FunctionType *FT = FunctionType::get(call.getType(), types, false);
         Builder2.CreateCall(
-            called->getParent()->getOrInsertFunction("MPI_Gather", FT), args,
-            BufferDefs);
+            called->getParent()->getOrInsertFunction(
+                getRenamedPerCallingConv(called->getName(), "MPI_Gather"), FT),
+            args, BufferDefs);
       }
 
       // 3. Zero diff(recvbuffer) [memset to 0]
@@ -1941,7 +2113,7 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
         BasicBlock *mergeBlock = gutils->addReverseBlock(
             rootBlock, currentBlock->getName() + "_post", gutils->newFunc);
 
-        Builder2.CreateCondBr(Builder2.CreateICmpEQ(rank, root), rootBlock,
+        Builder2.CreateCondBr(Builder2.CreateICmpEQ(rank, rootVal), rootBlock,
                               mergeBlock);
 
         Builder2.SetInsertPoint(rootBlock);
@@ -1977,7 +2149,7 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
   //           void *recvbuf, int recvcount, MPI_Datatype recvtype,
   //           MPI_Comm comm)
 
-  if (funcName == "MPI_Allgather") {
+  if (funcName == "MPI_Allgather" || funcName == "PMPI_Allgather") {
     if (Mode == DerivativeMode::ReverseModeGradient ||
         Mode == DerivativeMode::ReverseModeCombined ||
         Mode == DerivativeMode::ForwardMode ||
@@ -2038,7 +2210,7 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
       if (!forwardMode)
         comm = lookup(comm, Builder2);
 
-      Value *tysize = MPI_TYPE_SIZE(sendtype, Builder2, call.getType());
+      Value *tysize = MPI_TYPE_SIZE(sendtype, Builder2, call.getType(), called);
 
       if (forwardMode) {
         Value *args[] = {
@@ -2084,9 +2256,10 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
           CreateAllocation(Builder2, Type::getInt8Ty(call.getContext()),
                            sendlen_arg, "mpireduce_malloccache");
 
-      ConcreteType CT = TR.firstPointer(1, orig_sendbuf, &call);
+      ConcreteType CT =
+          TR.firstPointer(1, orig_sendbuf, &call, gutils, &Builder2);
       auto MPI_OP_type = getInt8PtrTy(call.getContext());
-      Type *MPI_OP_Ptr_type = PointerType::getUnqual(MPI_OP_type);
+      Type *MPI_OP_Ptr_type = getUnqual(MPI_OP_type);
 
       // 2. reduce diff(recvbuffer) then scatter to corresponding input node's
       // intermediate buffer
@@ -2103,7 +2276,7 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
             /*recvcount*/ sendcount,
             /*recvtype*/ sendtype,
             /*op (MPI_SUM)*/
-            getOrInsertOpFloatSum(*gutils->newFunc->getParent(),
+            getOrInsertOpFloatSum(*gutils->newFunc->getParent(), called,
                                   MPI_OP_Ptr_type, MPI_OP_type, CT,
                                   call.getType(), Builder2),
             /*comm*/ comm,
@@ -2113,9 +2286,12 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
           types[i] = args[i]->getType();
 
         FunctionType *FT = FunctionType::get(call.getType(), types, false);
-        Builder2.CreateCall(called->getParent()->getOrInsertFunction(
-                                "MPI_Reduce_scatter_block", FT),
-                            args, BufferDefs);
+        Builder2.CreateCall(
+            called->getParent()->getOrInsertFunction(
+                getRenamedPerCallingConv(called->getName(),
+                                         "MPI_Reduce_scatter_block"),
+                FT),
+            args, BufferDefs);
       }
 
       // 3. zero diff(recvbuffer) [memset to 0]
@@ -2130,7 +2306,7 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
         recvlen_arg = Builder2.CreateMul(
             recvlen_arg,
             Builder2.CreateZExtOrTrunc(
-                MPI_COMM_SIZE(comm, Builder2, call.getType()),
+                MPI_COMM_SIZE(comm, Builder2, call.getType(), called),
                 Type::getInt64Ty(call.getContext())),
             "", true, true);
         auto val_arg = ConstantInt::get(Type::getInt8Ty(call.getContext()), 0);
@@ -2160,14 +2336,18 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
 
   // Adjoint of barrier is to place a barrier at the corresponding
   // location in the reverse.
-  if (funcName == "MPI_Barrier") {
+  if (funcName == "MPI_Barrier" || funcName == "PMPI_Barrier") {
     if (Mode == DerivativeMode::ReverseModeGradient ||
         Mode == DerivativeMode::ReverseModeCombined) {
       IRBuilder<> Builder2(&call);
       getReverseBuilder(Builder2);
       auto callval = call.getCalledOperand();
-      Value *args[] = {
-          lookup(gutils->getNewFromOriginal(call.getOperand(0)), Builder2)};
+      // Copy all arguments to match the call's arity: Fortran ABI manglings
+      // of MPI_Barrier (e.g. "mpi_barrier_") take an extra `ierr` argument.
+      SmallVector<Value *, 4> args;
+      for (unsigned i = 0; i < call.arg_size(); i++)
+        args.push_back(lookup(gutils->getNewFromOriginal(call.getArgOperand(i)),
+                              Builder2));
       Builder2.CreateCall(call.getFunctionType(), callval, args);
     }
     if (Mode == DerivativeMode::ReverseModeGradient)
@@ -2197,7 +2377,46 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
 
       FunctionType *FT = FunctionType::get(call.getType(), types, false);
       Builder2.CreateCall(
-          called->getParent()->getOrInsertFunction("MPI_Comm_free", FT), args);
+          called->getParent()->getOrInsertFunction(
+              getRenamedPerCallingConv(called->getName(), "MPI_Comm_free"), FT),
+          args);
+    }
+    if (Mode == DerivativeMode::ReverseModeGradient)
+      eraseIfUnused(call, /*erase*/ true, /*check*/ false);
+    return;
+  }
+
+  // MPI_Init / MPI_Finalize don't participate in the computation being
+  // differentiated - just duplicate them as-is in both passes.
+  if (funcName == "MPI_Init" || funcName == "PMPI_Init" ||
+      funcName == "MPI_Init_thread" || funcName == "PMPI_Init_thread" ||
+      funcName == "MPI_Finalize" || funcName == "PMPI_Finalize" ||
+      funcName == "MPI_Test" || funcName == "PMPI_Test" ||
+      funcName == "MPI_Probe" || funcName == "PMPI_Probe") {
+    if (Mode == DerivativeMode::ReverseModeGradient ||
+        Mode == DerivativeMode::ReverseModeCombined ||
+        Mode == DerivativeMode::ReverseModePrimal) {
+      IRBuilder<> Builder2(&call);
+      getReverseBuilder(Builder2);
+      SmallVector<Value *, 8> args;
+      for (unsigned i = 0; i < call.arg_size(); ++i) {
+        args.push_back(lookup(gutils->getNewFromOriginal(call.getArgOperand(i)),
+                              Builder2));
+      }
+      Builder2.CreateCall(call.getFunctionType(), call.getCalledOperand(),
+                          args);
+    }
+    if (Mode == DerivativeMode::ForwardMode ||
+        Mode == DerivativeMode::ForwardModeError ||
+        Mode == DerivativeMode::ForwardModeSplit) {
+      IRBuilder<> Builder2(&call);
+      getForwardBuilder(Builder2);
+      SmallVector<Value *, 8> args;
+      for (unsigned i = 0; i < call.arg_size(); ++i) {
+        args.push_back(gutils->getNewFromOriginal(call.getArgOperand(i)));
+      }
+      Builder2.CreateCall(call.getFunctionType(), call.getCalledOperand(),
+                          args);
     }
     if (Mode == DerivativeMode::ReverseModeGradient)
       eraseIfUnused(call, /*erase*/ true, /*check*/ false);
@@ -2211,6 +2430,66 @@ void AdjointGenerator::handleMPI(llvm::CallInst &call, llvm::Function *called,
   llvm_unreachable("Unhandled MPI FUNCTION");
 }
 
+// Classify the op callee of a julia.atomicmodify pseudo-intrinsic call
+// (op has signature elty (elty oldval, args...), with elty an integer type
+// holding the bits of the modified value) as an atomicrmw-style operation
+// whose derivative Enzyme knows. On success sets opArgNo to the index of the
+// op parameter providing the update value and FT to the floating point type
+// the update is performed in (nullptr for Xchg).
+static llvm::AtomicRMWInst::BinOp
+classifyAtomicModifyOp(llvm::Function *op, unsigned &opArgNo, llvm::Type *&FT) {
+  using namespace llvm;
+  FT = nullptr;
+  if (!op || op->empty() || op->isVarArg() ||
+      op->getFunctionType()->getNumParams() == 0)
+    return AtomicRMWInst::BAD_BINOP;
+  ReturnInst *Ret = nullptr;
+  for (auto &BB : *op)
+    if (auto R = dyn_cast<ReturnInst>(BB.getTerminator())) {
+      if (Ret)
+        return AtomicRMWInst::BAD_BINOP;
+      Ret = R;
+    }
+  if (!Ret || !Ret->getReturnValue())
+    return AtomicRMWInst::BAD_BINOP;
+  auto peel = [](Value *V) {
+    while (auto BC = dyn_cast<BitCastInst>(V))
+      V = BC->getOperand(0);
+    return V;
+  };
+  Value *RV = peel(Ret->getReturnValue());
+  Value *Old = op->getArg(0);
+  if (auto A = dyn_cast<Argument>(RV)) {
+    if (A == Old)
+      return AtomicRMWInst::BAD_BINOP;
+    opArgNo = A->getArgNo();
+    return AtomicRMWInst::Xchg;
+  }
+  if (auto BO = dyn_cast<BinaryOperator>(RV)) {
+    Value *L = peel(BO->getOperand(0));
+    Value *R = peel(BO->getOperand(1));
+    FT = BO->getType();
+    if (!FT->isFPOrFPVectorTy())
+      return AtomicRMWInst::BAD_BINOP;
+    if (BO->getOpcode() == Instruction::FAdd) {
+      if (L == Old && isa<Argument>(R) && R != Old) {
+        opArgNo = cast<Argument>(R)->getArgNo();
+        return AtomicRMWInst::FAdd;
+      }
+      if (R == Old && isa<Argument>(L) && L != Old) {
+        opArgNo = cast<Argument>(L)->getArgNo();
+        return AtomicRMWInst::FAdd;
+      }
+    } else if (BO->getOpcode() == Instruction::FSub) {
+      if (L == Old && isa<Argument>(R) && R != Old) {
+        opArgNo = cast<Argument>(R)->getArgNo();
+        return AtomicRMWInst::FSub;
+      }
+    }
+  }
+  return AtomicRMWInst::BAD_BINOP;
+}
+
 bool AdjointGenerator::handleKnownCallDerivatives(
     CallInst &call, Function *called, StringRef funcName,
     bool subsequent_calls_may_write, const std::vector<bool> &overwritten_args,
@@ -2222,6 +2501,276 @@ bool AdjointGenerator::handleKnownCallDerivatives(
 
   IRBuilder<> BuilderZ(newCall);
   BuilderZ.setFastMathFlags(getFast());
+
+  // Julia's atomic modify pseudo-intrinsic (introduced in Julia 1.13):
+  //   {old, new} = julia.atomicmodify.iN.pAS(ptr, op, ordering, syncscope,
+  //                                          args...)
+  // which atomically performs old = *ptr; new = op(old, args...);
+  // *ptr = new, where op's parameter i (i >= 1) is forwarded from call
+  // operand i + 3. The pseudo-intrinsic must be kept intact (including in
+  // generated derivative code); it is only expanded to atomicrmw/cmpxchg by
+  // Julia's ExpandAtomicModify pass after GC lowering.
+  if (startsWith(funcName, "julia.atomicmodify.")) {
+    // Retire the primal call replayed in the pass being generated. Like the
+    // generic call path, tape its result in the augmented primal and read it
+    // back from the tape in the derivative pass if the latter needs the
+    // primal value: the modification must never be repeated by recomputing
+    // the call there.
+    auto finishPrimal = [&]() {
+      bool primalNeededInReverse = false;
+      {
+        auto found = gutils->knownRecomputeHeuristic.find(&call);
+        if (found != gutils->knownRecomputeHeuristic.end())
+          primalNeededInReverse = !found->second;
+      }
+      if (!primalNeededInReverse &&
+          Mode != DerivativeMode::ReverseModeCombined &&
+          Mode != DerivativeMode::ForwardMode &&
+          Mode != DerivativeMode::ForwardModeError && subretused &&
+          !gutils->unnecessaryIntermediates.count(&call)) {
+        std::map<UsageKey, bool> Seen =
+            gutils->populateSeenFromKnownRecompute();
+        auto minCutMode = (Mode == DerivativeMode::ReverseModePrimal)
+                              ? DerivativeMode::ReverseModeGradient
+                              : Mode;
+        primalNeededInReverse =
+            DifferentialUseAnalysis::is_value_needed_in_reverse<
+                QueryType::Primal>(gutils, &call, minCutMode, Seen,
+                                   oldUnreachable);
+      }
+      if (primalNeededInReverse) {
+        gutils->cacheForReverse(BuilderZ, newCall,
+                                getIndex(&call, CacheType::Self, BuilderZ));
+        eraseIfUnused(call);
+      } else if (Mode == DerivativeMode::ReverseModeGradient ||
+                 Mode == DerivativeMode::ForwardModeSplit) {
+        eraseIfUnused(call, /*erase*/ true, /*check*/ false);
+      } else {
+        eraseIfUnused(call);
+      }
+    };
+
+    // The pseudo-intrinsic called with the operands of the primal call,
+    // except for the location and (if non-null) the operand at valIdx.
+    auto emitCall = [&](Value *ptr, unsigned valIdx, Value *val) -> Value * {
+      SmallVector<Value *, 6> args;
+      for (size_t i = 0; i < call.arg_size(); i++) {
+        if (i == 0)
+          args.push_back(ptr);
+        else if (i == valIdx && val)
+          args.push_back(val);
+        else
+          args.push_back(gutils->getNewFromOriginal(call.getArgOperand(i)));
+      }
+      auto CI = BuilderZ.CreateCall(call.getFunctionType(), called, args);
+      CI->setCallingConv(call.getCallingConv());
+      CI->setAttributes(call.getAttributes());
+      CI->copyMetadata(*newCall);
+      return CI;
+    };
+
+    // Fully inactive calls only need the primal replayed. This must be
+    // handled here rather than falling through to the generic call path,
+    // as the latter may decide against the constant fallback (e.g. for a
+    // nocapture, non-readonly pointer argument) and then reject the
+    // variadic call with `Number of arg operands != function parameters`.
+    if (gutils->isConstantInstruction(&call) &&
+        gutils->isConstantValue(&call)) {
+      finishPrimal();
+      return true;
+    }
+
+    Type *elty = cast<StructType>(call.getType())->getElementType(0);
+    unsigned opArgNo = 0;
+    Type *FT = nullptr;
+    auto opKind = classifyAtomicModifyOp(
+        dyn_cast<Function>(call.getArgOperand(1)), opArgNo, FT);
+    if (opKind != AtomicRMWInst::BAD_BINOP &&
+        call.arg_size() - 3 != cast<Function>(call.getArgOperand(1))
+                                   ->getFunctionType()
+                                   ->getNumParams())
+      opKind = AtomicRMWInst::BAD_BINOP;
+    // Call operand forwarded to op's update value parameter.
+    unsigned valIdx = opArgNo + 3;
+    Value *valOp = opKind != AtomicRMWInst::BAD_BINOP
+                       ? call.getArgOperand(valIdx)
+                       : nullptr;
+
+    bool constval = gutils->isConstantValue(&call);
+    bool constptr = gutils->isConstantValue(call.getArgOperand(0));
+
+    // No shadow memory is involved; replaying the primal suffices.
+    if (constval && constptr) {
+      finishPrimal();
+      return true;
+    }
+
+    auto &DL = gutils->newFunc->getParent()->getDataLayout();
+    auto storeSize = (DL.getTypeSizeInBits(elty) + 7) / 8;
+    auto vd = TR.firstPointer(storeSize, call.getArgOperand(0), &call, gutils,
+                              /*errifnotfound*/ nullptr,
+                              /*pointerIntSame*/ true);
+
+    bool constargs = true;
+    for (size_t i = 4; i < call.arg_size(); i++)
+      if (!gutils->isConstantValue(call.getArgOperand(i))) {
+        constargs = false;
+        break;
+      }
+
+    // Non-differentiable (integer/pointer) data modified within duplicated
+    // memory: replicate the modification on the shadow location with the
+    // primal arguments (like inactive stores into active memory), keeping
+    // e.g. lock states and counters of shadow objects consistent. As for an
+    // inactive store, only the modified data has to be inactive, not the
+    // operands op derives it from; when the type of the data is unknown, an
+    // active operand however suggests floating point data, which is left
+    // to the rules for recognized ops below.
+    if (constval &&
+        (vd.isKnown() ? !vd.isFloat() : (looseTypeAnalysis && constargs))) {
+      // Which pass emits the shadow modification is decided exactly as for
+      // an inactive store into duplicated memory (visitCommonStore); in
+      // particular the augmented primal and the split derivative pass must
+      // not both replay it, and a shadow that is only materialized in the
+      // reverse pass must be updated there.
+      bool forwardsShadow, backwardsShadow;
+      shadowStoreSchedule(call, call.getArgOperand(0), forwardsShadow,
+                          backwardsShadow);
+
+      if ((Mode == DerivativeMode::ReverseModePrimal && forwardsShadow) ||
+          (Mode == DerivativeMode::ReverseModeGradient && backwardsShadow) ||
+          (Mode == DerivativeMode::ForwardModeSplit && backwardsShadow) ||
+          (Mode == DerivativeMode::ReverseModeCombined &&
+           (forwardsShadow || backwardsShadow)) ||
+          Mode == DerivativeMode::ForwardMode ||
+          Mode == DerivativeMode::ForwardModeError) {
+        Value *dptr = gutils->invertPointerM(call.getArgOperand(0), BuilderZ);
+        applyChainRule(
+            BuilderZ, [&](Value *dptr) { emitCall(dptr, 0, nullptr); }, dptr);
+      }
+      finishPrimal();
+      return true;
+    }
+
+    if (Mode == DerivativeMode::ForwardMode ||
+        Mode == DerivativeMode::ForwardModeError ||
+        Mode == DerivativeMode::ForwardModeSplit) {
+      if (opKind != AtomicRMWInst::BAD_BINOP) {
+        // new = op(old, v) is linear in (old, v) for FAdd/FSub/Xchg, so the
+        // same op applied to the shadow location and the shadow of v
+        // computes the tangent {dold, dnew}.
+        //
+        // The shadow of v is its tangent (zero if inactive), except for an
+        // inactive value exchanged into duplicated memory: like an inactive
+        // store, that writes the primal value for pointer/integer data (and
+        // zero for floating point data) into the shadow location.
+        Value *dval = nullptr;
+        if (!gutils->isConstantValue(valOp)) {
+          dval = gutils->invertPointerM(valOp, BuilderZ);
+        } else if (opKind == AtomicRMWInst::Xchg && !constptr) {
+          if (!gutils->runtimeActivity && vd == BaseType::Pointer &&
+              !isa<UndefValue>(valOp) && !isa<ConstantPointerNull>(valOp)) {
+            std::string str;
+            raw_string_ostream ss(str);
+            ss << "Mismatched activity for: " << call
+               << " const val: " << *valOp;
+            if (CustomErrorHandler) {
+              dval = unwrap(CustomErrorHandler(
+                  str.c_str(), wrap(&call), ErrorType::MixedActivityError,
+                  gutils, wrap(valOp), wrap(&BuilderZ)));
+            } else
+              EmitWarningAlways("MixedActivityError", call, ss.str(),
+                                MixedActivityHint);
+          }
+          if (!dval)
+            dval = gutils->invertPointerM(valOp, BuilderZ,
+                                          TypeTree(vd).Only(-1, nullptr));
+        }
+        if (!dval)
+          dval =
+              Constant::getNullValue(gutils->getShadowType(valOp->getType()));
+
+        auto rule = [&](Value *dptr, Value *dval) -> Value * {
+          if (!dptr) {
+            // Inactive location: dold = 0 and dnew = dv (-dv for FSub), in
+            // the bits of the modified value.
+            Value *dnew = dval;
+            if (opKind == AtomicRMWInst::FSub) {
+              dnew = BuilderZ.CreateBitCast(dnew, FT);
+              dnew = BuilderZ.CreateFNeg(dnew);
+            }
+            dnew = BuilderZ.CreateBitCast(dnew, elty);
+            return BuilderZ.CreateInsertValue(
+                Constant::getNullValue(call.getType()), dnew, {1});
+          }
+          return emitCall(dptr, valIdx, dval);
+        };
+        Value *diff = applyChainRule(
+            call.getType(), BuilderZ, rule,
+            constptr ? nullptr
+                     : gutils->invertPointerM(call.getArgOperand(0), BuilderZ),
+            dval);
+        if (!constval)
+          setDiffe(&call, diff, BuilderZ);
+        finishPrimal();
+        return true;
+      }
+    } else if (Mode == DerivativeMode::ReverseModePrimal) {
+      // Nothing to do in the primal pass beyond replaying the call. Besides
+      // the inactive case this also covers the augmented primal paired with
+      // a ForwardModeSplit derivative, which handles any recognized op.
+      if (constval || opKind != AtomicRMWInst::BAD_BINOP) {
+        if (!constval)
+          resolveShadowPlaceholder(call);
+        finishPrimal();
+        return true;
+      }
+    } else if ((Mode == DerivativeMode::ReverseModeCombined ||
+                Mode == DerivativeMode::ReverseModeGradient) &&
+               constval &&
+               (opKind == AtomicRMWInst::FAdd ||
+                opKind == AtomicRMWInst::FSub)) {
+      if (!gutils->isConstantValue(valOp) && !constptr) {
+        auto order = static_cast<AtomicOrdering>(
+            cast<ConstantInt>(call.getArgOperand(2))->getZExtValue());
+        auto ssid = static_cast<SyncScope::ID>(
+            cast<ConstantInt>(call.getArgOperand(3))->getZExtValue());
+        auto align = call.getParamAlign(0).value_or(DL.getABITypeAlign(elty));
+        addAtomicRMWValueAdjoint(call, call.getArgOperand(0), valOp, elty, FT,
+                                 /*negate*/ opKind == AtomicRMWInst::FSub,
+                                 align, order, ssid, /*isVolatile*/ false);
+      }
+      finishPrimal();
+      return true;
+    }
+
+    // Remaining cases (active result in reverse mode, or an op that is not
+    // a recognized linear modification) are not supported.
+    std::string s;
+    llvm::raw_string_ostream ss(s);
+    ss << *gutils->oldFunc << "\n" << call << "\n";
+    ss << " Active atomic modify not yet handled";
+    Value *rval = EmitNoDerivativeError(ss.str(), call, gutils, BuilderZ);
+    if (!constval) {
+      if (Mode == DerivativeMode::ForwardMode ||
+          Mode == DerivativeMode::ForwardModeError ||
+          Mode == DerivativeMode::ForwardModeSplit) {
+        if (!rval)
+          rval = Constant::getNullValue(gutils->getShadowType(call.getType()));
+        setDiffe(&call, rval, BuilderZ);
+      } else {
+        resolveShadowPlaceholder(call, rval);
+      }
+    }
+    if (!call.getType()->isVoidTy()) {
+      for (auto &U :
+           make_early_inc_range(gutils->getNewFromOriginal(&call)->uses())) {
+        U.set(UndefValue::get(call.getType()));
+      }
+    }
+    eraseIfUnused(call, /*erase*/ true, /*check*/ false);
+    return true;
+  }
 
   if (Mode != DerivativeMode::ReverseModePrimal && called) {
     if (funcName == "__kmpc_for_static_init_4" ||
@@ -2241,12 +2790,20 @@ bool AdjointGenerator::handleKnownCallDerivatives(
     }
   }
 
-  if ((startsWith(funcName, "MPI_") || startsWith(funcName, "PMPI_")) &&
-      (!gutils->isConstantInstruction(&call) || funcName == "MPI_Barrier" ||
-       funcName == "MPI_Comm_free" || funcName == "MPI_Comm_disconnect" ||
-       MPIInactiveCommAllocators.find(funcName) !=
+  // Canonicalize MPI routine names across calling conventions: the C
+  // convention ("MPI_Recv", "PMPI_Recv") as well as Fortran ABI manglings
+  // ("mpi_recv_", "mpi_comm_rank__", ...) all map to the canonical C name
+  // (without profiling prefix) used throughout handleMPI.
+  llvm::StringRef canonMPIName = canonicalizeMPIName(funcName);
+  if (!canonMPIName.empty() &&
+      (!gutils->isConstantInstruction(&call) || canonMPIName == "MPI_Barrier" ||
+       canonMPIName == "MPI_Comm_free" ||
+       canonMPIName == "MPI_Comm_disconnect" || canonMPIName == "MPI_Init" ||
+       canonMPIName == "MPI_Init_thread" || canonMPIName == "MPI_Finalize" ||
+       canonMPIName == "MPI_Test" || canonMPIName == "MPI_Probe" ||
+       MPIInactiveCommAllocators.find(canonMPIName) !=
            MPIInactiveCommAllocators.end())) {
-    handleMPI(call, called, funcName);
+    handleMPI(call, called, canonMPIName);
     return true;
   }
 
@@ -2366,6 +2923,15 @@ bool AdjointGenerator::handleKnownCallDerivatives(
 
         IRBuilder<> Builder2(&call);
         getReverseBuilder(Builder2);
+
+        if (!hasSingleGCPreserveEnd(begin_call, gutils)) {
+          std::string s;
+          llvm::raw_string_ostream ss(s);
+          ss << "cannot reverse gc preserve region with several ends: "
+             << *begin_call << "\n";
+          EmitNoDerivativeError(ss.str(), call, gutils, Builder2);
+          return true;
+        }
         SmallVector<Value *, 1> args;
         for (auto &arg : begin_call->args()) {
           bool primalUsed = false;
@@ -2438,6 +3004,11 @@ bool AdjointGenerator::handleKnownCallDerivatives(
         auto ifound = gutils->invertedPointers.find(&call);
         assert(ifound != gutils->invertedPointers.end());
         auto placeholder = cast<CallInst>(&*ifound->second);
+        if (!hasSingleGCPreserveEnd(&call, gutils)) {
+          gutils->invertedPointers.erase(ifound);
+          gutils->erase(placeholder);
+          return true;
+        }
         Builder2.CreateCall(
             called->getParent()->getOrInsertFunction(
                 "llvm.julia.gc_preserve_end",
@@ -2480,8 +3051,8 @@ bool AdjointGenerator::handleKnownCallDerivatives(
             call.getOperand(4)->getType(), call.getOperand(4)->getType(),
         };
         FunctionType *FT = FunctionType::get(call.getType(), types, false);
-        auto F = called->getParent()->getOrInsertFunction(
-            "gsl_sf_legendre_deriv_array_e", FT);
+        auto F = getOrInsertPerCallingConv(*called->getParent(), called,
+                                           "gsl_sf_legendre_deriv_array_e", FT);
 
         llvm::Value *args[6] = {
             gutils->lookupM(gutils->getNewFromOriginal(call.getOperand(0)),
@@ -2498,8 +3069,8 @@ bool AdjointGenerator::handleKnownCallDerivatives(
         Type *typesS[] = {args[1]->getType()};
         FunctionType *FTS =
             FunctionType::get(args[1]->getType(), typesS, false);
-        auto FS = called->getParent()->getOrInsertFunction(
-            "gsl_sf_legendre_array_n", FTS);
+        auto FS = getOrInsertPerCallingConv(*called->getParent(), called,
+                                            "gsl_sf_legendre_array_n", FTS);
         Value *alSize = Builder2.CreateCall(FS, args[1]);
         Value *tmp = CreateAllocation(Builder2, types[2], alSize);
         Value *dtmp = CreateAllocation(Builder2, types[2], alSize);
@@ -2542,7 +3113,7 @@ bool AdjointGenerator::handleKnownCallDerivatives(
             types[2],
             Builder2.CreatePointerCast(
                 gutils->invertPointerM(call.getOperand(4), Builder2),
-                PointerType::getUnqual(types[2])),
+                getUnqual(types[2])),
             idxs);
 
         auto l0 = Builder2.CreateLoad(types[2], dtmp_idx);
@@ -2710,12 +3281,19 @@ bool AdjointGenerator::handleKnownCallDerivatives(
       }
 
       if (!shouldCache && !lrc) {
-        std::map<UsageKey, bool> Seen;
-        for (auto pair : gutils->knownRecomputeHeuristic)
-          Seen[UsageKey(pair.first, QueryType::Primal)] = false;
+        std::map<UsageKey, bool> Seen =
+            gutils->populateSeenFromKnownRecompute();
         bool primalNeededInReverse =
             DifferentialUseAnalysis::is_value_needed_in_reverse<
                 QueryType::Primal>(gutils, &call, Mode, Seen, oldUnreachable);
+        {
+          auto found = gutils->knownRecomputeHeuristic.find(&call);
+          if (found != gutils->knownRecomputeHeuristic.end()) {
+            if (!found->second) {
+              primalNeededInReverse = true;
+            }
+          }
+        }
         shouldCache = primalNeededInReverse;
       }
 
@@ -2732,12 +3310,8 @@ bool AdjointGenerator::handleKnownCallDerivatives(
     if (called) {
       if (funcName == "julia.write_barrier" ||
           funcName == "julia.write_barrier_binding") {
-
-        std::map<UsageKey, bool> Seen;
-        for (auto pair : gutils->knownRecomputeHeuristic)
-          if (!pair.second)
-            Seen[UsageKey(pair.first, QueryType::Primal)] = false;
-
+        std::map<UsageKey, bool> Seen =
+            gutils->populateSeenFromKnownRecompute();
         bool backwardsShadow = false;
         bool forwardsShadow = true;
         for (auto pair : gutils->backwardsOnlyShadows) {
@@ -2790,21 +3364,7 @@ bool AdjointGenerator::handleKnownCallDerivatives(
           for (const auto &pair : gutils->rematerializableAllocations) {
             if (!pair.second.stores.count(&call))
               continue;
-            bool primalNeededInReverse =
-                Mode == DerivativeMode::ForwardMode ||
-                        Mode == DerivativeMode::ForwardModeError
-                    ? false
-                    : DifferentialUseAnalysis::is_value_needed_in_reverse<
-                          QueryType::Primal>(gutils, pair.first, Mode, Seen,
-                                             oldUnreachable);
-
-            bool cacheWholeAllocation =
-                gutils->needsCacheWholeAllocation(pair.first);
-            if (cacheWholeAllocation) {
-              primalNeededInReverse = true;
-            }
-
-            if (primalNeededInReverse && !cacheWholeAllocation)
+            if (gutils->allocationsToBeRematerialized.count(pair.first))
               // However, if we are rematerailizing the allocation and not
               // inside the loop level rematerialization, we do still need the
               // reverse passes ``fake primal'' store and therefore write
@@ -3131,19 +3691,37 @@ bool AdjointGenerator::handleKnownCallDerivatives(
                   llvm_unreachable("Unknown allocation to upgrade");
 
                 Type *elTy = Type::getInt8Ty(call.getContext());
+                if (MD->getNumOperands() == 2) {
+                  elTy = (Type *)cast<ConstantInt>(
+                             cast<ConstantAsMetadata>(MD->getOperand(1))
+                                 ->getValue())
+                             ->getLimitedValue();
+                  Value *tsize = ConstantInt::get(
+                      Size->getType(), (gutils->newFunc->getParent()
+                                            ->getDataLayout()
+                                            .getTypeAllocSizeInBits(elTy) +
+                                        7) /
+                                           8);
+
+                  Size = bb.CreateUDiv(Size, tsize, "", /*exact*/ true);
+                }
                 std::string name = "";
 #if LLVM_VERSION_MAJOR < 17
                 if (call.getContext().supportsTypedPointers()) {
                   for (auto U : call.users()) {
                     if (hasMetadata(cast<Instruction>(U), "enzyme_caststack")) {
-                      elTy = U->getType()->getPointerElementType();
-                      Value *tsize = ConstantInt::get(
-                          Size->getType(), (gutils->newFunc->getParent()
-                                                ->getDataLayout()
-                                                .getTypeAllocSizeInBits(elTy) +
-                                            7) /
-                                               8);
-                      Size = bb.CreateUDiv(Size, tsize, "", /*exact*/ true);
+                      if (MD->getNumOperands() == 1) {
+                        elTy = U->getType()->getPointerElementType();
+                        Value *tsize = ConstantInt::get(
+                            Size->getType(),
+                            (gutils->newFunc->getParent()
+                                 ->getDataLayout()
+                                 .getTypeAllocSizeInBits(elTy) +
+                             7) /
+                                8);
+
+                        Size = bb.CreateUDiv(Size, tsize, "", /*exact*/ true);
+                      }
                       name = (U->getName() + "'ai").str();
                       break;
                     }
@@ -3170,25 +3748,11 @@ bool AdjointGenerator::handleKnownCallDerivatives(
                     if (anti->getType()->getPointerElementType() != elTy)
                       replacement = bb.CreatePointerCast(
                           replacement,
-                          PointerType::getUnqual(
-                              anti->getType()->getPointerElementType()));
+                          getUnqual(anti->getType()->getPointerElementType()));
                   }
 #endif
-                  if (int AS = cast<PointerType>(anti->getType())
-                                   ->getAddressSpace()) {
-                    llvm::PointerType *PT;
-#if LLVM_VERSION_MAJOR < 17
-                    if (call.getContext().supportsTypedPointers()) {
-                      PT = PointerType::get(
-                          anti->getType()->getPointerElementType(), AS);
-#endif
-#if LLVM_VERSION_MAJOR < 17
-                    } else {
-#endif
-                      PT = PointerType::get(anti->getContext(), AS);
-#if LLVM_VERSION_MAJOR < 17
-                    }
-#endif
+                  auto PT = cast<PointerType>(anti->getType());
+                  if (PT->getAddressSpace()) {
                     replacement = bb.CreateAddrSpaceCast(replacement, PT);
                     cast<Instruction>(replacement)
                         ->setMetadata(
@@ -3231,14 +3795,33 @@ bool AdjointGenerator::handleKnownCallDerivatives(
           Value *tofree = lookup(anti, Builder2);
           assert(tofree);
           assert(tofree->getType());
-          auto rule = [&](Value *tofree) {
-            auto CI = freeKnownAllocation(Builder2, tofree, funcName, dbgLoc,
+          for (size_t i = 0; i < gutils->getWidth(); i++) {
+            Value *tofree_i =
+                gutils->getWidth() == 1
+                    ? tofree
+                    : GradientUtils::extractMeta(Builder2, tofree, i);
+
+            auto CI = freeKnownAllocation(Builder2, tofree_i, funcName, dbgLoc,
                                           gutils->TLI, &call, gutils);
-            if (CI)
+            if (CI) {
               CI->addAttributeAtIndex(AttributeList::FirstArgIndex,
                                       Attribute::NonNull);
-          };
-          applyChainRule(Builder2, rule, tofree);
+              bool combined = Mode == DerivativeMode::ReverseModeCombined;
+              auto ident = MDNode::getDistinct(
+                  CI->getContext(),
+                  {ConstantAsMetadata::get(
+                      combined ? ConstantInt::getTrue(CI->getContext())
+                               : ConstantInt::getFalse(CI->getContext()))});
+              Value *anti_i =
+                  gutils->getWidth() == 1
+                      ? anti
+                      : GradientUtils::extractMeta(Builder2, anti, i);
+              cast<Instruction>(anti_i)->setMetadata(
+                  "enzyme_cache_alloc", MDNode::get(CI->getContext(), {ident}));
+              CI->setMetadata("enzyme_cache_free",
+                              MDNode::get(CI->getContext(), {ident}));
+            }
+          }
         }
       } else if (Mode == DerivativeMode::ForwardMode ||
                  Mode == DerivativeMode::ForwardModeError) {
@@ -3301,10 +3884,7 @@ bool AdjointGenerator::handleKnownCallDerivatives(
       return true;
     }
 
-    std::map<UsageKey, bool> Seen;
-    for (auto pair : gutils->knownRecomputeHeuristic)
-      if (!pair.second)
-        Seen[UsageKey(pair.first, QueryType::Primal)] = false;
+    std::map<UsageKey, bool> Seen = gutils->populateSeenFromKnownRecompute();
     bool primalNeededInReverse =
         Mode == DerivativeMode::ForwardMode ||
                 Mode == DerivativeMode::ForwardModeError
@@ -3312,6 +3892,14 @@ bool AdjointGenerator::handleKnownCallDerivatives(
             : DifferentialUseAnalysis::is_value_needed_in_reverse<
                   QueryType::Primal>(gutils, &call, Mode, Seen, oldUnreachable);
 
+    // If we explicitly decided we need this in the reverse pass, mark it as
+    // such.
+    {
+      auto found = gutils->knownRecomputeHeuristic.find(&call);
+      if (found != gutils->knownRecomputeHeuristic.end() && !found->second) {
+        primalNeededInReverse = true;
+      }
+    }
     bool cacheWholeAllocation = gutils->needsCacheWholeAllocation(&call);
     if (cacheWholeAllocation) {
       primalNeededInReverse = true;
@@ -3334,19 +3922,34 @@ bool AdjointGenerator::handleKnownCallDerivatives(
         B.SetInsertPoint(gutils->inversionAllocs);
       }
       Type *elTy = Type::getInt8Ty(call.getContext());
+      if (MD->getNumOperands() == 2) {
+        elTy = (Type *)cast<ConstantInt>(
+                   cast<ConstantAsMetadata>(MD->getOperand(1))->getValue())
+                   ->getLimitedValue();
+        Value *tsize = ConstantInt::get(Size->getType(),
+                                        (gutils->newFunc->getParent()
+                                             ->getDataLayout()
+                                             .getTypeAllocSizeInBits(elTy) +
+                                         7) /
+                                            8);
+        Size = B.CreateUDiv(Size, tsize, "", /*exact*/ true);
+      }
       Instruction *I = nullptr;
 #if LLVM_VERSION_MAJOR < 17
       if (call.getContext().supportsTypedPointers()) {
         for (auto U : call.users()) {
           if (hasMetadata(cast<Instruction>(U), "enzyme_caststack")) {
-            elTy = U->getType()->getPointerElementType();
-            Value *tsize = ConstantInt::get(Size->getType(),
-                                            (gutils->newFunc->getParent()
-                                                 ->getDataLayout()
-                                                 .getTypeAllocSizeInBits(elTy) +
-                                             7) /
-                                                8);
-            Size = B.CreateUDiv(Size, tsize, "", /*exact*/ true);
+            if (MD->getNumOperands() == 1) {
+              elTy = U->getType()->getPointerElementType();
+              Value *tsize = ConstantInt::get(
+                  Size->getType(), (gutils->newFunc->getParent()
+                                        ->getDataLayout()
+                                        .getTypeAllocSizeInBits(elTy) +
+                                    7) /
+                                       8);
+
+              Size = B.CreateUDiv(Size, tsize, "", /*exact*/ true);
+            }
             I = gutils->getNewFromOriginal(cast<Instruction>(U));
             break;
           }
@@ -3355,7 +3958,8 @@ bool AdjointGenerator::handleKnownCallDerivatives(
 #endif
       Value *replacement = B.CreateAlloca(elTy, Size);
       for (auto MD : {"enzyme_active", "enzyme_inactive", "enzyme_type",
-                      "enzymejl_allocart", "enzymejl_allocart_name"})
+                      "enzymejl_allocart", "enzymejl_allocart_name",
+                      "enzymejl_gc_alloc_rt"})
         if (auto M = call.getMetadata(MD))
           cast<AllocaInst>(replacement)->setMetadata(MD, M);
       if (I)
@@ -3374,23 +3978,11 @@ bool AdjointGenerator::handleKnownCallDerivatives(
       if (call.getContext().supportsTypedPointers()) {
         if (call.getType()->getPointerElementType() != elTy)
           replacement = B.CreatePointerCast(
-              replacement,
-              PointerType::getUnqual(call.getType()->getPointerElementType()));
+              replacement, getUnqual(call.getType()->getPointerElementType()));
       }
 #endif
-      if (int AS = cast<PointerType>(call.getType())->getAddressSpace()) {
-        llvm::PointerType *PT;
-#if LLVM_VERSION_MAJOR < 17
-        if (call.getContext().supportsTypedPointers()) {
-          PT = PointerType::get(call.getType()->getPointerElementType(), AS);
-#endif
-#if LLVM_VERSION_MAJOR < 17
-        } else {
-#endif
-          PT = PointerType::get(call.getContext(), AS);
-#if LLVM_VERSION_MAJOR < 17
-        }
-#endif
+      auto PT = cast<PointerType>(call.getType());
+      if (PT->getAddressSpace()) {
         replacement = B.CreateAddrSpaceCast(replacement, PT);
         cast<Instruction>(replacement)
             ->setMetadata("enzyme_backstack",
@@ -3406,7 +3998,7 @@ bool AdjointGenerator::handleKnownCallDerivatives(
       if (found != gutils->rematerializableAllocations.end()) {
         // If rematerializing (e.g. needed in reverse, but not needing
         //  the whole allocation):
-        if (primalNeededInReverse && !cacheWholeAllocation) {
+        if (gutils->allocationsToBeRematerialized.count(&call)) {
           assert(!unnecessaryValues.count(&call));
           // if rematerialize, don't ever cache and downgrade to stack
           // allocation where possible. Note that for allocations which are
@@ -3447,8 +4039,21 @@ bool AdjointGenerator::handleKnownCallDerivatives(
             IRBuilder<> Builder2(&call);
             getReverseBuilder(Builder2);
             auto dbgLoc = gutils->getNewFromOriginal(call.getDebugLoc());
-            freeKnownAllocation(Builder2, lookup(newCall, Builder2), funcName,
-                                dbgLoc, gutils->TLI, &call, gutils);
+            auto freecall = freeKnownAllocation(
+                Builder2, lookup(newCall, Builder2), funcName, dbgLoc,
+                gutils->TLI, &call, gutils);
+            if (freecall) {
+              auto ident = MDNode::getDistinct(
+                  freecall->getContext(),
+                  {ConstantAsMetadata::get(
+                      ConstantInt::getTrue(freecall->getContext()))});
+              newCall->setMetadata(
+                  "enzyme_cache_alloc",
+                  MDNode::get(freecall->getContext(), {ident}));
+              freecall->setMetadata(
+                  "enzyme_cache_free",
+                  MDNode::get(freecall->getContext(), {ident}));
+            }
             if (Mode == DerivativeMode::ReverseModeGradient && AllocationLoop)
               gutils->rematerializedPrimalOrShadowAllocations.push_back(
                   newCall);
@@ -3529,6 +4134,14 @@ bool AdjointGenerator::handleKnownCallDerivatives(
     if ((primalNeededInReverse &&
          !gutils->unnecessaryIntermediates.count(&call)) ||
         hasPDFree) {
+      if (hasPDFree && Mode == DerivativeMode::ReverseModePrimal) {
+        auto ident =
+            MDNode::getDistinct(newCall->getContext(),
+                                {ConstantAsMetadata::get(ConstantInt::getFalse(
+                                    newCall->getContext()))});
+        newCall->setMetadata("enzyme_cache_alloc",
+                             MDNode::get(newCall->getContext(), {ident}));
+      }
       Value *nop = gutils->cacheForReverse(
           BuilderZ, newCall, getIndex(&call, CacheType::Self, BuilderZ));
       if (hasPDFree &&
@@ -3538,8 +4151,22 @@ bool AdjointGenerator::handleKnownCallDerivatives(
         IRBuilder<> Builder2(&call);
         getReverseBuilder(Builder2);
         auto dbgLoc = gutils->getNewFromOriginal(call.getDebugLoc());
-        freeKnownAllocation(Builder2, lookup(nop, Builder2), funcName, dbgLoc,
-                            gutils->TLI, &call, gutils);
+        auto freecall =
+            freeKnownAllocation(Builder2, lookup(nop, Builder2), funcName,
+                                dbgLoc, gutils->TLI, &call, gutils);
+        if (freecall) {
+          bool combined = Mode == DerivativeMode::ReverseModeCombined;
+          auto ident = MDNode::getDistinct(
+              freecall->getContext(),
+              {ConstantAsMetadata::get(
+                  combined ? ConstantInt::getTrue(freecall->getContext())
+                           : ConstantInt::getFalse(freecall->getContext()))});
+          if (combined)
+            newCall->setMetadata("enzyme_cache_alloc",
+                                 MDNode::get(freecall->getContext(), {ident}));
+          freecall->setMetadata("enzyme_cache_free",
+                                MDNode::get(freecall->getContext(), {ident}));
+        }
       }
     } else if (Mode == DerivativeMode::ReverseModeGradient ||
                Mode == DerivativeMode::ReverseModeCombined ||
@@ -3685,8 +4312,24 @@ bool AdjointGenerator::handleKnownCallDerivatives(
     IRBuilder<> BuilderZ(&call);
     getForwardBuilder(BuilderZ);
 
-    bool forceErase = Mode == DerivativeMode::ReverseModeGradient ||
-                      Mode == DerivativeMode::ForwardModeSplit;
+    bool backwardsShadow = false;
+    bool forwardsShadow = true;
+    for (auto pair : gutils->backwardsOnlyShadows) {
+      if (pair.second.stores.count(&call)) {
+        backwardsShadow = true;
+        forwardsShadow = pair.second.primalInitialize;
+        if (auto inst = dyn_cast<Instruction>(pair.first))
+          if (!forwardsShadow && pair.second.LI &&
+              pair.second.LI->contains(inst->getParent()))
+            backwardsShadow = false;
+      }
+    }
+
+    bool forceErase =
+        !((Mode == DerivativeMode::ReverseModePrimal && forwardsShadow) ||
+          (Mode == DerivativeMode::ReverseModeCombined && forwardsShadow) ||
+          (Mode == DerivativeMode::ReverseModeGradient && backwardsShadow) ||
+          (Mode == DerivativeMode::ForwardModeSplit && backwardsShadow));
 
     if (forceErase)
       eraseIfUnused(call, /*erase*/ true, /*check*/ false);
@@ -3741,7 +4384,7 @@ bool AdjointGenerator::handleKnownCallDerivatives(
         Mode == DerivativeMode::ReverseModeCombined) {
       val = gutils->getNewFromOriginal(call.getOperand(0));
       if (!isa<PointerType>(val->getType()))
-        val = BuilderZ.CreateIntToPtr(val, PointerType::getUnqual(PT));
+        val = BuilderZ.CreateIntToPtr(val, getUnqual(PT));
       val = BuilderZ.CreateLoad(PT, val);
       val = gutils->cacheForReverse(BuilderZ, val,
                                     getIndex(&call, CacheType::Tape, BuilderZ));
@@ -3757,8 +4400,9 @@ bool AdjointGenerator::handleKnownCallDerivatives(
       IRBuilder<> Builder2(&call);
       getReverseBuilder(Builder2);
       val = gutils->lookupM(val, Builder2);
-      auto FreeFunc = gutils->newFunc->getParent()->getOrInsertFunction(
-          "cuStreamDestroy", call.getType(), PT);
+      auto FreeFunc = getOrInsertPerCallingConv(
+          *gutils->newFunc->getParent(), called, "cuStreamDestroy",
+          FunctionType::get(call.getType(), {PT}, false));
       Value *nargs[] = {val};
       Builder2.CreateCall(FreeFunc, nargs);
     }
@@ -3836,8 +4480,7 @@ bool AdjointGenerator::handleKnownCallDerivatives(
 
               BuilderZ.CreateCall(called, args, Defs);
               if (!isa<PointerType>(ptrshadow->getType()))
-                ptrshadow = BuilderZ.CreateIntToPtr(ptrshadow,
-                                                    PointerType::getUnqual(PT));
+                ptrshadow = BuilderZ.CreateIntToPtr(ptrshadow, getUnqual(PT));
               Value *val = BuilderZ.CreateLoad(PT, ptrshadow);
 
               auto dst_arg =
@@ -3853,8 +4496,8 @@ bool AdjointGenerator::handleKnownCallDerivatives(
                 BuilderZ.CreateMemSet(dst_arg, val_arg, len_arg, MaybeAlign());
               } else if (funcName == "cudaMalloc") {
                 Type *tys[] = {PT, val_arg->getType(), len_arg->getType()};
-                auto F = M->getOrInsertFunction(
-                    "cudaMemset",
+                auto F = getOrInsertPerCallingConv(
+                    *M, called, "cudaMemset",
                     FunctionType::get(call.getType(), tys, false));
                 Value *nargs[] = {dst_arg, val_arg, len_arg};
                 auto memset = cast<CallInst>(BuilderZ.CreateCall(F, nargs));
@@ -3863,8 +4506,8 @@ bool AdjointGenerator::handleKnownCallDerivatives(
                          funcName == "cudaMallocFromPoolAsync") {
                 Type *tys[] = {PT, val_arg->getType(), len_arg->getType(),
                                stream->getType()};
-                auto F = M->getOrInsertFunction(
-                    "cudaMemsetAsync",
+                auto F = getOrInsertPerCallingConv(
+                    *M, called, "cudaMemsetAsync",
                     FunctionType::get(call.getType(), tys, false));
                 Value *nargs[] = {dst_arg, val_arg, len_arg, stream};
                 auto memset = cast<CallInst>(BuilderZ.CreateCall(F, nargs));
@@ -3872,8 +4515,8 @@ bool AdjointGenerator::handleKnownCallDerivatives(
               } else if (funcName == "cuMemAllocAsync") {
                 Type *tys[] = {PT, val_arg->getType(), len_arg->getType(),
                                stream->getType()};
-                auto F = M->getOrInsertFunction(
-                    "cuMemsetD8Async",
+                auto F = getOrInsertPerCallingConv(
+                    *M, called, "cuMemsetD8Async",
                     FunctionType::get(call.getType(), tys, false));
                 Value *nargs[] = {dst_arg, val_arg, len_arg, stream};
                 auto memset = cast<CallInst>(BuilderZ.CreateCall(F, nargs));
@@ -3881,8 +4524,10 @@ bool AdjointGenerator::handleKnownCallDerivatives(
               } else if (funcName == "cuMemAlloc" ||
                          funcName == "cuMemAlloc_v2") {
                 Type *tys[] = {PT, val_arg->getType(), len_arg->getType()};
-                auto F = M->getOrInsertFunction(
-                    "cuMemsetD8",
+                auto F = getOrInsertPerCallingConv(
+                    *M, called,
+                    funcName == "cuMemAlloc_v2" ? "cuMemsetD8_v2"
+                                                : "cuMemsetD8",
                     FunctionType::get(call.getType(), tys, false));
                 Value *nargs[] = {dst_arg, val_arg, len_arg};
                 auto memset = cast<CallInst>(BuilderZ.CreateCall(F, nargs));
@@ -3928,30 +4573,37 @@ bool AdjointGenerator::handleKnownCallDerivatives(
                       M->getOrInsertFunction("free", VoidTy, IntPtrTy);
                   Builder2.CreateCall(FreeFunc, tofree);
                 } else if (funcName == "cuMemAllocAsync") {
-                  auto FreeFunc = M->getOrInsertFunction(
-                      "cuMemFreeAsync", VoidTy, IntPtrTy, streamL->getType());
+                  auto FreeFunc = getOrInsertPerCallingConv(
+                      *M, called, "cuMemFreeAsync",
+                      FunctionType::get(VoidTy, {IntPtrTy, streamL->getType()},
+                                        false));
                   Value *nargs[] = {tofree, streamL};
                   Builder2.CreateCall(FreeFunc, nargs);
                 } else if (funcName == "cuMemAlloc" ||
                            funcName == "cuMemAlloc_v2") {
-                  auto FreeFunc =
-                      M->getOrInsertFunction("cuMemFree", VoidTy, IntPtrTy);
+                  auto FreeFunc = getOrInsertPerCallingConv(
+                      *M, called, "cuMemFree",
+                      FunctionType::get(VoidTy, {IntPtrTy}, false));
                   Value *nargs[] = {tofree};
                   Builder2.CreateCall(FreeFunc, nargs);
                 } else if (funcName == "cudaMalloc") {
-                  auto FreeFunc =
-                      M->getOrInsertFunction("cudaFree", VoidTy, IntPtrTy);
+                  auto FreeFunc = getOrInsertPerCallingConv(
+                      *M, called, "cudaFree",
+                      FunctionType::get(VoidTy, {IntPtrTy}, false));
                   Value *nargs[] = {tofree};
                   Builder2.CreateCall(FreeFunc, nargs);
                 } else if (funcName == "cudaMallocAsync" ||
                            funcName == "cudaMallocFromPoolAsync") {
-                  auto FreeFunc = M->getOrInsertFunction(
-                      "cudaFreeAsync", VoidTy, IntPtrTy, streamL->getType());
+                  auto FreeFunc = getOrInsertPerCallingConv(
+                      *M, called, "cudaFreeAsync",
+                      FunctionType::get(VoidTy, {IntPtrTy, streamL->getType()},
+                                        false));
                   Value *nargs[] = {tofree, streamL};
                   Builder2.CreateCall(FreeFunc, nargs);
                 } else if (funcName == "cudaMallocHost") {
-                  auto FreeFunc =
-                      M->getOrInsertFunction("cudaFreeHost", VoidTy, IntPtrTy);
+                  auto FreeFunc = getOrInsertPerCallingConv(
+                      *M, called, "cudaFreeHost",
+                      FunctionType::get(VoidTy, {IntPtrTy}, false));
                   Value *nargs[] = {tofree};
                   Builder2.CreateCall(FreeFunc, nargs);
                 } else
@@ -3984,7 +4636,7 @@ bool AdjointGenerator::handleKnownCallDerivatives(
       IRBuilder<> Builder2(newCall->getNextNode());
       auto ptrv = gutils->getNewFromOriginal(call.getOperand(0));
       if (!isa<PointerType>(ptrv->getType()))
-        ptrv = BuilderZ.CreateIntToPtr(ptrv, PointerType::getUnqual(PT));
+        ptrv = BuilderZ.CreateIntToPtr(ptrv, getUnqual(PT));
       auto load = Builder2.CreateLoad(PT, ptrv, "posix_preread");
       Builder2.SetInsertPoint(&call);
       getReverseBuilder(Builder2);
@@ -4008,27 +4660,34 @@ bool AdjointGenerator::handleKnownCallDerivatives(
         auto FreeFunc = M->getOrInsertFunction("free", VoidTy, IntPtrTy);
         Builder2.CreateCall(FreeFunc, tofree);
       } else if (funcName == "cuMemAllocAsync") {
-        auto FreeFunc = M->getOrInsertFunction("cuMemFreeAsync", VoidTy,
-                                               IntPtrTy, streamL->getType());
+        auto FreeFunc = getOrInsertPerCallingConv(
+            *M, called, "cuMemFreeAsync",
+            FunctionType::get(VoidTy, {IntPtrTy, streamL->getType()}, false));
         Value *nargs[] = {tofree, streamL};
         Builder2.CreateCall(FreeFunc, nargs);
       } else if (funcName == "cuMemAlloc" || funcName == "cuMemAlloc_v2") {
-        auto FreeFunc = M->getOrInsertFunction("cuMemFree", VoidTy, IntPtrTy);
+        auto FreeFunc = getOrInsertPerCallingConv(
+            *M, called, "cuMemFree",
+            FunctionType::get(VoidTy, {IntPtrTy}, false));
         Value *nargs[] = {tofree};
         Builder2.CreateCall(FreeFunc, nargs);
       } else if (funcName == "cudaMalloc") {
-        auto FreeFunc = M->getOrInsertFunction("cudaFree", VoidTy, IntPtrTy);
+        auto FreeFunc = getOrInsertPerCallingConv(
+            *M, called, "cudaFree",
+            FunctionType::get(VoidTy, {IntPtrTy}, false));
         Value *nargs[] = {tofree};
         Builder2.CreateCall(FreeFunc, nargs);
       } else if (funcName == "cudaMallocAsync" ||
                  funcName == "cudaMallocFromPoolAsync") {
-        auto FreeFunc = M->getOrInsertFunction("cudaFreeAsync", VoidTy,
-                                               IntPtrTy, streamL->getType());
+        auto FreeFunc = getOrInsertPerCallingConv(
+            *M, called, "cudaFreeAsync",
+            FunctionType::get(VoidTy, {IntPtrTy, streamL->getType()}, false));
         Value *nargs[] = {tofree, streamL};
         Builder2.CreateCall(FreeFunc, nargs);
       } else if (funcName == "cudaMallocHost") {
-        auto FreeFunc =
-            M->getOrInsertFunction("cudaFreeHost", VoidTy, IntPtrTy);
+        auto FreeFunc = getOrInsertPerCallingConv(
+            *M, called, "cudaFreeHost",
+            FunctionType::get(VoidTy, {IntPtrTy}, false));
         Value *nargs[] = {tofree};
         Builder2.CreateCall(FreeFunc, nargs);
       } else
@@ -4086,7 +4745,8 @@ bool AdjointGenerator::handleKnownCallDerivatives(
     auto callval = call.getCalledOperand();
 
     for (auto rmat : gutils->backwardsOnlyShadows) {
-      if (rmat.second.frees.count(&call)) {
+      if (gutils->allocationsToBeRematerialized.count(rmat.first) &&
+          rmat.second.frees.count(&call)) {
         bool shouldFree = false;
         if (rmat.second.primalInitialize) {
           if (Mode == DerivativeMode::ReverseModePrimal)
@@ -4111,7 +4771,8 @@ bool AdjointGenerator::handleKnownCallDerivatives(
 
     // If a rematerializable allocation.
     for (auto rmat : gutils->rematerializableAllocations) {
-      if (rmat.second.frees.count(&call)) {
+      if (gutils->allocationsToBeRematerialized.count(rmat.first) &&
+          rmat.second.frees.count(&call)) {
         // Leave the original free behavior since this won't be used
         // in the reverse pass in split mode
         if (Mode == DerivativeMode::ReverseModePrimal) {
@@ -4122,14 +4783,20 @@ bool AdjointGenerator::handleKnownCallDerivatives(
           return true;
         } else {
           assert(Mode == DerivativeMode::ReverseModeCombined);
-          std::map<UsageKey, bool> Seen;
-          for (auto pair : gutils->knownRecomputeHeuristic)
-            if (!pair.second)
-              Seen[UsageKey(pair.first, QueryType::Primal)] = false;
+          std::map<UsageKey, bool> Seen =
+              gutils->populateSeenFromKnownRecompute();
           bool primalNeededInReverse =
               DifferentialUseAnalysis::is_value_needed_in_reverse<
                   QueryType::Primal>(gutils, rmat.first, Mode, Seen,
                                      oldUnreachable);
+          {
+            auto found = gutils->knownRecomputeHeuristic.find(rmat.first);
+            if (found != gutils->knownRecomputeHeuristic.end()) {
+              if (!found->second) {
+                primalNeededInReverse = true;
+              }
+            }
+          }
           bool cacheWholeAllocation =
               gutils->needsCacheWholeAllocation(rmat.first);
           if (cacheWholeAllocation) {
@@ -4161,6 +4828,20 @@ bool AdjointGenerator::handleKnownCallDerivatives(
       return true;
     }
 
+    if (call.getMetadata("enzyme_cache_free")) {
+      bool hasGuaranteedFree = false;
+      for (const auto &pair : gutils->allocationsWithGuaranteedFree) {
+        if (pair.second.count(&call)) {
+          hasGuaranteedFree = true;
+          break;
+        }
+      }
+      if (!hasGuaranteedFree) {
+        eraseIfUnused(call, /*erase*/ true, /*check*/ false);
+        return true;
+      }
+    }
+
     llvm::Value *val = getBaseObject(call.getArgOperand(0));
     if (isa<ConstantPointerNull>(val)) {
       llvm::errs() << "removing free of null pointer\n";
@@ -4169,7 +4850,7 @@ bool AdjointGenerator::handleKnownCallDerivatives(
     }
 
     // TODO HANDLE FREE
-    llvm::errs() << "freeing without malloc " << *val << "\n";
+    llvm::errs() << "freeing without malloc " << *val << " in " << call << "\n";
     eraseIfUnused(call, /*erase*/ true, /*check*/ false);
     return true;
   }
