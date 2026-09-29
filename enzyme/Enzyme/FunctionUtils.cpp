@@ -3988,8 +3988,8 @@ void ReplaceFunctionImplementation(Module &M) {
       }
       if (Impl.isDeclaration()) {
         bool UseDeviceDeclaration =
-            (M.getTargetTriple().find("amdgcn") != std::string::npos &&
-             Impl.getName().starts_with("__ocml_"));
+            M.getTargetTriple().isAMDGCN() &&
+            Impl.getName().starts_with("__ocml_");
         if (!UseDeviceDeclaration)
           continue;
       }

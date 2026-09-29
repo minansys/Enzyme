@@ -251,6 +251,18 @@ bool isTargetNVPTX(llvm::Module &M) {
 #endif
 }
 
+static StringRef getDeviceMathPrefix(Module &M) {
+  if (isTargetNVPTX(M))
+    return "__nv_";
+
+  Triple TT(M.getTargetTriple());
+  if (TT.isAMDGPU())
+    return "__ocml_";
+  if (TT.getArchName() == "air64")
+    return "air.";
+  return {};
+}
+
 static constexpr const char preserve_device_math_anchor_name[] =
     "__enzyme_preserve_device_math";
 
@@ -295,7 +307,7 @@ static FunctionType *getDeviceMathDeclarationType(Module &M, StringRef MathName,
   if (isMemFreeLibMFunction(MathName, &KnownID) &&
       KnownID != Intrinsic::not_intrinsic) {
     if (KnownID == Intrinsic::pow || KnownID == Intrinsic::minnum ||
-        KnownID == Intrinsic::maxnum)
+        KnownID == Intrinsic::maxnum || KnownID == Intrinsic::copysign)
       return FunctionType::get(Ty, {Ty, Ty}, false);
     return FunctionType::get(Ty, {Ty}, false);
   }
@@ -355,13 +367,80 @@ getDeviceMathSeedForFunction(
 
 static std::optional<std::string> findDeviceMathNameBySignature(
     const StringMap<std::pair<std::string, std::string>> &Implements,
-    StringRef MathName, StringRef PrecisionSuffix) {
+    StringRef MathName, StringRef PrecisionSuffix,
+    StringRef PreferredPrefix) {
   for (const auto &Entry : Implements) {
-    if (Entry.getValue().first == MathName &&
+    if (Entry.getKey().starts_with(PreferredPrefix) &&
+        Entry.getValue().first == MathName &&
         StringRef(Entry.getValue().second).ends_with(PrecisionSuffix))
       return Entry.getKey().str();
   }
   return std::nullopt;
+}
+
+static std::optional<std::string> getMangledDeviceMathWrapperTarget(
+    Function &F,
+  const StringMap<std::pair<std::string, std::string>> &Implements,
+  StringRef PreferredPrefix) {
+  if (!F.isDeclaration())
+    return std::nullopt;
+
+  // Clang's CUDA overload shims use local Itanium names of the form
+  // _ZL<length><math-name><parameter-types>.
+  StringRef EncodedName = F.getName();
+  if (!EncodedName.consume_front("_ZL"))
+    return std::nullopt;
+
+  size_t LengthEnd = 0;
+  while (LengthEnd < EncodedName.size() &&
+       EncodedName[LengthEnd] >= '0' && EncodedName[LengthEnd] <= '9')
+    ++LengthEnd;
+  if (LengthEnd == 0)
+    return std::nullopt;
+
+  unsigned NameLength = 0;
+  if (EncodedName.take_front(LengthEnd).getAsInteger(10, NameLength) ||
+      NameLength > EncodedName.size() - LengthEnd)
+    return std::nullopt;
+  StringRef MathName = EncodedName.substr(LengthEnd, NameLength);
+
+  StringRef PrecisionSuffix;
+  if (F.getReturnType()->isFloatTy())
+    PrecisionSuffix = "f32";
+  else if (F.getReturnType()->isDoubleTy())
+    PrecisionSuffix = "f64";
+  if (PrecisionSuffix.empty()) {
+    for (Type *ParamTy : F.getFunctionType()->params()) {
+      if (ParamTy->isFloatTy()) {
+        PrecisionSuffix = "f32";
+        break;
+      }
+      if (ParamTy->isDoubleTy()) {
+        PrecisionSuffix = "f64";
+        break;
+      }
+    }
+  }
+  if (PrecisionSuffix.empty())
+    return std::nullopt;
+
+  SmallString<32> NormalizedMathName(MathName);
+  if (PrecisionSuffix == "f32")
+    NormalizedMathName += "f";
+  auto DeviceName = findDeviceMathNameBySignature(
+      Implements, NormalizedMathName, PrecisionSuffix, PreferredPrefix);
+  if (!DeviceName && PrecisionSuffix == "f32")
+    DeviceName = findDeviceMathNameBySignature(
+        Implements, MathName, PrecisionSuffix, PreferredPrefix);
+  if (!DeviceName)
+    return std::nullopt;
+
+  const auto &Entry = Implements.find(*DeviceName)->getValue();
+  FunctionType *ExpectedType =
+      getDeviceMathDeclarationType(*F.getParent(), Entry.first, Entry.second);
+  if (ExpectedType != F.getFunctionType())
+    return std::nullopt;
+  return DeviceName;
 }
 
 static void enqueueNeededDeviceMathName(StringRef DeviceName,
@@ -411,7 +490,8 @@ getDeviceMathDependencyBaseNames(StringRef BaseMathName) {
 static void enqueueDependentDeviceMathNames(
     StringRef MathName, StringRef PrecisionSuffix,
     const StringMap<std::pair<std::string, std::string>> &Implements,
-    StringSet<> &NeededNames, SmallVectorImpl<std::string> &Worklist) {
+  StringRef PreferredPrefix, StringSet<> &NeededNames,
+  SmallVectorImpl<std::string> &Worklist) {
   bool IsFloat = MathName.ends_with("f") || PrecisionSuffix == "f32";
   StringRef BaseMathName = MathName;
   if (IsFloat && BaseMathName.ends_with("f"))
@@ -423,7 +503,7 @@ static void enqueueDependentDeviceMathNames(
       DepMathName += "f";
 
       if (auto DepDeviceName = findDeviceMathNameBySignature(
-          Implements, DepMathName, PrecisionSuffix))
+          Implements, DepMathName, PrecisionSuffix, PreferredPrefix))
       enqueueNeededDeviceMathName(*DepDeviceName, NeededNames, Worklist);
   };
 
@@ -436,18 +516,26 @@ static StringSet<> collectNeededDeviceMathNames(
     const StringMap<std::pair<std::string, std::string>> &Implements) {
   StringSet<> NeededNames;
   SmallVector<std::string, 16> Worklist;
+  StringRef PreferredPrefix = getDeviceMathPrefix(M);
+  if (PreferredPrefix.empty())
+    return NeededNames;
 
   for (Function &F : M) {
+    if (auto DeviceWrapperName =
+            getMangledDeviceMathWrapperTarget(F, Implements,
+                                               PreferredPrefix))
+      enqueueNeededDeviceMathName(*DeviceWrapperName, NeededNames, Worklist);
+
     auto Seed = getDeviceMathSeedForFunction(F, Implements);
     if (!Seed)
       continue;
 
     if (auto DeviceName = findDeviceMathNameBySignature(
-            Implements, Seed->first, Seed->second))
+            Implements, Seed->first, Seed->second, PreferredPrefix))
       enqueueNeededDeviceMathName(*DeviceName, NeededNames, Worklist);
 
     enqueueDependentDeviceMathNames(Seed->first, Seed->second, Implements,
-                                    NeededNames, Worklist);
+                                    PreferredPrefix, NeededNames, Worklist);
   }
 
   while (!Worklist.empty()) {
@@ -462,7 +550,7 @@ static StringSet<> collectNeededDeviceMathNames(
       continue;
 
     enqueueDependentDeviceMathNames(MathName, LLVMName.take_back(3), Implements,
-                                    NeededNames, Worklist);
+                                    PreferredPrefix, NeededNames, Worklist);
   }
 
   return NeededNames;
@@ -499,40 +587,51 @@ static bool materializeDeviceMathDeclarations(
   return changed;
 }
 
-static bool materializeMangledMinMaxWrapperDefinitions(Module &M) {
-  Triple TT(M.getTargetTriple());
-  if (!(isTargetNVPTX(M) || TT.isAMDGPU()))
+static bool replaceMangledDeviceMathWrapperDeclarations(
+    Module &M,
+    const StringMap<std::pair<std::string, std::string>> &Implements) {
+  if (!isTargetNVPTX(M))
     return false;
 
   bool changed = false;
+  StringRef PreferredPrefix = getDeviceMathPrefix(M);
   for (Function &F : llvm::make_early_inc_range(M)) {
     if (!F.isDeclaration())
       continue;
-    if (!F.getName().starts_with("_Z"))
-      continue;
-
-    Intrinsic::ID KnownID = Intrinsic::not_intrinsic;
-    if (!isMemFreeLibMFunction(F.getName(), &KnownID) ||
-        (KnownID != Intrinsic::minnum && KnownID != Intrinsic::maxnum))
+    auto DeviceName =
+      getMangledDeviceMathWrapperTarget(F, Implements, PreferredPrefix);
+    if (!DeviceName)
       continue;
 
     FunctionType *FT = F.getFunctionType();
     Type *Ty = FT->getReturnType();
-    if (FT->isVarArg() || FT->getNumParams() != 2)
-      continue;
-    if (Ty != FT->getParamType(0) || Ty != FT->getParamType(1))
-      continue;
+    Function *Implementation = nullptr;
+    Intrinsic::ID KnownID = Intrinsic::not_intrinsic;
+    if (isMemFreeLibMFunction(F.getName(), &KnownID) &&
+        (KnownID == Intrinsic::copysign || KnownID == Intrinsic::minnum ||
+         KnownID == Intrinsic::maxnum))
+      Implementation = Intrinsic::getDeclaration(&M, KnownID, {Ty});
 
-    auto *Entry = BasicBlock::Create(M.getContext(), "entry", &F);
-    IRBuilder<> Builder(Entry);
-    Value *X = F.getArg(0);
-    Value *Y = F.getArg(1);
-    X->setName("x");
-    Y->setName("y");
-    Function *IntrinsicDecl = Intrinsic::getDeclaration(&M, KnownID, {Ty});
-    auto *Call = Builder.CreateCall(IntrinsicDecl, {X, Y});
-    Call->setCallingConv(IntrinsicDecl->getCallingConv());
-    Builder.CreateRet(Call);
+    if (!Implementation)
+      Implementation = M.getFunction(*DeviceName);
+    if (!Implementation) {
+      Implementation = Function::Create(FT, Function::ExternalLinkage,
+                                        *DeviceName, M);
+      Implementation->setCallingConv(CallingConv::Fast);
+      Implementation->addFnAttr(Attribute::NoUnwind);
+      Implementation->addFnAttr(Attribute::WillReturn);
+    } else if (Implementation->getFunctionType() != FT) {
+      continue;
+    }
+
+    SmallVector<CallBase *, 4> Calls;
+    for (Use &U : F.uses())
+      if (auto *Call = dyn_cast<CallBase>(U.getUser()))
+        Calls.push_back(Call);
+    F.replaceAllUsesWith(Implementation);
+    for (CallBase *Call : Calls)
+      Call->setCallingConv(Implementation->getCallingConv());
+    F.eraseFromParent();
     changed = true;
   }
 
@@ -1567,10 +1666,10 @@ bool preserveNVVM(bool Begin, Module &M,
   StringSet<> NeededDeviceMathNames =
       collectNeededDeviceMathNames(M, Implements);
   if (Begin)
+    changed |= replaceMangledDeviceMathWrapperDeclarations(M, Implements);
+  if (Begin)
     changed |= materializeDeviceMathDeclarations(M, Implements,
                                                  NeededDeviceMathNames);
-  if (Begin)
-    changed |= materializeMangledMinMaxWrapperDefinitions(M);
   if (Begin)
     changed |= linkMissingNVPTXDeviceMathImplementations(M,
                                                          NeededDeviceMathNames);

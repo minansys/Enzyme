@@ -3847,20 +3847,8 @@ public:
         length = BuilderZ.CreateSub(
             length, ConstantInt::get(new_size->getType(), seg_start));
 
-      unsigned subdstalign = dstalign;
-      // todo make better alignment calculation
-      if (dstalign != 0) {
-        if (seg_start % dstalign != 0) {
-          dstalign = 1;
-        }
-      }
-      unsigned subsrcalign = srcalign;
-      // todo make better alignment calculation
-      if (srcalign != 0) {
-        if (seg_start % srcalign != 0) {
-          srcalign = 1;
-        }
-      }
+      unsigned subdstalign = commonAlignment(Align(dstalign), seg_start).value();
+      unsigned subsrcalign = commonAlignment(Align(srcalign), seg_start).value();
       IRBuilder<> BuilderZ(gutils->getNewFromOriginal(&MTI));
       Value *shadow_dst = gutils->isConstantValue(orig_dst)
                               ? nullptr

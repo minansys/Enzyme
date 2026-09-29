@@ -12,7 +12,7 @@ package(
 )
 
 ENZYME_WARNING_COPTS = select({
-    "@platforms//os:windows": [],
+    "@platforms//os:windows": ["/std:c++20"],
     "//conditions:default": [
         "-Wno-unused-variable",
         "-Wno-return-type",
@@ -155,10 +155,7 @@ cc_library(
         ],
         exclude = ["Enzyme/AdjointGenerator.h"],
     ),
-    copts = [
-        "-Wno-unused-variable",
-        "-Wno-return-type",
-    ],
+    copts = ENZYME_WARNING_COPTS,
     visibility = ["//visibility:public"],
     deps = [
         "@llvm-project//llvm:Analysis",
@@ -185,10 +182,7 @@ cc_library(
         ],
         exclude = ["Enzyme/AdjointGenerator.h"],
     ),
-    copts = [
-        "-Wno-unused-variable",
-        "-Wno-return-type",
-    ],
+    copts = ENZYME_WARNING_COPTS,
     visibility = ["//visibility:public"],
     deps = [
         ":blas-typeanalysis",
@@ -217,10 +211,8 @@ cc_library(
         exclude = ["Enzyme/AdjointGenerator.h"],
     ),
     copts = [
-        "-Wno-unused-variable",
-        "-Wno-return-type",
         "-DENZYME_ENABLE_NVVM_ATTRIBUTION=0",
-    ],
+    ] + ENZYME_WARNING_COPTS,
     visibility = ["//visibility:public"],
     deps = [
         "@llvm-project//llvm:Analysis",
@@ -254,10 +246,7 @@ cc_library(
         "Enzyme/*.h",
         "Enzyme/TypeAnalysis/*.h",
     ]),
-    copts = [
-        "-Wno-unused-variable",
-        "-Wno-return-type",
-    ],
+    copts = ENZYME_WARNING_COPTS,
     visibility = ["//visibility:public"],
     deps = [
         ":binop-derivatives",
