@@ -1156,15 +1156,8 @@ void DiffeGradientUtils::addToInvertedPtrDiffe(Instruction *orig,
               ConstantInt::get(Type::getInt32Ty(vt->getContext()), i)};
           auto vptr = BuilderM.CreateGEP(addingType, ptr, Idxs);
           MaybeAlign alignv = align;
-          if (alignv) {
-            if (start != 0) {
-              // todo make better alignment calculation
-              assert((*alignv).value() != 0);
-              if (start % (*alignv).value() != 0) {
-                alignv = Align(1);
-              }
-            }
-          }
+          if (alignv)
+            alignv = commonAlignment(*alignv, start);
           BuilderM.CreateAtomicRMW(op, vptr, vdif, alignv,
                                    AtomicOrdering::Monotonic,
                                    SyncScope::System);
@@ -1175,15 +1168,8 @@ void DiffeGradientUtils::addToInvertedPtrDiffe(Instruction *orig,
       auto rule = [&](Value *dif, Value *ptr) {
         dif = SanitizeDerivatives(orig, dif, BuilderM);
         MaybeAlign alignv = align;
-        if (alignv) {
-          if (start != 0) {
-            // todo make better alignment calculation
-            assert((*alignv).value() != 0);
-            if (start % (*alignv).value() != 0) {
-              alignv = Align(1);
-            }
-          }
-        }
+        if (alignv)
+          alignv = commonAlignment(*alignv, start);
         BuilderM.CreateAtomicRMW(op, ptr, dif, alignv,
                                  AtomicOrdering::Monotonic, SyncScope::System);
       };

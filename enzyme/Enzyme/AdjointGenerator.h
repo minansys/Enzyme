@@ -3847,20 +3847,8 @@ public:
         length = BuilderZ.CreateSub(
             length, ConstantInt::get(new_size->getType(), seg_start));
 
-      unsigned subdstalign = dstalign;
-      // todo make better alignment calculation
-      if (dstalign != 0) {
-        if (seg_start % dstalign != 0) {
-          dstalign = 1;
-        }
-      }
-      unsigned subsrcalign = srcalign;
-      // todo make better alignment calculation
-      if (srcalign != 0) {
-        if (seg_start % srcalign != 0) {
-          srcalign = 1;
-        }
-      }
+      unsigned subdstalign = commonAlignment(Align(dstalign), seg_start).value();
+      unsigned subsrcalign = commonAlignment(Align(srcalign), seg_start).value();
       IRBuilder<> BuilderZ(gutils->getNewFromOriginal(&MTI));
       Value *shadow_dst = gutils->isConstantValue(orig_dst)
                               ? nullptr
@@ -4184,6 +4172,7 @@ public:
       {
         SmallVector<Value *, 1> args = {};
 #if LLVM_VERSION_MAJOR > 20
+        args.push_back(ConstantInt::get(Type::getInt32Ty(M->getContext()), 0));
         auto cal = cast<CallInst>(Builder2.CreateCall(
             getIntrinsicDeclaration(
                 M, Intrinsic::nvvm_barrier_cta_sync_aligned_all),
@@ -4211,7 +4200,16 @@ public:
       case Intrinsic::nvvm_membar_cta:
       case Intrinsic::nvvm_membar_gl:
       case Intrinsic::nvvm_membar_sys: {
-        SmallVector<Value *, 1> args = {};
+        SmallVector<Value *, 2> args = {};
+#if LLVM_VERSION_MAJOR > 20
+        if (ID == Intrinsic::nvvm_barrier_cta_sync_aligned_all ||
+            ID == Intrinsic::nvvm_barrier_cta_sync_aligned_count) {
+          auto *CB = cast<CallBase>(&I);
+          for (Use &arg : CB->args())
+            args.push_back(
+                lookup(gutils->getNewFromOriginal(arg.get()), Builder2));
+        }
+#endif
         auto cal = cast<CallInst>(
             Builder2.CreateCall(getIntrinsicDeclaration(M, ID), args));
         cal->setCallingConv(getIntrinsicDeclaration(M, ID)->getCallingConv());
@@ -4392,8 +4390,16 @@ public:
   }
 
 // first one allows adding attributes to blas functions declared in the second
+#ifndef _MSC_VER
 #include "BlasAttributor.inc"
 #include "BlasDerivatives.inc"
+#else
+  template <typename BlasInfoT>
+  bool handleBLAS(llvm::CallInst &, llvm::Function *, const BlasInfoT &,
+                  const std::vector<bool> &) {
+    return false;
+  }
+#endif
 
   void visitOMPCall(llvm::CallInst &call) {
     using namespace llvm;
@@ -4797,7 +4803,7 @@ public:
 
         newcalled = gutils->Logic.CreatePrimalAndGradient(
             RequestContext(&call, &Builder2),
-            (ReverseCacheKey){
+            ReverseCacheKey{
                 .todiff = cast<Function>(called),
                 .retType = subretType,
                 .constant_args = argsInverted,
@@ -6251,7 +6257,7 @@ public:
 
       newcalled = gutils->Logic.CreatePrimalAndGradient(
           RequestContext(&call, &Builder2),
-          (ReverseCacheKey){
+          ReverseCacheKey{
               .todiff = cast<Function>(called),
               .retType = subretType,
               .constant_args = argsInverted,
